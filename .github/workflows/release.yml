@@ -1,0 +1,36 @@
+name: Release (JSR)
+
+# GitHub Release を publish すると @hdae/fetch-cache を JSR に publish する。
+# この job は checkout(read)+OIDC(id-token) のみ・生成物を作らないので tree は clean（--allow-dirty 不要）。
+#
+# タグ規約: Release の tag は v プレフィックス付きで deno.json の version に一致させる（例: v0.2.0）。
+on:
+  release:
+    types: [published]
+
+# JSR publish の canonical 権限セット。contents:read は actions/checkout 用（public では既定で付くが、
+# private 化しても壊れないよう明示）。id-token:write は JSR の OIDC publish 用。
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      # タグ（v プレフィックス）== deno.json.version を fail-loud 検証（tag と publish version の乖離を防ぐ）。
+      # 併せて公開 VERSION（src/mod.ts）の drift も検証する。--no-lock は必須: jsr import が deno.lock を
+      # 書いて直後の deno publish を dirty で落とすのを防ぐ。
+      - name: Verify release tag matches deno.json version
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: deno run --no-lock --allow-read scripts/verify_tag.ts "$TAG"
+
+      # JSR publish（OIDC）。生成物を作らず tree は clean なので --allow-dirty は付けない。
+      - name: Publish to JSR
+        run: deno publish

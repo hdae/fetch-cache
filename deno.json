@@ -1,0 +1,31 @@
+{
+  "name": "@hdae/fetch-cache",
+  "version": "0.1.0",
+  "license": "MIT",
+  "exports": {
+    ".": "./src/mod.ts",
+    "./hf": "./src/hf/mod.ts"
+  },
+  "imports": {
+    "@std/assert": "jsr:@std/assert@^1.0.0"
+  },
+  "tasks": {
+    "check": "deno fmt --check .github CLAUDE.md README.md deno.json scripts src && deno lint scripts src && deno check src/mod.ts src/hf/mod.ts && deno test --allow-read",
+    "bump": "deno run --allow-read --allow-run=deno,git --allow-write=src/mod.ts --no-lock scripts/bump.ts"
+  },
+  "fmt": {
+    "proseWrap": "preserve"
+  },
+  "publish": {
+    "include": [
+      "README.md",
+      "LICENSE",
+      "deno.json",
+      "src/**/*.ts"
+    ],
+    "exclude": [
+      "src/**/*.test.ts",
+      "src/testing/**"
+    ]
+  }
+}
