@@ -3,8 +3,9 @@
  *
  * `fetchBytes` は URL をそのままキーに Cache Storage へ保存し、2 回目以降は network なしで返す。
  * `validate` フックはキャッシュヒット側にも適用され、破損キャッシュは evict して真実源から取り直す
- * （self-heal）。`caches` が無いランタイム（Node.js 等）では素の fetch にフォールバックする＝
- * キャッシュは正しさの要件ではなく最適化。
+ * （self-heal）。`decode` フックで「保存形 ≠ 利用形」（例: gzip のまま保存・解凍して返す）に
+ * 対応する（throw は破損扱い＝validate と同じ縮退経路）。`caches` が無いランタイム
+ * （Node.js 等）では素の fetch にフォールバックする＝キャッシュは正しさの要件ではなく最適化。
  *
  * MUST: 実行時依存ゼロ。fetch / caches / crypto.subtle など Web 標準 API のみを使う。
  *
@@ -23,6 +24,15 @@ export type CacheErrorContext = {
   error: unknown;
 };
 
+/** 保存形（raw）バイト列の検証。throw = 破損。 */
+export type ValidateBytes = (bytes: Uint8Array) => void | Promise<void>;
+
+/**
+ * 保存形（raw）→ 利用形への変換（解凍・復号など）。throw = 破損扱い（validate と同じ縮退経路:
+ * キャッシュヒット側は self-heal、network 側はそのまま throw・キャッシュしない）。
+ */
+export type DecodeBytes = (raw: Uint8Array) => Uint8Array | Promise<Uint8Array>;
+
 export type FetchBytesOptions = {
   /** Cache Storage の名前空間。既定 "fetch-cache"。 */
   cacheName?: string;
@@ -32,8 +42,22 @@ export type FetchBytesOptions = {
    * 取得/キャッシュ読出しバイト列の検証。throw = 不正。キャッシュヒット側にも適用され、
    * 失敗時は evict して network から取り直す（self-heal）。network 取得物の失敗はそのまま
    * throw（不正物はキャッシュしない）。
+   *
+   * NOTE: 常に保存形（raw = cache に入る/入っているバイト列そのもの）に対して走る。
+   *       `decode` 併用時も decode の**前**。利用形側の検証は decode 内で throw する。
    */
-  validate?: (bytes: Uint8Array) => void | Promise<void>;
+  validate?: ValidateBytes;
+  /**
+   * 保存形（raw）→ 利用形への変換（例: gzip のまま保存し、解凍して返す）。cache には raw を
+   * そのまま保存し、戻り値には decode 適用後を返す。decode の throw は破損扱いで validate と
+   * 同じ縮退経路に乗る: キャッシュヒット側は evict → network から取り直し（self-heal）、
+   * network 取得物はそのまま throw（decode 不能物はキャッシュしない）。省略時は raw をそのまま
+   * 返す（従来と完全互換）。gzip には同梱の `decodeGzip` がそのまま使える。
+   *
+   * MUST NOT: `raw` を破壊的に変更しない — network 側では decode 成功後にその raw を
+   * cache.put するため、変更すると壊れた内容がキャッシュされる。
+   */
+  decode?: DecodeBytes;
   /** ダウンロード進捗（チャンク毎）。キャッシュヒット時は呼ばれない。 */
   onProgress?: (progress: FetchProgress) => void;
   /**
@@ -114,12 +138,26 @@ const readBody = async (
 };
 
 /**
+ * validate（raw の完全性検証）→ decode（保存形 → 利用形）の共有経路。キャッシュヒット側と
+ * network 側で必ずこの順・この意味論を共有する（経路毎に別実装すると契約が黙って乖離する）。
+ * throw はどちら由来でも「破損」として呼び出し側の縮退経路に乗る。
+ */
+const validateAndDecode = async (
+  raw: Uint8Array,
+  opts: FetchBytesOptions,
+): Promise<Uint8Array> => {
+  await opts.validate?.(raw);
+  return opts.decode === undefined ? raw : await opts.decode(raw);
+};
+
+/**
  * URL からバイト列を取得する（Cache API 優先・self-heal・fail loud）。
  *
- * キャッシュヒット時は network に出ない（onProgress も呼ばれない）。`validate` が
+ * キャッシュヒット時は network に出ない（onProgress も呼ばれない）。`validate` / `decode` が
  * キャッシュ内容を拒否したら evict して network から取り直す（self-heal）。network 取得物が
- * `validate` に落ちたらそのまま throw し、不正物はキャッシュしない。HTTP エラーは
- * `fetch-cache: HTTP {status} {statusText} ({url})` で throw する。
+ * `validate` / `decode` に落ちたらそのまま throw し、不正物はキャッシュしない。HTTP エラーは
+ * `fetch-cache: HTTP {status} {statusText} ({url})` で throw する。cache に入るのは常に
+ * 保存形（raw）で、戻り値は `decode` 適用後（省略時は raw）。
  *
  * NOTE: `caches` が無いランタイム（Node.js 等）では `cache` 指定に関わらず素の fetch に
  *       フォールバックする（キャッシュは最適化であり正しさの要件ではない）。
@@ -171,12 +209,11 @@ export const fetchBytes = async (
       onCacheError({ op: "match", url: requestUrl, error });
     }
     if (cachedBytes !== undefined) {
-      if (opts.validate === undefined) return cachedBytes;
       try {
-        await opts.validate(cachedBytes);
-        return cachedBytes;
+        return await validateAndDecode(cachedBytes, opts);
       } catch {
-        // 破損キャッシュ。真実源から取り直すため evict してフォールスルー（self-heal）。
+        // 破損キャッシュ（validate 拒否 or decode 不能）。真実源から取り直すため evict して
+        // フォールスルー（self-heal）。
         try {
           await cache.delete(requestUrl);
         } catch (error) {
@@ -197,8 +234,9 @@ export const fetchBytes = async (
     );
   }
   const bytes = await readBody(response, opts.onProgress);
-  // validate 成功後にのみ cache.put（不正物をキャッシュに残さない）。失敗はそのまま throw。
-  await opts.validate?.(bytes);
+  // validate / decode 成功後にのみ cache.put（不正物・decode 不能物をキャッシュに残さない）。
+  // 失敗はそのまま throw。put するのは常に保存形 raw（decode 前）。
+  const decoded = await validateAndDecode(bytes, opts);
   if (cache !== undefined) {
     // put 失敗（quota 超過等）は成功したダウンロードを巻き添えにしない（縮退+通知）。
     try {
@@ -207,7 +245,24 @@ export const fetchBytes = async (
       onCacheError({ op: "put", url: requestUrl, error });
     }
   }
-  return bytes;
+  return decoded;
+};
+
+/**
+ * gzip を解凍する decode ヘルパ（`decode: decodeGzip` でそのまま渡せる）。
+ * DecompressionStream（Web 標準）が無いランタイムでは throw する（fail loud）。
+ * 不正な gzip は throw = 破損扱いで self-heal の対象になる。
+ */
+export const decodeGzip = async (raw: Uint8Array): Promise<Uint8Array> => {
+  if (typeof DecompressionStream === "undefined") {
+    throw new Error(
+      "fetch-cache: このランタイムには DecompressionStream が無いため gzip を解凍できません",
+    );
+  }
+  // SharedArrayBuffer 由来でも Blob に渡せるようコピーで ArrayBuffer 背面を保証する。
+  const stream = new Blob([new Uint8Array(raw)]).stream()
+    .pipeThrough(new DecompressionStream("gzip"));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
 };
 
 /**
