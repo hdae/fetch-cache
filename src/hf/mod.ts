@@ -9,7 +9,11 @@
  * @module
  */
 
-import { fetchBytes, type FetchProgress } from "../mod.ts";
+import {
+  type CacheErrorContext,
+  fetchBytes,
+  type FetchProgress,
+} from "../mod.ts";
 
 export type HfRepoKind = "model" | "dataset" | "space";
 
@@ -113,7 +117,11 @@ export type HfFetchOptions = {
   cacheName?: string;
   /** ファイル毎の進捗（path 付き）。 */
   onProgress?: (progress: FetchProgress & { path: string }) => void;
+  /** cache I/O 失敗の通知（cache 層へそのまま渡す）。既定 console.warn。 */
+  onCacheError?: (context: CacheErrorContext) => void;
   fetch?: typeof globalThis.fetch;
+  /** CacheStorage の差し替え（cache 層へそのまま渡す）。既定 globalThis.caches。 */
+  caches?: CacheStorage;
 };
 
 /** バイト列をハッシュして小文字 hex を返す（sha256 検証用）。crypto.subtle が無ければ throw。 */
@@ -179,7 +187,9 @@ const fetchResolvedFile = (
     onProgress: onProgress === undefined
       ? undefined
       : (progress) => onProgress({ ...progress, path: spec.path }),
+    onCacheError: opts.onCacheError,
     fetch: opts.fetch,
+    caches: opts.caches,
   });
 };
 

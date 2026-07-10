@@ -16,6 +16,13 @@ export const VERSION = "0.1.0";
 /** ダウンロード進捗。`total` は content-length ヘッダがあるときだけ入る。 */
 export type FetchProgress = { loaded: number; total?: number };
 
+/** cache I/O 失敗の通知内容。`op` は失敗した Cache API 操作。 */
+export type CacheErrorContext = {
+  op: "open" | "match" | "put" | "delete";
+  url: string;
+  error: unknown;
+};
+
 export type FetchBytesOptions = {
   /** Cache Storage の名前空間。既定 "fetch-cache"。 */
   cacheName?: string;
@@ -29,11 +36,30 @@ export type FetchBytesOptions = {
   validate?: (bytes: Uint8Array) => void | Promise<void>;
   /** ダウンロード進捗（チャンク毎）。キャッシュヒット時は呼ばれない。 */
   onProgress?: (progress: FetchProgress) => void;
+  /**
+   * cache I/O 失敗（open/match/put/delete の throw。quota 超過等）の通知先。既定 console.warn。
+   * キャッシュは最適化であり正しさの要件ではないため、失敗はダウンロードを落とさず network 側へ
+   * 縮退して続行する。無言では握り潰さない（DECIDED: docs/decisions/0001）。
+   */
+  onCacheError?: (context: CacheErrorContext) => void;
   /** fetch の差し替え（テスト・カスタム輸送用）。既定 globalThis.fetch。 */
   fetch?: typeof globalThis.fetch;
+  /** CacheStorage の差し替え（テストの故障注入用）。既定 globalThis.caches。 */
+  caches?: CacheStorage;
 };
 
 const DEFAULT_CACHE_NAME = "fetch-cache";
+
+// `caches` が無いランタイム（Node.js 等）では undefined（素の fetch へフォールバック）。
+const globalCaches = (): CacheStorage | undefined =>
+  typeof caches !== "undefined" ? caches : undefined;
+
+const defaultOnCacheError = (context: CacheErrorContext): void => {
+  console.warn(
+    `fetch-cache: キャッシュ ${context.op} に失敗したため network へ縮退します (${context.url})`,
+    context.error,
+  );
+};
 
 /** content-length を進捗の total に読む。無い・数値でないヘッダは「total 不明」扱い（進捗は任意情報）。 */
 const readTotal = (response: Response): number | undefined => {
@@ -87,6 +113,8 @@ const readBody = async (
  *
  * NOTE: `caches` が無いランタイム（Node.js 等）では `cache` 指定に関わらず素の fetch に
  *       フォールバックする（キャッシュは最適化であり正しさの要件ではない）。
+ * NOTE: cache I/O の失敗（quota 超過等）もダウンロードを落とさず network 側へ縮退して続行し、
+ *       `onCacheError`（既定 console.warn）で通知する（DECIDED: docs/decisions/0001）。
  */
 export const fetchBytes = async (
   url: string | URL,
@@ -94,21 +122,46 @@ export const fetchBytes = async (
 ): Promise<Uint8Array> => {
   const requestUrl = typeof url === "string" ? url : url.href;
   const fetchImpl = opts.fetch ?? globalThis.fetch;
-  const useCache = (opts.cache ?? true) && typeof caches !== "undefined";
   const cacheName = opts.cacheName ?? DEFAULT_CACHE_NAME;
+  const onCacheError = opts.onCacheError ?? defaultOnCacheError;
+  const cacheStorage = (opts.cache ?? true)
+    ? opts.caches ?? globalCaches()
+    : undefined;
 
-  if (useCache) {
-    const cache = await caches.open(cacheName);
-    const cached = await cache.match(requestUrl);
-    if (cached !== undefined) {
-      const bytes = new Uint8Array(await cached.arrayBuffer());
-      if (opts.validate === undefined) return bytes;
+  // open は読出し・書込みで共有する 1 回だけ。失敗したらキャッシュ無しで続行（縮退+通知）。
+  let cache: Cache | undefined;
+  if (cacheStorage !== undefined) {
+    try {
+      cache = await cacheStorage.open(cacheName);
+    } catch (error) {
+      onCacheError({ op: "open", url: requestUrl, error });
+    }
+  }
+
+  if (cache !== undefined) {
+    let cachedBytes: Uint8Array<ArrayBuffer> | undefined;
+    try {
+      const cached = await cache.match(requestUrl);
+      cachedBytes = cached === undefined
+        ? undefined
+        : new Uint8Array(await cached.arrayBuffer());
+    } catch (error) {
+      // 読出し失敗は miss と同じ扱いで network へ縮退する。
+      onCacheError({ op: "match", url: requestUrl, error });
+    }
+    if (cachedBytes !== undefined) {
+      if (opts.validate === undefined) return cachedBytes;
       try {
-        await opts.validate(bytes);
-        return bytes;
+        await opts.validate(cachedBytes);
+        return cachedBytes;
       } catch {
         // 破損キャッシュ。真実源から取り直すため evict してフォールスルー（self-heal）。
-        await cache.delete(requestUrl);
+        try {
+          await cache.delete(requestUrl);
+        } catch (error) {
+          // evict 失敗でも再取得は続行できる（残った破損エントリは次回また self-heal を試みる）。
+          onCacheError({ op: "delete", url: requestUrl, error });
+        }
       }
     }
   }
@@ -125,9 +178,13 @@ export const fetchBytes = async (
   const bytes = await readBody(response, opts.onProgress);
   // validate 成功後にのみ cache.put（不正物をキャッシュに残さない）。失敗はそのまま throw。
   await opts.validate?.(bytes);
-  if (useCache) {
-    const cache = await caches.open(cacheName);
-    await cache.put(requestUrl, new Response(bytes));
+  if (cache !== undefined) {
+    // put 失敗（quota 超過等）は成功したダウンロードを巻き添えにしない（縮退+通知）。
+    try {
+      await cache.put(requestUrl, new Response(bytes));
+    } catch (error) {
+      onCacheError({ op: "put", url: requestUrl, error });
+    }
   }
   return bytes;
 };
