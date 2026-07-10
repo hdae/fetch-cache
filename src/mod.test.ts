@@ -17,16 +17,36 @@ import {
   uniqueCacheName,
 } from "./testing/mock_fetch.ts";
 
+// Cache.keys() の型は Deno のバージョンで揺れる（2.8: 型に無し / 2.9+: 必須メソッド）。
+// 両対応のため wrapper は keys を必須で持ち（2.8 では余剰プロパティとして無害）、実体が
+// あれば委譲・無ければ reject する。実装側 mod.ts の feature-detect と同じ橋渡しキャスト。
+type CacheKeysFn = (
+  request?: RequestInfo | URL,
+  options?: CacheQueryOptions,
+) => Promise<readonly Request[]>;
+
 /** cache I/O 失敗を注入する CacheStorage ラッパ（overrides で指定した操作だけ差し替える）。 */
 const failingCacheStorage = (overrides: Partial<Cache>): CacheStorage => ({
   open: async (cacheName) => {
     const real = await caches.open(cacheName);
-    return {
-      match: (request) => real.match(request),
-      put: (request, response) => real.put(request, response),
-      delete: (request) => real.delete(request),
+    // 変数経由で返す（オブジェクトリテラル直返しだと 2.8 の Cache 型に無い keys が
+    // 余剰プロパティ検査で弾かれるため）。
+    const wrapper = {
+      match: (request: RequestInfo | URL, options?: CacheQueryOptions) =>
+        real.match(request, options),
+      put: (request: RequestInfo | URL, response: Response) =>
+        real.put(request, response),
+      delete: (request: RequestInfo | URL, options?: CacheQueryOptions) =>
+        real.delete(request, options),
+      keys: (request?: RequestInfo | URL, options?: CacheQueryOptions) => {
+        const keysImpl = (real as Partial<{ keys: CacheKeysFn }>).keys;
+        return keysImpl === undefined
+          ? Promise.reject(new Error("Cache.keys() 未実装ランタイム"))
+          : keysImpl.call(real, request, options);
+      },
       ...overrides,
     };
+    return wrapper;
   },
   has: (cacheName) => caches.has(cacheName),
   delete: (cacheName) => caches.delete(cacheName),
@@ -37,7 +57,7 @@ const failingCacheStorage = (overrides: Partial<Cache>): CacheStorage => ({
 const URL_A = "https://example.com/assets/a.bin";
 const BYTES_A = new Uint8Array([1, 2, 3, 4, 5]);
 
-// 現行 Deno は Cache.keys() 未実装（put/match/delete のみ）。listCachedUrls のテストを
+// Cache.keys() の実装有無はランタイム依存（Deno 2.9 で実装）。listCachedUrls のテストを
 // 実行時サポートで分岐する（実装側 supportsKeys と同じ feature-detect）。
 const probeName = uniqueCacheName();
 const probeCache = await caches.open(probeName);
@@ -519,7 +539,7 @@ Deno.test("clearCache: 名前空間ごと削除して true、既に無ければ 
 
 Deno.test({
   name:
-    "listCachedUrls: keys() 未実装ランタイム（現行 Deno）では fail loud に throw する",
+    "listCachedUrls: keys() 未実装ランタイム（Deno 2.8 以前）では fail loud に throw する",
   ignore: runtimeHasCacheKeys,
   fn: async () => {
     const cacheName = uniqueCacheName();

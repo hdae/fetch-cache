@@ -28,8 +28,9 @@
 
 ## ランタイム
 
-- **Deno では `listCachedUrls` が throw**: 現行 Deno は `Cache.keys()` 未実装のため、実在
-  エントリを空一覧と偽らず fail-loud に throw する（`fetchBytes` のキャッシュ・`evictUrl` /
-  `clearCache` は Deno でも動く）。
+- **Deno 2.8 以前では `listCachedUrls` が throw**: `Cache.keys()` 未実装のため、実在
+  エントリを空一覧と偽らず fail-loud に throw する。Deno 2.9+ は `keys()` 実装済みで
+  `listCachedUrls` も動く（`fetchBytes` のキャッシュ・`evictUrl` / `clearCache` は
+  全バージョンで動く）。
 - **自動テストは Deno のみ**: ブラウザ実環境での CI は無い（ランタイム対応表のブラウザ挙動は
   Web 標準仕様に依拠）。

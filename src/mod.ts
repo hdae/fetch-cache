@@ -234,8 +234,8 @@ export const clearCache = async (
   return await caches.delete(cacheName);
 };
 
-// Deno（2.8 時点）は Cache API のうち keys() を実装していない（put/match/delete のみ）。
-// 型定義には keys が居るため、実行時の feature-detect で判定する。
+// Cache.keys() の有無はランタイム依存（Deno 2.8 以前は未実装・2.9 で実装、ブラウザは実装済み）。
+// 型定義もバージョンで揺れるため、実行時の feature-detect で判定する。
 type CacheWithKeys = Cache & { keys: () => Promise<readonly Request[]> };
 const supportsKeys = (cache: Cache): cache is CacheWithKeys =>
   typeof (cache as Partial<CacheWithKeys>).keys === "function";
@@ -243,7 +243,7 @@ const supportsKeys = (cache: Cache): cache is CacheWithKeys =>
 /**
  * 名前空間内のキャッシュ済み URL 一覧を返す。`caches` が無いランタイムでは []。
  *
- * NOTE: `caches` はあるが `Cache.keys()` が未実装のランタイム（現行 Deno）では throw する
+ * NOTE: `caches` はあるが `Cache.keys()` が未実装のランタイム（Deno 2.8 以前）では throw する
  *       （fail loud）。実在するエントリを [] と偽ると、この一覧に基づく掃除・表示が静かに
  *       壊れるため、欠落は隠さない。
  */
@@ -254,7 +254,7 @@ export const listCachedUrls = async (
   const cache = await caches.open(cacheName);
   if (!supportsKeys(cache)) {
     throw new Error(
-      "fetch-cache: このランタイムの Cache API は keys() を実装していないため一覧できません（現行 Deno など）",
+      "fetch-cache: このランタイムの Cache API は keys() を実装していないため一覧できません（Deno 2.8 以前など）",
     );
   }
   const keys = await cache.keys();

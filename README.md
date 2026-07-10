@@ -153,10 +153,10 @@ Caching is an optimization, not a correctness requirement. On runtimes without
 `evictUrl` / `clearCache` return false, and `listCachedUrls` returns `[]`.
 
 > [!NOTE]
-> Current Deno does not implement `Cache.keys()`, so only `listCachedUrls`
-> throws on Deno (failing loud instead of passing off existing entries as an
-> empty list). `fetchBytes` caching, `evictUrl`, and `clearCache` all work on
-> Deno.
+> Deno implements `Cache.keys()` since 2.9, so `listCachedUrls` works there.
+> On Deno 2.8 and earlier it throws instead (failing loud rather than passing
+> off existing entries as an empty list). `fetchBytes` caching, `evictUrl`,
+> and `clearCache` work on every Deno version.
 
 In browsers, keep in mind that Cache Storage is subject to the browser's
 storage eviction policy (consider `navigator.storage.persist()` for large
