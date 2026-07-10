@@ -65,10 +65,22 @@ if (import.meta.main) {
     console.error(bumped.stderr);
     Deno.exit(bumped.code);
   }
+
+  // bump-version 実行後（= deno.json 書換え後）の失敗分岐では、書換え済みファイルを原状復帰
+  // してから exit する。半 bump の working tree を残すと、素朴な `git add . && commit` で
+  // 版ズレが commit される罠になる（clean-tree ガード済みなので checkout は bump 差分のみ捨てる）。
+  const restoreAndExit = async (
+    message: string,
+    code: number,
+  ): Promise<never> => {
+    await run("git", ["checkout", "--", "deno.json", "src/mod.ts"]);
+    console.error(`${message}（deno.json / src/mod.ts は原状復帰済み）`);
+    Deno.exit(code);
+  };
+
   const after = await readVersion();
   if (after === before) {
-    console.error(`バージョンが変化しませんでした（${before}）。`);
-    Deno.exit(1);
+    await restoreAndExit(`バージョンが変化しませんでした（${before}）。`, 1);
   }
 
   // 焼き込み src/mod.ts を同じ版へ surgical 更新（他行は保全）。deno.json と常に一致させる。
@@ -79,12 +91,17 @@ if (import.meta.main) {
     `export const VERSION = "${after}";`,
   );
   if (updatedTs === modTs) {
-    console.error(
+    await restoreAndExit(
       `${modPath} の VERSION 行が見つからないか変化しませんでした。`,
+      1,
     );
-    Deno.exit(1);
   }
-  await Deno.writeTextFile(modPath, updatedTs);
+  try {
+    await Deno.writeTextFile(modPath, updatedTs);
+  } catch (error) {
+    console.error(error);
+    await restoreAndExit(`${modPath} の書き込みに失敗しました。`, 1);
+  }
 
   // version バンプ（deno.json + src/mod.ts）のみを1コミットに（他の staged 変更は含めない）。
   const committed = await run("git", [
@@ -96,7 +113,7 @@ if (import.meta.main) {
   ]);
   if (committed.code !== 0) {
     console.error(committed.stderr);
-    Deno.exit(committed.code);
+    await restoreAndExit("git commit に失敗しました。", committed.code);
   }
   console.error(
     `${before} -> ${after} を commit しました（tag/push は未実施）。`,
