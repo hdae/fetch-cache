@@ -3,16 +3,19 @@
  *
  * 可変 ref（"main" 等）は必ず現在のコミット SHA へ解決してから取得する。SHA 固定 URL は
  * 不変＝キャッシュ可能なので、SHA が変わらない限り 2 回目以降は network なしで返る。
- * `expectedBytes` / `sha256` は `fetchBytes` の validate フックとして実装され、キャッシュ
- * ヒット側にも効く（破損キャッシュは self-heal）。
+ * `expectedBytes` / `sha256` / カスタム `validate` は `fetchBytes` の validate フックへ
+ * 合成され、キャッシュヒット側にも効く（破損キャッシュは self-heal）。ファイル毎の
+ * `decode` で「保存形 ≠ 利用形」（gzip のまま保存・解凍して返す等）にも対応する。
  *
  * @module
  */
 
 import {
   type CacheErrorContext,
+  type DecodeBytes,
   fetchBytes,
   type FetchProgress,
+  type ValidateBytes,
 } from "../mod.ts";
 
 export type HfRepoKind = "model" | "dataset" | "space";
@@ -30,10 +33,26 @@ export type HfRepoRef = {
 
 export type HfFileSpec = {
   path: string;
-  /** バイト数検証（不一致 throw）。 */
+  /** バイト数検証（不一致 throw）。Hub 上の保存形 raw に対して。 */
   expectedBytes?: number;
-  /** SHA-256 検証（小文字 hex、不一致 throw。crypto.subtle 必須 — 無ければ throw）。 */
+  /**
+   * SHA-256 検証（小文字 hex、不一致 throw。crypto.subtle 必須 — 無ければ throw）。
+   * Hub 上の保存形 raw に対して照合する（LFS メタデータの値がそのまま使える。`decode`
+   * 併用時も解凍前）。
+   */
   sha256?: string;
+  /**
+   * カスタム検証。built-in（expectedBytes / sha256）の後に、同じく保存形 raw に対して走る。
+   * throw = 破損扱い（キャッシュヒット側は self-heal）。利用形側の検証は `decode` 内で
+   * throw する。
+   */
+  validate?: ValidateBytes;
+  /**
+   * 保存形 → 利用形の変換（cache 層の `decode` へそのまま転送。gzip なら同梱の
+   * `decodeGzip` が使える）。cache には raw のまま保存され、戻り値だけが decode 適用後に
+   * なる。ファイル毎に形式が違うため、呼び出しオプションではなくファイル指定側に置く。
+   */
+  decode?: DecodeBytes;
 };
 
 const DEFAULT_HUB_URL = "https://huggingface.co";
@@ -148,13 +167,15 @@ const sha256Hex = async (bytes: Uint8Array): Promise<string> => {
 };
 
 /**
- * HfFileSpec の検証（expectedBytes / sha256）を fetchBytes の validate フックにする。
- * validate として渡すことでキャッシュヒット側にも効き、破損キャッシュは self-heal される。
+ * HfFileSpec の検証（expectedBytes / sha256 / カスタム validate）を fetchBytes の validate
+ * フックへ合成する。validate として渡すことでキャッシュヒット側にも効き、破損キャッシュは
+ * self-heal される。built-in を先に走らせる（安価な長さ検査 → sha256 → カスタム）。
  */
-const buildValidate = (
-  spec: HfFileSpec,
-): ((bytes: Uint8Array) => Promise<void>) | undefined => {
-  if (spec.expectedBytes === undefined && spec.sha256 === undefined) {
+const buildValidate = (spec: HfFileSpec): ValidateBytes | undefined => {
+  if (
+    spec.expectedBytes === undefined && spec.sha256 === undefined &&
+    spec.validate === undefined
+  ) {
     return undefined;
   }
   return async (bytes) => {
@@ -173,6 +194,7 @@ const buildValidate = (
         );
       }
     }
+    await spec.validate?.(bytes);
   };
 };
 
@@ -189,6 +211,7 @@ const fetchResolvedFile = (
     cache: true,
     cacheName: opts.cacheName ?? DEFAULT_CACHE_NAME,
     validate: buildValidate(spec),
+    decode: spec.decode,
     onProgress: onProgress === undefined
       ? undefined
       : (progress) => onProgress({ ...progress, path: spec.path }),

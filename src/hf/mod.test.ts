@@ -1,4 +1,9 @@
-import { assertEquals, assertRejects, assertStringIncludes } from "@std/assert";
+import {
+  assertEquals,
+  assertExists,
+  assertRejects,
+  assertStringIncludes,
+} from "@std/assert";
 import {
   fetchHfFile,
   fetchHfFiles,
@@ -374,6 +379,142 @@ Deno.test("fetchHfFiles: 1 ファイルの失敗で全体が reject し、成功
     });
     assertEquals(again, bytesA);
     assertEquals(calls.length, callsBefore); // network 0 回。
+  } finally {
+    await caches.delete(cacheName);
+  }
+});
+
+Deno.test("fetchHfFile: decode は利用形を返し、cache は保存形 raw のまま（sha256 は raw に照合）", async () => {
+  const cacheName = uniqueCacheName();
+  const url = `https://huggingface.co/owner/name/resolve/${SHA}/dict.gz`;
+  const { fetch, calls } = mockFetch(() => new Response(BYTES));
+  const spec = {
+    path: "dict.gz",
+    sha256: BYTES_SHA256, // 保存形 raw のハッシュ（Hub の LFS メタデータ相当）。
+    decode: (raw: Uint8Array) => new Uint8Array([raw.length]),
+  };
+  try {
+    const first = await fetchHfFile({ repo: REPO, revision: SHA }, spec, {
+      cacheName,
+      fetch,
+    });
+    assertEquals(first, new Uint8Array([4])); // 戻り値は decode 適用後の利用形。
+
+    // cache に入るのは sha256 の照合対象と同じ保存形 raw。
+    const cache = await caches.open(cacheName);
+    const cachedResponse = await cache.match(url);
+    assertExists(cachedResponse);
+    assertEquals(new Uint8Array(await cachedResponse.arrayBuffer()), BYTES);
+
+    // ヒット側も sha256（raw）→ decode の同じ経路で network 0 回。
+    const second = await fetchHfFile({ repo: REPO, revision: SHA }, spec, {
+      cacheName,
+      fetch,
+    });
+    assertEquals(second, new Uint8Array([4]));
+    assertEquals(calls.length, 1);
+  } finally {
+    await caches.delete(cacheName);
+  }
+});
+
+Deno.test("fetchHfFile: カスタム validate は保存形 raw を受け、throw は不正扱いでキャッシュしない", async () => {
+  const cacheName = uniqueCacheName();
+  const { fetch } = mockFetch(() => new Response(BYTES));
+  const seen: Uint8Array[] = [];
+  try {
+    const bytes = await fetchHfFile(
+      { repo: REPO, revision: SHA },
+      {
+        path: "a.bin",
+        validate: (raw) => {
+          seen.push(raw.slice());
+        },
+        decode: (raw) => new Uint8Array([raw.length]),
+      },
+      { cacheName, fetch },
+    );
+    assertEquals(bytes, new Uint8Array([4]));
+    assertEquals(seen, [BYTES]); // decode 前の raw を受ける。
+
+    await assertRejects(
+      () =>
+        fetchHfFile(
+          { repo: REPO, revision: SHA },
+          {
+            path: "b.bin",
+            validate: () => {
+              throw new Error("magic 不一致");
+            },
+          },
+          { cacheName, fetch },
+        ),
+      Error,
+      "magic 不一致",
+    );
+    const cache = await caches.open(cacheName);
+    assertEquals(
+      await cache.match(
+        `https://huggingface.co/owner/name/resolve/${SHA}/b.bin`,
+      ),
+      undefined, // 不正物は保存されない（cache 層の契約が HF 層でも生きる）。
+    );
+  } finally {
+    await caches.delete(cacheName);
+  }
+});
+
+Deno.test("fetchHfFile: built-in 検証（expectedBytes）が落ちたらカスタム validate は走らない", async () => {
+  const cacheName = uniqueCacheName();
+  const { fetch } = mockFetch(() => new Response(BYTES));
+  let customCalled = false;
+  try {
+    const error = await assertRejects(
+      () =>
+        fetchHfFile(
+          { repo: REPO, revision: SHA },
+          {
+            path: "a.bin",
+            expectedBytes: BYTES.length + 1,
+            validate: () => {
+              customCalled = true;
+            },
+          },
+          { cacheName, fetch },
+        ),
+      Error,
+    );
+    assertStringIncludes(error.message, "バイト数不一致");
+    assertEquals(customCalled, false); // 安価な built-in が先に落ちる（合成順の凍結）。
+  } finally {
+    await caches.delete(cacheName);
+  }
+});
+
+Deno.test("fetchHfFiles: decode はファイル毎に独立して適用される", async () => {
+  const cacheName = uniqueCacheName();
+  const dictBytes = new Uint8Array([5, 5, 5]);
+  const metaBytes = new Uint8Array([7, 7]);
+  const { fetch } = mockFetch((url) => {
+    if (url.includes("/api/")) return Response.json({ sha: SHA });
+    if (url.endsWith("/dict.gz")) return new Response(dictBytes);
+    if (url.endsWith("/meta.json")) return new Response(metaBytes);
+    return new Response("missing", { status: 404, statusText: "Not Found" });
+  });
+  try {
+    const files = await fetchHfFiles(
+      { repo: REPO },
+      {
+        dict: {
+          path: "dict.gz",
+          decode: (raw) => new Uint8Array([raw.length]),
+        },
+        meta: "meta.json",
+      },
+      { cacheName, fetch },
+    );
+    assertEquals(files.dict, new Uint8Array([3])); // decode 指定ファイルだけ利用形。
+    assertEquals(files.meta, metaBytes); // 指定なしは raw のまま（従来互換）。
   } finally {
     await caches.delete(cacheName);
   }
