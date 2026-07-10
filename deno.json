@@ -10,7 +10,7 @@
     "@std/assert": "jsr:@std/assert@^1.0.0"
   },
   "tasks": {
-    "check": "deno fmt --check .github CLAUDE.md README.md deno.json scripts src && deno lint scripts src && deno check src/mod.ts src/hf/mod.ts && deno test --allow-read",
+    "check": "deno fmt --check .github CLAUDE.md README.md deno.json docs scripts src && deno lint scripts src && deno check . && deno test --allow-read",
     "bump": "deno run --allow-read --allow-run=deno,git --allow-write=src/mod.ts --no-lock scripts/bump.ts"
   },
   "fmt": {
