@@ -6,6 +6,8 @@ export type MockFetch = {
   fetch: typeof globalThis.fetch;
   /** 呼び出された URL の記録（回数 = length）。 */
   calls: string[];
+  /** 呼び出し毎の RequestInit の記録（init パススルー検証用。未指定は undefined）。 */
+  inits: (RequestInit | undefined)[];
 };
 
 /** URL ごとに Response を返すハンドラから mock fetch を作る。 */
@@ -13,12 +15,14 @@ export const mockFetch = (
   handler: (url: string) => Response | Promise<Response>,
 ): MockFetch => {
   const calls: string[] = [];
-  const fetchImpl: typeof globalThis.fetch = (input, _init) => {
+  const inits: (RequestInit | undefined)[] = [];
+  const fetchImpl: typeof globalThis.fetch = (input, init) => {
     const url = input instanceof Request ? input.url : String(input);
     calls.push(url);
+    inits.push(init);
     return Promise.resolve(handler(url));
   };
-  return { fetch: fetchImpl, calls };
+  return { fetch: fetchImpl, calls, inits };
 };
 
 /**

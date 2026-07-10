@@ -87,7 +87,7 @@ export const hfResolveUrl = (ref: HfRepoRef & { path: string }): string => {
  */
 export const resolveHfRevision = async (
   ref: HfRepoRef,
-  opts: { fetch?: typeof globalThis.fetch } = {},
+  opts: { fetch?: typeof globalThis.fetch; init?: RequestInit } = {},
 ): Promise<string> => {
   const revision = ref.revision ?? "main";
   if (isCommitSha(revision)) return revision;
@@ -97,7 +97,7 @@ export const resolveHfRevision = async (
     encodeURIComponent(revision)
   }`;
   const fetchImpl = opts.fetch ?? globalThis.fetch;
-  const response = await fetchImpl(url);
+  const response = await fetchImpl(url, opts.init);
   if (!response.ok) {
     // 未消費 body は接続リソースを保持し続けるため解放してから throw する（mod.ts と同じ扱い）。
     await response.body?.cancel().catch(() => {});
@@ -119,6 +119,11 @@ export type HfFetchOptions = {
   onProgress?: (progress: FetchProgress & { path: string }) => void;
   /** cache I/O 失敗の通知（cache 層へそのまま渡す）。既定 console.warn。 */
   onCacheError?: (context: CacheErrorContext) => void;
+  /**
+   * fetch へそのまま渡す RequestInit（gated/private repo の Authorization 等）。revision
+   * 解決 API とファイル取得の両方へ渡る。キャッシュキーは URL のみ（docs/limitations.md）。
+   */
+  init?: RequestInit;
   fetch?: typeof globalThis.fetch;
   /** CacheStorage の差し替え（cache 層へそのまま渡す）。既定 globalThis.caches。 */
   caches?: CacheStorage;
@@ -188,6 +193,7 @@ const fetchResolvedFile = (
       ? undefined
       : (progress) => onProgress({ ...progress, path: spec.path }),
     onCacheError: opts.onCacheError,
+    init: opts.init,
     fetch: opts.fetch,
     caches: opts.caches,
   });
@@ -205,7 +211,10 @@ export const fetchHfFile = async (
   file: string | HfFileSpec,
   opts: HfFetchOptions = {},
 ): Promise<Uint8Array> => {
-  const revision = await resolveHfRevision(ref, { fetch: opts.fetch });
+  const revision = await resolveHfRevision(ref, {
+    fetch: opts.fetch,
+    init: opts.init,
+  });
   return await fetchResolvedFile(ref, revision, toSpec(file), opts);
 };
 
@@ -218,7 +227,10 @@ export const fetchHfFiles = async <Names extends string>(
   files: Record<Names, string | HfFileSpec>,
   opts: HfFetchOptions = {},
 ): Promise<Record<Names, Uint8Array>> => {
-  const revision = await resolveHfRevision(ref, { fetch: opts.fetch });
+  const revision = await resolveHfRevision(ref, {
+    fetch: opts.fetch,
+    init: opts.init,
+  });
   // Object.keys は string[] に落ちるため Names[] へ戻す（キーは files の実キーそのもの）。
   const names = Object.keys(files) as Names[];
   const entries = await Promise.all(

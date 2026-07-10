@@ -42,6 +42,16 @@ export type FetchBytesOptions = {
    * 縮退して続行する。無言では握り潰さない（DECIDED: docs/decisions/0001）。
    */
   onCacheError?: (context: CacheErrorContext) => void;
+  /**
+   * fetch へそのまま渡す RequestInit（Authorization 等のヘッダ・AbortSignal など）。
+   * キャッシュキーは URL のみ（ヘッダ非依存）なので、認証付きで取得した bytes は以後
+   * 認証なしの呼び出しでもヒットする（docs/limitations.md）。
+   *
+   * NOTE: Cache API は GET しか格納できないため、cache 有効のまま GET 以外の method を
+   *       指定すると throw する（`cache: false` なら任意の method 可 —
+   *       DECIDED: docs/decisions/0002）。
+   */
+  init?: RequestInit;
   /** fetch の差し替え（テスト・カスタム輸送用）。既定 globalThis.fetch。 */
   fetch?: typeof globalThis.fetch;
   /** CacheStorage の差し替え（テストの故障注入用）。既定 globalThis.caches。 */
@@ -124,6 +134,17 @@ export const fetchBytes = async (
   const fetchImpl = opts.fetch ?? globalThis.fetch;
   const cacheName = opts.cacheName ?? DEFAULT_CACHE_NAME;
   const onCacheError = opts.onCacheError ?? defaultOnCacheError;
+
+  // Cache API は GET しか格納できない。`caches` の有無に依らず（Node.js でも）一貫して
+  // fail loud にするため、ガードは「キャッシュを使う意図」（cache !== false）で判定する。
+  const method = (opts.init?.method ?? "GET").toUpperCase();
+  if ((opts.cache ?? true) && method !== "GET") {
+    throw new Error(
+      `fetch-cache: GET 以外（${method}）はキャッシュできません（Cache API の制約）。` +
+        `cache: false を指定してください (${requestUrl})`,
+    );
+  }
+
   const cacheStorage = (opts.cache ?? true)
     ? opts.caches ?? globalCaches()
     : undefined;
@@ -166,7 +187,7 @@ export const fetchBytes = async (
     }
   }
 
-  const response = await fetchImpl(requestUrl);
+  const response = await fetchImpl(requestUrl, opts.init);
   if (!response.ok) {
     // 未消費 body は接続リソースを保持し続けるため解放してから throw する。
     // cancel 自体の失敗は握りつぶす（本命の HTTP エラーを優先する後始末）。

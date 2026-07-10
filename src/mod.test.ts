@@ -1,4 +1,9 @@
-import { assertEquals, assertRejects, assertStringIncludes } from "@std/assert";
+import {
+  assertEquals,
+  assertRejects,
+  assertStrictEquals,
+  assertStringIncludes,
+} from "@std/assert";
 import {
   type CacheErrorContext,
   clearCache,
@@ -436,6 +441,54 @@ Deno.test("fetchBytes: self-heal 中の evict 失敗でも再取得は続行し�
     assertEquals(bytes, BYTES_A); // 破損ヒット → evict 失敗 → それでも network から取り直す。
     assertEquals(calls.length, 1);
     assertEquals(notified.map((context) => context.op), ["delete"]);
+  } finally {
+    await caches.delete(cacheName);
+  }
+});
+
+Deno.test("fetchBytes: init（ヘッダ・signal）は fetch へそのまま渡る", async () => {
+  const cacheName = uniqueCacheName();
+  const { fetch, inits } = mockFetch(() => new Response(BYTES_A));
+  const controller = new AbortController();
+  try {
+    await fetchBytes(URL_A, {
+      cacheName,
+      fetch,
+      init: {
+        headers: { authorization: "Bearer token" },
+        signal: controller.signal,
+      },
+    });
+    assertEquals(inits.length, 1);
+    assertEquals(
+      new Headers(inits[0]?.headers).get("authorization"),
+      "Bearer token",
+    );
+    assertStrictEquals(inits[0]?.signal, controller.signal);
+  } finally {
+    await caches.delete(cacheName);
+  }
+});
+
+Deno.test("fetchBytes: GET 以外はキャッシュ有効のままだと throw、cache:false なら通る", async () => {
+  const cacheName = uniqueCacheName();
+  const { fetch, calls, inits } = mockFetch(() => new Response(BYTES_A));
+  try {
+    const error = await assertRejects(
+      () => fetchBytes(URL_A, { cacheName, fetch, init: { method: "POST" } }),
+      Error,
+    );
+    assertStringIncludes(error.message, "cache: false");
+    assertEquals(calls.length, 0); // fetch 前に fail loud。
+
+    const bytes = await fetchBytes(URL_A, {
+      cacheName,
+      fetch,
+      cache: false,
+      init: { method: "POST" },
+    });
+    assertEquals(bytes, BYTES_A);
+    assertEquals(inits[0]?.method, "POST");
   } finally {
     await caches.delete(cacheName);
   }
