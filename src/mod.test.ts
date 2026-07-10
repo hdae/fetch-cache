@@ -357,6 +357,86 @@ Deno.test("single-flight: onProgress は合流者へも fan-out される", asyn
   }
 });
 
+Deno.test("single-flight: 途中合流者には直近の進捗が合流時に 1 回即時通知される", async () => {
+  const cacheName = uniqueCacheName();
+  // 手動制御ストリームで「チャンク1 → 合流 → チャンク2」の順序を決定的に作る。
+  let controller!: ReadableStreamDefaultController<Uint8Array<ArrayBuffer>>;
+  const stream = new ReadableStream<Uint8Array<ArrayBuffer>>({
+    start(c) {
+      controller = c;
+    },
+  });
+  const { fetch } = mockFetch(() => new Response(stream));
+  const leaderProgress: number[] = [];
+  const leaderFirstChunk = Promise.withResolvers<void>();
+  try {
+    const leader = fetchBytes(URL_A, {
+      cacheName,
+      fetch,
+      onProgress: (p) => {
+        leaderProgress.push(p.loaded);
+        leaderFirstChunk.resolve();
+      },
+    });
+    controller.enqueue(new Uint8Array([1, 2]));
+    await leaderFirstChunk.promise; // ここで state.last = {loaded: 2}
+    const joinerProgress: number[] = [];
+    const joiner = fetchBytes(URL_A, {
+      cacheName,
+      fetch,
+      onProgress: (p) => joinerProgress.push(p.loaded),
+    });
+    // 合流時リプレイは合流の同期区間で走る（fetchBytes が最初の await に達した時点で通知済み）。
+    assertEquals(joinerProgress, [2]);
+    controller.enqueue(new Uint8Array([3, 4, 5]));
+    controller.close();
+    await Promise.all([leader, joiner]);
+    assertEquals(leaderProgress, [2, 5]);
+    assertEquals(joinerProgress, [2, 5]);
+  } finally {
+    await caches.delete(cacheName);
+  }
+});
+
+Deno.test("single-flight: onProgress リスナーの throw は取得を巻き添えにしない（隔離+警告）", async () => {
+  const cacheName = uniqueCacheName();
+  const gate = Promise.withResolvers<void>();
+  const { fetch } = mockFetch(async () => {
+    await gate.promise;
+    return chunkedResponse([new Uint8Array([1, 2, 3])]);
+  });
+  const seen: number[] = [];
+  const warns: string[] = [];
+  const origWarn = console.warn;
+  console.warn = (...args: unknown[]) => {
+    warns.push(String(args[0]));
+  };
+  try {
+    // leader 自身のリスナーが事故を起こしても、合流フライト全体（joiner の取得）は続行する。
+    const bad = fetchBytes(URL_A, {
+      cacheName,
+      fetch,
+      onProgress: () => {
+        throw new Error("リスナー事故");
+      },
+    });
+    const good = fetchBytes(URL_A, {
+      cacheName,
+      fetch,
+      onProgress: (p) => seen.push(p.loaded),
+    });
+    gate.resolve();
+    const [a, b] = await Promise.all([bad, good]);
+    assertEquals(a, new Uint8Array([1, 2, 3]));
+    assertEquals(b, new Uint8Array([1, 2, 3]));
+    assertEquals(seen, [3]);
+    assertEquals(warns.some((w) => w.includes("onProgress")), true);
+  } finally {
+    console.warn = origWarn;
+    await caches.delete(cacheName);
+  }
+});
+
 Deno.test("single-flight: cache:false の呼び出しは合流しない（毎回取得の意図を尊重）", async () => {
   const gate = Promise.withResolvers<void>();
   const { fetch, calls } = mockFetch(async () => {

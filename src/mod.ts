@@ -56,9 +56,17 @@ export type FetchBytesOptions = {
    *
    * MUST NOT: `raw` を破壊的に変更しない — network 側では decode 成功後にその raw を
    * cache.put するため、変更すると壊れた内容がキャッシュされる。
+   * MUST NOT: `decode` / `validate` の中から同一 (cacheName, URL) の `fetchBytes` を
+   * 呼ばない — 自分自身の in-flight フライトに合流して自己デッドロックする
+   * （DECIDED: docs/decisions/0004）。
    */
   decode?: DecodeBytes;
-  /** ダウンロード進捗（チャンク毎）。キャッシュヒット時は呼ばれない。 */
+  /**
+   * ダウンロード進捗（チャンク毎）。キャッシュヒット時は呼ばれない。進捗は任意情報であり、
+   * リスナーの throw は取得を落とさない（console.warn で通知して続行 — single-flight の
+   * 合流フライトで 1 リスナーの事故が他の呼び出しを巻き添えにしないため。
+   * DECIDED: docs/decisions/0004）。
+   */
   onProgress?: (progress: FetchProgress) => void;
   /**
    * cache I/O 失敗（open/match/put/delete の throw。quota 超過等）の通知先。既定 console.warn。
@@ -165,6 +173,26 @@ type InflightEntry = {
 };
 
 const inflight = new Map<string, InflightEntry>();
+
+/**
+ * 進捗リスナーの隔離ラッパ。進捗は任意情報（正しさの要件ではない）なので、リスナーの throw で
+ * 取得を落とさない — 特に single-flight の合流フライトでは 1 リスナーの事故が他の呼び出しの
+ * ダウンロードまで巻き添えにする。onCacheError と同じ「落とさず・無言にもしない」縮退方針。
+ */
+const isolateProgress = (
+  listener: (progress: FetchProgress) => void,
+  requestUrl: string,
+): (progress: FetchProgress) => void =>
+(progress) => {
+  try {
+    listener(progress);
+  } catch (error) {
+    console.warn(
+      `fetch-cache: onProgress リスナーが throw しました（通知のみ中断・取得は続行） (${requestUrl})`,
+      error,
+    );
+  }
+};
 
 /**
  * raw 取得と（先行呼び出しオプションでの）validate/decode の本体。cache open/match →
@@ -292,20 +320,25 @@ export const fetchBytes = async (
     const { decoded } = await acquireAndDecode(
       requestUrl,
       opts,
-      opts.onProgress,
+      opts.onProgress === undefined
+        ? undefined
+        : isolateProgress(opts.onProgress, requestUrl),
     );
     return decoded;
   }
 
-  const key = `${opts.cacheName ?? DEFAULT_CACHE_NAME} ${requestUrl}`;
+  // 区切りは U+0000（cacheName にも URL 文字列にも現れない制御文字）。可視文字で連結すると
+  // ("x", "y z") と ("x y", "z") のような別ペアが同一キーへ衝突し誤合流する。
+  // NOTE: 必ずエスケープ表記で書く — 生の制御文字は不可視でレビューを欺く。
+  const key = `${opts.cacheName ?? DEFAULT_CACHE_NAME}\u0000${requestUrl}`;
   const existing = inflight.get(key);
   if (existing !== undefined) {
     // 合流: raw（保存形）を受け取り、自分の validate / decode を適用する。
     if (opts.onProgress !== undefined) {
-      existing.listeners.add(opts.onProgress);
-      if (existing.state.last !== undefined) {
-        opts.onProgress(existing.state.last);
-      }
+      const isolated = isolateProgress(opts.onProgress, requestUrl);
+      existing.listeners.add(isolated);
+      // 直近の進捗を 1 回即時通知して、合流者の表示を現在地へ追いつかせる。
+      if (existing.state.last !== undefined) isolated(existing.state.last);
     }
     const { raw } = await existing.promise;
     return await validateAndDecode(raw, opts);
@@ -314,8 +347,11 @@ export const fetchBytes = async (
   // 先行呼び出し（leader）。MUST: ここから inflight.set まで await を挟まない —
   // 挟むと同一ターンの並行呼び出しが合流できず二重フライトになる（TOCTOU）。
   const listeners = new Set<(progress: FetchProgress) => void>();
-  if (opts.onProgress !== undefined) listeners.add(opts.onProgress);
+  if (opts.onProgress !== undefined) {
+    listeners.add(isolateProgress(opts.onProgress, requestUrl));
+  }
   const state: { last?: FetchProgress } = {};
+  // リスナーは登録時点で全て隔離済み（isolateProgress）。
   const emit = (progress: FetchProgress): void => {
     state.last = progress;
     for (const listener of listeners) listener(progress);
