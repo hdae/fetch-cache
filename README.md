@@ -18,8 +18,12 @@ corrupted cache entries. A thin HuggingFace Hub layer (`./hf`) is included.
 - **HuggingFace layer**: resolves mutable refs (`"main"` etc.) to the current
   commit SHA, then fetches and caches via immutable SHA-pinned URLs; parallel
   multi-file downloads with `expectedBytes` / `sha256` integrity checks
-- **Injectable fetch**: every fetch function accepts a `fetch` implementation
-  (testing, custom transport, auth headers)
+- **fetch-compatible options**: pass a standard `RequestInit` via `init` (auth
+  headers for gated repos, `AbortSignal`, …) or swap out `fetch` itself
+  (testing, custom transport)
+- **Quota-safe**: cache I/O failures (quota exceeded, broken storage) never
+  lose a successful download — they degrade to a plain fetch and notify via
+  `onCacheError` (default `console.warn`)
 
 ## Installation
 
@@ -57,6 +61,23 @@ const bytes = await fetchBytes("https://example.com/assets/model.onnx", {
 `validate` also applies to cache reads: an entry that fails validation is
 evicted and re-fetched from the network (self-heal). If a freshly fetched
 response fails validation, the error is thrown as-is and nothing is cached.
+
+### Auth & abort
+
+```typescript
+// A standard RequestInit passes straight through to fetch.
+const controller = new AbortController();
+const bytes = await fetchBytes("https://example.com/private/model.onnx", {
+  init: {
+    headers: { authorization: "Bearer <token>" },
+    signal: controller.signal,
+  },
+});
+```
+
+The cache key is the URL only (headers are not part of it), and only GET can
+be cached — pass `cache: false` for other methods. See
+[docs/limitations.md](docs/limitations.md).
 
 ### Cache management
 
@@ -109,6 +130,8 @@ A few things worth knowing:
   HF downloads — use `clearCache("fetch-cache-hf")`.
 - `hubUrl` (default `"https://huggingface.co"`) can be overridden to point at
   a mirror.
+- Gated / private repos: pass an Authorization header via `init` — it reaches
+  both the revision-resolution call and the file download.
 - If any file fails, `fetchHfFiles` rejects as a whole, but files that already
   succeeded stay cached — a retry picks them up as instant cache hits.
 
