@@ -12,7 +12,7 @@
  * @module
  */
 
-export const VERSION = "0.1.0";
+export const VERSION = "0.2.0";
 
 /** ダウンロード進捗。`total` は content-length ヘッダがあるときだけ入る。 */
 export type FetchProgress = { loaded: number; total?: number };
