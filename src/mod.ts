@@ -115,6 +115,9 @@ export const fetchBytes = async (
 
   const response = await fetchImpl(requestUrl);
   if (!response.ok) {
+    // 未消費 body は接続リソースを保持し続けるため解放してから throw する。
+    // cancel 自体の失敗は握りつぶす（本命の HTTP エラーを優先する後始末）。
+    await response.body?.cancel().catch(() => {});
     throw new Error(
       `fetch-cache: HTTP ${response.status} ${response.statusText} (${requestUrl})`,
     );

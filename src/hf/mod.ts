@@ -95,6 +95,8 @@ export const resolveHfRevision = async (
   const fetchImpl = opts.fetch ?? globalThis.fetch;
   const response = await fetchImpl(url);
   if (!response.ok) {
+    // 未消費 body は接続リソースを保持し続けるため解放してから throw する（mod.ts と同じ扱い）。
+    await response.body?.cancel().catch(() => {});
     throw new Error(
       `fetch-cache: HTTP ${response.status} ${response.statusText} (${url})`,
     );

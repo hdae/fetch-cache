@@ -307,6 +307,24 @@ Deno.test("fetchBytes: 正常キャッシュヒットは validate 通過で netw
   }
 });
 
+Deno.test("fetchBytes: HTTP エラー時は body を cancel して接続リソースを解放する", async () => {
+  const cacheName = uniqueCacheName();
+  let response: Response | undefined;
+  const { fetch } = mockFetch(() => {
+    response = new Response("missing", {
+      status: 404,
+      statusText: "Not Found",
+    });
+    return response;
+  });
+  try {
+    await assertRejects(() => fetchBytes(URL_A, { cacheName, fetch }), Error);
+    assertEquals(response?.bodyUsed, true); // cancel 済み＝disturbed。
+  } finally {
+    await caches.delete(cacheName);
+  }
+});
+
 Deno.test("evictUrl: エントリがあれば削除して true、無ければ false", async () => {
   const cacheName = uniqueCacheName();
   const { fetch } = mockFetch(() => new Response(BYTES_A));

@@ -124,6 +124,22 @@ Deno.test("resolveHfRevision: HTTP エラーは status 入りメッセージで 
   assertStringIncludes(error.message, "/api/models/owner/name/revision/main");
 });
 
+Deno.test("resolveHfRevision: HTTP エラー時は body を cancel して接続リソースを解放する", async () => {
+  let response: Response | undefined;
+  const { fetch } = mockFetch(() => {
+    response = new Response("x", {
+      status: 500,
+      statusText: "Internal Server Error",
+    });
+    return response;
+  });
+  await assertRejects(
+    () => resolveHfRevision({ repo: REPO }, { fetch }),
+    Error,
+  );
+  assertEquals(response?.bodyUsed, true); // cancel 済み＝disturbed。
+});
+
 Deno.test("fetchHfFile: 可変 ref は解決 1 回 → SHA 固定 URL で取得する", async () => {
   const cacheName = uniqueCacheName();
   const { fetch, calls } = mockFetch((url) =>
