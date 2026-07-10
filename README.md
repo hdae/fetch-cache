@@ -15,6 +15,10 @@ corrupted cache entries. A thin HuggingFace Hub layer (`./hf`) is included.
   entries are evicted and re-fetched from the source of truth (fail loud)
 - **Progress callback**: streaming reads fire `onProgress` per chunk (`total`
   is present only when the response has content-length)
+- **Decode hook (stored form ≠ usage form)**: keep the cache in the fetched
+  form (e.g. gzip) while callers receive the decoded bytes; a failing `decode`
+  self-heals exactly like `validate`, and a zero-dependency `decodeGzip`
+  helper is included
 - **HuggingFace layer**: resolves mutable refs (`"main"` etc.) to the current
   commit SHA, then fetches and caches via immutable SHA-pinned URLs; parallel
   multi-file downloads with `expectedBytes` / `sha256` integrity checks
@@ -61,6 +65,40 @@ const bytes = await fetchBytes("https://example.com/assets/model.onnx", {
 `validate` also applies to cache reads: an entry that fails validation is
 evicted and re-fetched from the network (self-heal). If a freshly fetched
 response fails validation, the error is thrown as-is and nothing is cached.
+
+### Decode (store compressed, return decompressed)
+
+```typescript
+import { decodeGzip, fetchBytes } from "@hdae/fetch-cache";
+
+// The cache keeps the small gzip; callers receive the decompressed bytes.
+const bytes = await fetchBytes("https://example.com/assets/dict.jtd.gz", {
+  decode: decodeGzip,
+});
+```
+
+`decode` converts the stored form (raw) into the usage form: the cache always
+stores raw, and only the return value has `decode` applied. It runs on cache
+reads too, and a throwing `decode` is treated as corruption exactly like
+`validate` — cache entries self-heal (evict + refetch), network responses
+throw and are never cached. Any custom transform works (decompression,
+decryption, …); validate the decoded form by throwing inside `decode`:
+
+```typescript
+const dict = await fetchBytes(url, {
+  decode: async (raw) => {
+    const bytes = await decodeGzip(raw);
+    if (bytes[0] !== 0x4a) throw new Error("magic mismatch"); // throw = corrupt
+    return bytes;
+  },
+});
+```
+
+Two contract details: `validate` (if given) runs on the raw bytes _before_
+`decode`, and `decode` must not mutate its input — the raw bytes are written
+to the cache after decoding. The decoded form is never cached, so `decode`
+runs on every call (storage savings traded for CPU; see
+[docs/limitations.md](docs/limitations.md)).
 
 ### Auth & abort
 
@@ -122,6 +160,23 @@ files.dict; // Uint8Array
 
 `expectedBytes` / `sha256` are implemented as the generic layer's `validate`
 hook, so they also protect cache reads (corrupted entries self-heal).
+
+Each file spec also takes a custom `validate` (extra checks on the raw bytes,
+after the built-in ones) and a `decode` (stored form → usage form, per file):
+
+```typescript
+import { decodeGzip } from "@hdae/fetch-cache";
+
+const files = await fetchHfFiles(
+  { repo: "owner/name", kind: "dataset" },
+  {
+    // sha256 matches the hub's LFS metadata (the stored gzip);
+    // callers receive the decompressed bytes.
+    dict: { path: "dict.jtd.gz", sha256: "…", decode: decodeGzip },
+    meta: "meta.json",
+  },
+);
+```
 
 A few things worth knowing:
 

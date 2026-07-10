@@ -18,6 +18,10 @@
   （Content-Encoding 越しでは解凍後サイズと不一致が正常）、突合は誤検知バグになる。真の
   切断は stream エラーで throw 済み。整合性検証は `validate`（HF 層の sha256 /
   expectedBytes）に委譲する。
+- **decode 後（利用形）はキャッシュしない**: cache に入るのは常に保存形 raw で、`decode` は
+  毎呼び出し実行される（storage 節約と引き換えの CPU コスト。トレードオフの選択は
+  呼び出し側 — DECIDED: docs/decisions/0003）。また `validate` は decode 併用時も保存形
+  raw に対して走る（利用形側の検証は decode 内で throw する）。
 
 ## HF 層
 
