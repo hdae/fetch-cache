@@ -51,19 +51,27 @@ const API_SEGMENT: Record<HfRepoKind, string> = {
 export const isCommitSha = (revision: string): boolean =>
   /^[0-9a-f]{40}$/.test(revision);
 
+// path はセグメント毎に percent-encode する（`/` は構造として保持）。revision は丸ごと
+// encode（slash 入り ref `refs/pr/1` 等は %2F を要求するのが HF の実挙動 — 仕様保証ではない）。
+// 公式クライアント huggingface_hub の quote(revision, safe="") / quote(filename, safe="/") と
+// 同じ扱い。SHA・通常の path には恒等なのでキャッシュキーは変わらない。
+const encodePath = (path: string): string =>
+  path.split("/").map(encodeURIComponent).join("/");
+
 /**
  * HuggingFace の resolve URL を組み立てる。model は
  * `{hubUrl}/{repo}/resolve/{revision}/{path}`、dataset / space はそれぞれ
  * `{hubUrl}/datasets/{repo}/...`・`{hubUrl}/spaces/{repo}/...`。
- * path は URL エンコードしない前提（HF のパスは素の相対パス）。
+ * revision は丸ごと・path はセグメント毎に percent-encode する。repo（owner/name）の
+ * `/` は構造要素なのでエンコードしない。
  */
 export const hfResolveUrl = (ref: HfRepoRef & { path: string }): string => {
   const hubUrl = ref.hubUrl ?? DEFAULT_HUB_URL;
   const kind = ref.kind ?? "model";
   const revision = ref.revision ?? "main";
-  return `${hubUrl}/${
-    RESOLVE_PREFIX[kind]
-  }${ref.repo}/resolve/${revision}/${ref.path}`;
+  return `${hubUrl}/${RESOLVE_PREFIX[kind]}${ref.repo}/resolve/${
+    encodeURIComponent(revision)
+  }/${encodePath(ref.path)}`;
 };
 
 /**
@@ -81,9 +89,9 @@ export const resolveHfRevision = async (
   if (isCommitSha(revision)) return revision;
   const hubUrl = ref.hubUrl ?? DEFAULT_HUB_URL;
   const kind = ref.kind ?? "model";
-  const url = `${hubUrl}/api/${
-    API_SEGMENT[kind]
-  }/${ref.repo}/revision/${revision}`;
+  const url = `${hubUrl}/api/${API_SEGMENT[kind]}/${ref.repo}/revision/${
+    encodeURIComponent(revision)
+  }`;
   const fetchImpl = opts.fetch ?? globalThis.fetch;
   const response = await fetchImpl(url);
   if (!response.ok) {
