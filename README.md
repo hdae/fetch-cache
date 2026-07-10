@@ -19,6 +19,10 @@ corrupted cache entries. A thin HuggingFace Hub layer (`./hf`) is included.
   form (e.g. gzip) while callers receive the decoded bytes; a failing `decode`
   self-heals exactly like `validate`, and a zero-dependency `decodeGzip`
   helper is included
+- **Single-flight**: concurrent `fetchBytes` calls for the same (cacheName,
+  URL) join one in-flight download (cached GETs only — `cache: false` opts
+  out); joiners share the stored raw bytes and apply their own `validate` /
+  `decode`, and `onProgress` fans out to every joined caller
 - **HuggingFace layer**: resolves mutable refs (`"main"` etc.) to the current
   commit SHA, then fetches and caches via immutable SHA-pinned URLs; parallel
   multi-file downloads with `expectedBytes` / `sha256` integrity checks

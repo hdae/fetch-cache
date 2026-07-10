@@ -4,10 +4,13 @@
 
 ## cache 層
 
-- **single-flight なし**: 同一 URL への並行 `fetchBytes` は合流せず、それぞれ network に出る
-  （二重ダウンロード）。put は last-writer-wins で内容同一のため整合性は壊れない
-  （検証済み: .claude/reviews/2026-07-10_b5ccf62 verify-A V1）。in-flight 合流は今後の
-  バージョンで導入予定（ユーザー判断 2026-07-10）。それまでの重複抑止は呼び出し側の責務。
+- **single-flight は cache 有効の GET のみ**（0.3.0 で導入 — DECIDED: docs/decisions/0004）。
+  `cache: false` の並行呼び出しは合流せずそれぞれ network に出る（「毎回取りに行く」意図と
+  非 GET の非冪等性を尊重。put は last-writer-wins で内容同一のため整合性は壊れない）。
+  合流キーは (cacheName, URL) のみで、**合流者の `fetch` / `caches` / `init` /
+  `onCacheError` は使われない**（取得は先行呼び出しのオプションで走る。認証ヘッダ違いを
+  区別しないのはキャッシュキーが URL のみの設計と同じ割り切り）。取得失敗は合流全員へ
+  伝播する。
 - **非 GET はキャッシュ非対応**: Cache API は GET しか格納できない。cache 有効 + 非 GET は
   fail-loud に throw する（`cache: false` で素の fetch は可）。POST 応答のキャッシュは
   スコープ外（DECIDED: docs/decisions/0002）。

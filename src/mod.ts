@@ -151,37 +151,34 @@ const validateAndDecode = async (
 };
 
 /**
- * URL からバイト列を取得する（Cache API 優先・self-heal・fail loud）。
- *
- * キャッシュヒット時は network に出ない（onProgress も呼ばれない）。`validate` / `decode` が
- * キャッシュ内容を拒否したら evict して network から取り直す（self-heal）。network 取得物が
- * `validate` / `decode` に落ちたらそのまま throw し、不正物はキャッシュしない。HTTP エラーは
- * `fetch-cache: HTTP {status} {statusText} ({url})` で throw する。cache に入るのは常に
- * 保存形（raw）で、戻り値は `decode` 適用後（省略時は raw）。
- *
- * NOTE: `caches` が無いランタイム（Node.js 等）では `cache` 指定に関わらず素の fetch に
- *       フォールバックする（キャッシュは最適化であり正しさの要件ではない）。
- * NOTE: cache I/O の失敗（quota 超過等）もダウンロードを落とさず network 側へ縮退して続行し、
- *       `onCacheError`（既定 console.warn）で通知する（DECIDED: docs/decisions/0001）。
+ * 同一 (cacheName, URL) の in-flight 取得（single-flight の合流点）。
+ * `raw` は保存形（cache に入る/入っているバイト列）で、合流者は各自の
+ * validate / decode をこれに適用する（decode との直交 — DECIDED: docs/decisions/0004）。
  */
-export const fetchBytes = async (
-  url: string | URL,
-  opts: FetchBytesOptions = {},
-): Promise<Uint8Array> => {
-  const requestUrl = typeof url === "string" ? url : url.href;
+type InflightEntry = {
+  /** 先行呼び出しの取得結果。decoded は先行呼び出しのオプションで decode 済みの値。 */
+  promise: Promise<{ raw: Uint8Array; decoded: Uint8Array }>;
+  /** 進捗の fan-out 先（合流者の onProgress もここに登録される）。 */
+  listeners: Set<(progress: FetchProgress) => void>;
+  /** 直近の進捗。合流時に 1 回即時通知して、合流者の表示を現在地へ追いつかせる。 */
+  state: { last?: FetchProgress };
+};
+
+const inflight = new Map<string, InflightEntry>();
+
+/**
+ * raw 取得と（先行呼び出しオプションでの）validate/decode の本体。cache open/match →
+ * self-heal → network → put の一連で、常に { raw: 保存形, decoded: decode 適用後 } を返す。
+ * single-flight の合流者は raw を受け取り、各自の validate/decode を適用し直す。
+ */
+const acquireAndDecode = async (
+  requestUrl: string,
+  opts: FetchBytesOptions,
+  emitProgress: ((progress: FetchProgress) => void) | undefined,
+): Promise<{ raw: Uint8Array; decoded: Uint8Array }> => {
   const fetchImpl = opts.fetch ?? globalThis.fetch;
   const cacheName = opts.cacheName ?? DEFAULT_CACHE_NAME;
   const onCacheError = opts.onCacheError ?? defaultOnCacheError;
-
-  // Cache API は GET しか格納できない。`caches` の有無に依らず（Node.js でも）一貫して
-  // fail loud にするため、ガードは「キャッシュを使う意図」（cache !== false）で判定する。
-  const method = (opts.init?.method ?? "GET").toUpperCase();
-  if ((opts.cache ?? true) && method !== "GET") {
-    throw new Error(
-      `fetch-cache: GET 以外（${method}）はキャッシュできません（Cache API の制約）。` +
-        `cache: false を指定してください (${requestUrl})`,
-    );
-  }
 
   const cacheStorage = (opts.cache ?? true)
     ? opts.caches ?? globalCaches()
@@ -210,7 +207,10 @@ export const fetchBytes = async (
     }
     if (cachedBytes !== undefined) {
       try {
-        return await validateAndDecode(cachedBytes, opts);
+        return {
+          raw: cachedBytes,
+          decoded: await validateAndDecode(cachedBytes, opts),
+        };
       } catch {
         // 破損キャッシュ（validate 拒否 or decode 不能）。真実源から取り直すため evict して
         // フォールスルー（self-heal）。
@@ -233,7 +233,7 @@ export const fetchBytes = async (
       `fetch-cache: HTTP ${response.status} ${response.statusText} (${requestUrl})`,
     );
   }
-  const bytes = await readBody(response, opts.onProgress);
+  const bytes = await readBody(response, emitProgress);
   // validate / decode 成功後にのみ cache.put（不正物・decode 不能物をキャッシュに残さない）。
   // 失敗はそのまま throw。put するのは常に保存形 raw（decode 前）。
   const decoded = await validateAndDecode(bytes, opts);
@@ -245,6 +245,88 @@ export const fetchBytes = async (
       onCacheError({ op: "put", url: requestUrl, error });
     }
   }
+  return { raw: bytes, decoded };
+};
+
+/**
+ * URL からバイト列を取得する（Cache API 優先・self-heal・single-flight・fail loud）。
+ *
+ * キャッシュヒット時は network に出ない（onProgress も呼ばれない）。`validate` / `decode` が
+ * キャッシュ内容を拒否したら evict して network から取り直す（self-heal）。network 取得物が
+ * `validate` / `decode` に落ちたらそのまま throw し、不正物はキャッシュしない。HTTP エラーは
+ * `fetch-cache: HTTP {status} {statusText} ({url})` で throw する。cache に入るのは常に
+ * 保存形（raw）で、戻り値は `decode` 適用後（省略時は raw）。
+ *
+ * **single-flight**: 同一 (cacheName, URL) への並行呼び出しは 1 フライトに合流し、
+ * network への取得は 1 回だけになる（cache 有効時のみ。`cache: false` は「毎回取りに行く」
+ * 意図を尊重して合流しない）。合流者には保存形 raw が共有され、`validate` / `decode` は
+ * 各呼び出しが自分のオプションで適用する。取得失敗は合流した全呼び出しへ伝播し、フライト
+ * 終了後の呼び出しは新規に取得する（失敗は記憶しない）。`onProgress` は合流者へも fan-out
+ * され、合流時に直近の進捗が 1 回即時通知される。NOTE: 合流者の `fetch` / `caches` /
+ * `init` / `onCacheError` は使われない — 取得は先行呼び出しのオプションで走っている
+ * （DECIDED: docs/decisions/0004、docs/limitations.md）。
+ *
+ * NOTE: `caches` が無いランタイム（Node.js 等）では `cache` 指定に関わらず素の fetch に
+ *       フォールバックする（キャッシュは最適化であり正しさの要件ではない）。
+ * NOTE: cache I/O の失敗（quota 超過等）もダウンロードを落とさず network 側へ縮退して続行し、
+ *       `onCacheError`（既定 console.warn）で通知する（DECIDED: docs/decisions/0001）。
+ */
+export const fetchBytes = async (
+  url: string | URL,
+  opts: FetchBytesOptions = {},
+): Promise<Uint8Array> => {
+  const requestUrl = typeof url === "string" ? url : url.href;
+
+  // Cache API は GET しか格納できない。`caches` の有無に依らず（Node.js でも）一貫して
+  // fail loud にするため、ガードは「キャッシュを使う意図」（cache !== false）で判定する。
+  const method = (opts.init?.method ?? "GET").toUpperCase();
+  if ((opts.cache ?? true) && method !== "GET") {
+    throw new Error(
+      `fetch-cache: GET 以外（${method}）はキャッシュできません（Cache API の制約）。` +
+        `cache: false を指定してください (${requestUrl})`,
+    );
+  }
+
+  // cache 無効の呼び出しは合流しない（非 GET・「必ず新規取得」の意図を保つ）。
+  if (opts.cache === false) {
+    const { decoded } = await acquireAndDecode(
+      requestUrl,
+      opts,
+      opts.onProgress,
+    );
+    return decoded;
+  }
+
+  const key = `${opts.cacheName ?? DEFAULT_CACHE_NAME} ${requestUrl}`;
+  const existing = inflight.get(key);
+  if (existing !== undefined) {
+    // 合流: raw（保存形）を受け取り、自分の validate / decode を適用する。
+    if (opts.onProgress !== undefined) {
+      existing.listeners.add(opts.onProgress);
+      if (existing.state.last !== undefined) {
+        opts.onProgress(existing.state.last);
+      }
+    }
+    const { raw } = await existing.promise;
+    return await validateAndDecode(raw, opts);
+  }
+
+  // 先行呼び出し（leader）。MUST: ここから inflight.set まで await を挟まない —
+  // 挟むと同一ターンの並行呼び出しが合流できず二重フライトになる（TOCTOU）。
+  const listeners = new Set<(progress: FetchProgress) => void>();
+  if (opts.onProgress !== undefined) listeners.add(opts.onProgress);
+  const state: { last?: FetchProgress } = {};
+  const emit = (progress: FetchProgress): void => {
+    state.last = progress;
+    for (const listener of listeners) listener(progress);
+  };
+  const promise = acquireAndDecode(requestUrl, opts, emit).finally(() => {
+    // 成否に依らずフライトを閉じる（失敗を記憶すると自然回復を妨げる）。合流者は
+    // promise への参照を直接持つため、この削除で取りこぼしは起きない。
+    inflight.delete(key);
+  });
+  inflight.set(key, { promise, listeners, state });
+  const { decoded } = await promise;
   return decoded;
 };
 
