@@ -894,6 +894,15 @@ Deno.test("evictUrl: エントリがあれば削除して true、無ければ fa
   }
 });
 
+Deno.test("evictUrl / listCachedUrls: 無い名前空間を作らない（読み取り系の永続化副作用の禁止）", async () => {
+  const cacheName = uniqueCacheName();
+  assertEquals(await evictUrl(URL_A, { cacheName }), false);
+  assertEquals(await caches.has(cacheName), false); // 旧実装は open で空名前空間が残った
+  // 名前空間が無ければ keys() 未実装ランタイム（Deno 2.8 以前）でも [] を返せる。
+  assertEquals(await listCachedUrls(cacheName), []);
+  assertEquals(await caches.has(cacheName), false);
+});
+
 Deno.test("clearCache: 名前空間ごと削除して true、既に無ければ false", async () => {
   const cacheName = uniqueCacheName();
   const { fetch } = mockFetch(() => new Response(BYTES_A));

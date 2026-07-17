@@ -385,14 +385,18 @@ export const decodeGzip = async (raw: Uint8Array): Promise<Uint8Array> => {
 
 /**
  * 指定 URL のキャッシュエントリを削除する。エントリがあったら true。
- * `caches` が無いランタイムでは常に false。
+ * `caches` が無いランタイム・名前空間ごと存在しない場合は常に false。
  */
 export const evictUrl = async (
   url: string | URL,
   opts: { cacheName?: string } = {},
 ): Promise<boolean> => {
   if (typeof caches === "undefined") return false;
-  const cache = await caches.open(opts.cacheName ?? DEFAULT_CACHE_NAME);
+  const cacheName = opts.cacheName ?? DEFAULT_CACHE_NAME;
+  // caches.open は無い名前空間を永続作成してしまう（削除 API の副作用として不適切）。
+  // 名前空間が無ければエントリも無い — 触らずに false を返す。
+  if (!(await caches.has(cacheName))) return false;
+  const cache = await caches.open(cacheName);
   return await cache.delete(typeof url === "string" ? url : url.href);
 };
 
@@ -414,7 +418,8 @@ const supportsKeys = (cache: Cache): cache is CacheWithKeys =>
   typeof (cache as Partial<CacheWithKeys>).keys === "function";
 
 /**
- * 名前空間内のキャッシュ済み URL 一覧を返す。`caches` が無いランタイムでは []。
+ * 名前空間内のキャッシュ済み URL 一覧を返す。`caches` が無いランタイム・名前空間ごと
+ * 存在しない場合は []（空は事実 — 名前空間を作る副作用も持たない）。
  *
  * NOTE: `caches` はあるが `Cache.keys()` が未実装のランタイム（Deno 2.8 以前）では throw する
  *       （fail loud）。実在するエントリを [] と偽ると、この一覧に基づく掃除・表示が静かに
@@ -424,6 +429,7 @@ export const listCachedUrls = async (
   cacheName: string = DEFAULT_CACHE_NAME,
 ): Promise<string[]> => {
   if (typeof caches === "undefined") return [];
+  if (!(await caches.has(cacheName))) return [];
   const cache = await caches.open(cacheName);
   if (!supportsKeys(cache)) {
     throw new Error(
