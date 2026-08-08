@@ -684,7 +684,11 @@ Deno.test("prefetchHfFile: 可変 ref を解決 1 回 → SHA 固定 URL で温�
   try {
     assertEquals(
       await prefetchHfFile({ repo: REPO }, "model.onnx", { cacheName, fetch }),
-      true,
+      {
+        fetched: true,
+        revision: SHA,
+        url: `https://huggingface.co/${REPO}/resolve/${SHA}/model.onnx`,
+      },
     );
     assertEquals(calls, [
       `https://huggingface.co/api/models/${REPO}/revision/main`,
@@ -705,6 +709,48 @@ Deno.test("prefetchHfFile: 可変 ref を解決 1 回 → SHA 固定 URL で温�
   }
 });
 
+Deno.test("prefetchHfFile: 戻り値の revision / url が温めたエントリを指し、渡し回せば upstream が動いてもヒットする", async () => {
+  const cacheName = uniqueCacheName();
+  const MOVED = "89abcdef0123456789abcdef0123456789abcdef";
+  // 温めた後に upstream が動くリポジトリ（可変 ref のまま読むと別 SHA を引く状況）。
+  let head = SHA;
+  const { fetch, calls } = mockFetch((url) =>
+    url.includes("/api/")
+      ? new Response(JSON.stringify({ sha: head }))
+      : new Response(BYTES)
+  );
+  try {
+    const result = await prefetchHfFile({ repo: REPO }, "model.onnx", {
+      cacheName,
+      fetch,
+    });
+    // 可変 ref を渡しても、どの SHA を温めたかが戻り値で分かる。
+    assertEquals(result.revision, SHA);
+    // url は温めたエントリのキャッシュキーそのもの。
+    const cache = await caches.open(cacheName);
+    assertExists(await cache.match(result.url));
+
+    head = MOVED;
+    const warmed = calls.length;
+    // 戻り値の revision を渡し回せば、upstream が動いてもヒットのまま（network に出ない）。
+    assertEquals(
+      await fetchHfFile(
+        { repo: REPO, revision: result.revision },
+        "model.onnx",
+        { cacheName, fetch },
+      ),
+      BYTES,
+    );
+    assertEquals(calls.length, warmed);
+
+    // 対比: 可変 ref のまま読むと動いた先の SHA を引き、温めたエントリは丸ごとミスする。
+    await fetchHfFile({ repo: REPO }, "model.onnx", { cacheName, fetch });
+    assertEquals(calls.length, warmed + 2); // revision 解決 + ファイル取得。
+  } finally {
+    await caches.delete(cacheName);
+  }
+});
+
 Deno.test("prefetchHfFile: spec.sha256 は通過中検証へ流れ、trustCachedSha256 のヒットは無ハッシュになる", async () => {
   const cacheName = uniqueCacheName();
   const { fetch, calls } = mockFetch(() => new Response(BYTES));
@@ -716,7 +762,11 @@ Deno.test("prefetchHfFile: spec.sha256 は通過中検証へ流れ、trustCached
         cacheName,
         fetch,
       }),
-      true,
+      {
+        fetched: true,
+        revision: SHA,
+        url: `https://huggingface.co/${REPO}/resolve/${SHA}/model.onnx`,
+      },
     );
     // prefetch 側は純 TS の逐次ハッシュ（native の一括 digest は使わない）。
     assertEquals(digest.args.length, 0);
@@ -801,7 +851,11 @@ Deno.test("prefetchHfFile: 既にエントリがあれば network に出ず fals
         cacheName,
         fetch,
       }),
-      false,
+      {
+        fetched: false,
+        revision: SHA,
+        url: `https://huggingface.co/${REPO}/resolve/${SHA}/model.onnx`,
+      },
     );
     assertEquals(calls.length, 1);
   } finally {

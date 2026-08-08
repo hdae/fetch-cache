@@ -281,11 +281,26 @@ export type HfPrefetchOptions = {
   caches?: CacheStorage;
 };
 
+/** `prefetchHfFile` の結果（何をしたか + どの revision / URL を温めたか）。 */
+export type HfPrefetchResult = {
+  /** 取得して格納したなら true、既にエントリがあって何もしなかったなら false。 */
+  fetched: boolean;
+  /** 温めた対象の解決済みコミット SHA（可変 ref を渡した場合の解決結果）。 */
+  revision: string;
+  /** 温めた対象の SHA 固定 URL（= キャッシュキー）。 */
+  url: string;
+};
+
 /**
  * HuggingFace のファイルを**ヒープに全量を載せずに**キャッシュへ温める（streaming prefetch）。
  * 可変 ref は `fetchHfFile` と同じ流儀で現在の SHA へ解決してから SHA 固定 URL で取得するので、
- * 温めたエントリはそのまま `fetchHfFile` のヒットになる。戻り値は「取得して格納した」なら
- * true、「既にエントリがあって何もしなかった」なら false。
+ * 温めたエントリはそのまま `fetchHfFile` のヒットになる。戻り値の `fetched` は「取得して
+ * 格納した」なら true、「既にエントリがあって何もしなかった」なら false。
+ *
+ * 可変 ref（"main" 等）を渡しても、**どの SHA を温めたかが戻り値の `revision` で分かる**
+ * （revision 解決は既存エントリで何もしない場合も必ず走るので、`revision` / `url` は常に
+ * 返る）。以後 `fetchHfFile` の `revision` にその SHA を渡せばキャッシュキーが一致し、
+ * 温めと読み出しの間に upstream が動いてもキャッシュミス（+ 孤児エントリ）にならない。
  *
  * `spec.sha256` があれば cache 層の通過中検証（`prefetchUrl` の `sha256`）へ自動で流れ、
  * 一致したエントリにだけ検証済みマーカーが焼かれる。以後 `trustCachedSha256: true` で読めば
@@ -306,7 +321,7 @@ export const prefetchHfFile = async (
   ref: HfRepoRef,
   file: string | HfFileSpec,
   opts: HfPrefetchOptions = {},
-): Promise<boolean> => {
+): Promise<HfPrefetchResult> => {
   const revision = await resolveHfRevision(ref, {
     fetch: opts.fetch,
     init: opts.init,
@@ -314,7 +329,7 @@ export const prefetchHfFile = async (
   const spec = toSpec(file);
   const url = hfResolveUrl({ ...ref, revision, path: spec.path });
   const onProgress = opts.onProgress;
-  return await prefetchUrl(url, {
+  const fetched = await prefetchUrl(url, {
     cacheName: opts.cacheName ?? DEFAULT_CACHE_NAME,
     sha256: spec.sha256,
     onProgress: onProgress === undefined
@@ -324,6 +339,7 @@ export const prefetchHfFile = async (
     fetch: opts.fetch,
     caches: opts.caches,
   });
+  return { fetched, revision, url };
 };
 
 /**

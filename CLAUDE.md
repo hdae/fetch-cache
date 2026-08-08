@@ -10,7 +10,8 @@ Deno / ブラウザ両対応の「URL ベースの Cache API 付きダウンロ�
 - `src/sha256.ts` — 内部モジュール（非公開）。通過中検証用の純 TS インクリメンタル
   SHA-256。materialize 済みバイト列は native の一括 digest のまま（ADR 0005 §5）。
 - `src/hf/mod.ts` — `./hf` エントリ（HuggingFace 層: fetchHfFile / fetchHfFiles /
-  prefetchHfFile / resolveHfRevision / hfResolveUrl / isCommitSha。cache 層の上に実装）。
+  prefetchHfFile（戻り値 HfPrefetchResult）/ resolveHfRevision / hfResolveUrl /
+  isCommitSha。cache 層の上に実装）。
 - `src/testing/` — テスト専用の mock fetch ヘルパ（publish 対象外）。
 - `scripts/` — version 単一真実源（deno.json）+ drift ガード一式（bump / verify_tag）。
 - `docs/` — 設計ドキュメント（下記 Docs 参照）。

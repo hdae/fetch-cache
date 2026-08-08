@@ -270,14 +270,18 @@ const ref = { repo: "owner/name" };
 const revision = await resolveHfRevision(ref);
 const spec = { path: "model.safetensors", sha256: "1a2b…" };
 
-// true = downloaded and stored, false = an entry was already there.
-// A mismatching hash rejects the put, so the entry never comes into existence.
-await prefetchHfFile({ ...ref, revision }, spec, {
+// { fetched, revision, url }: fetched is true when it downloaded and stored,
+// false when an entry was already there. A mismatching hash rejects the put,
+// so the entry never comes into existence.
+const warmed = await prefetchHfFile({ ...ref, revision }, spec, {
   onProgress: ({ path, loaded, total }) => console.log(path, loaded, total),
 });
 
-// Reading it back is a cache hit, and the marker skips the full re-hash.
-const model = await fetchHfFile({ ...ref, revision }, spec, {
+// `warmed.revision` is the SHA that was actually warmed (it is resolved even
+// when you pass a mutable ref like "main"), and `warmed.url` is the cache key.
+// Pass that SHA back in and the read is guaranteed to hit the entry you warmed,
+// even if the branch moved in between; the marker skips the full re-hash.
+const model = await fetchHfFile({ ...ref, revision: warmed.revision }, spec, {
   trustCachedSha256: true,
 });
 ```
