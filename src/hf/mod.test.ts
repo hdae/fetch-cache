@@ -863,6 +863,42 @@ Deno.test("prefetchHfFile: 既にエントリがあれば network に出ず fals
   }
 });
 
+// --- sha256 の形式ガード（全入口の正規化点 toSpec） ---
+
+Deno.test("fetchHfFile: 形式不正の sha256 は network に出る前に fail loud", async () => {
+  const { fetch, calls } = mockFetch(() => new Response(BYTES));
+  const error = await assertRejects(
+    () =>
+      fetchHfFile(
+        { repo: REPO, revision: SHA },
+        // 大文字 hex は sha256Hex の出力（常に小文字）と必ず食い違う = 成立し得ない申告。
+        { path: "model.onnx", sha256: BYTES_SHA256.toUpperCase() },
+        { cacheName: uniqueCacheName(), fetch },
+      ),
+    Error,
+  );
+  assertStringIncludes(error.message, "64 桁の小文字 hex");
+  assertStringIncludes(error.message, "model.onnx");
+  // 全量ダウンロードしてから落とすと呼び出し毎に帯域を捨てることになる。
+  assertEquals(calls.length, 0);
+});
+
+Deno.test("prefetchHfFile: 形式不正の sha256 は network に出る前に fail loud", async () => {
+  const { fetch, calls } = mockFetch(() => new Response(BYTES));
+  const error = await assertRejects(
+    () =>
+      prefetchHfFile(
+        { repo: REPO, revision: SHA },
+        { path: "model.onnx", sha256: BYTES_SHA256.toUpperCase() },
+        { cacheName: uniqueCacheName(), fetch },
+      ),
+    Error,
+  );
+  assertStringIncludes(error.message, "64 桁の小文字 hex");
+  assertStringIncludes(error.message, "model.onnx");
+  assertEquals(calls.length, 0);
+});
+
 Deno.test("prefetchHfFile: onProgress には path が付き、init は解決と取得の両方へ渡る", async () => {
   const cacheName = uniqueCacheName();
   const { fetch, calls, inits } = mockFetch((url) =>

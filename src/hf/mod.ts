@@ -37,9 +37,9 @@ export type HfFileSpec = {
   /** バイト数検証（不一致 throw）。Hub 上の保存形 raw に対して。 */
   expectedBytes?: number;
   /**
-   * SHA-256 検証（小文字 hex、不一致 throw。crypto.subtle 必須 — 無ければ throw）。
-   * Hub 上の保存形 raw に対して照合する（LFS メタデータの値がそのまま使える。`decode`
-   * 併用時も解凍前）。
+   * SHA-256 検証（**64 桁の小文字 hex** — 形式不正は network に出る前に throw。不一致も
+   * throw。crypto.subtle 必須 — 無ければ throw）。Hub 上の保存形 raw に対して照合する
+   * （LFS メタデータの値がそのまま使える。`decode` 併用時も解凍前）。
    */
   sha256?: string;
   /**
@@ -249,8 +249,20 @@ const fetchResolvedFile = (
   });
 };
 
-const toSpec = (file: string | HfFileSpec): HfFileSpec =>
-  typeof file === "string" ? { path: file } : file;
+/**
+ * ファイル指定を HfFileSpec へ正規化する（全入口の合流点）。形式不正の `sha256` はここで
+ * fail loud に弾く — 必ず不一致になる申告なので、全量ダウンロードしてから落とすと呼び出し毎に
+ * 帯域を捨てることになる（cache 層 `prefetchUrl` の同じガードと語彙を揃える）。
+ */
+const toSpec = (file: string | HfFileSpec): HfFileSpec => {
+  const spec = typeof file === "string" ? { path: file } : file;
+  if (spec.sha256 !== undefined && !/^[0-9a-f]{64}$/.test(spec.sha256)) {
+    throw new Error(
+      `fetch-cache: sha256 は 64 桁の小文字 hex で指定してください: ${spec.sha256} (${spec.path})`,
+    );
+  }
+  return spec;
+};
 
 /**
  * HuggingFace リポジトリからファイルを 1 つ取得する。可変 ref は現在の SHA へ解決してから
