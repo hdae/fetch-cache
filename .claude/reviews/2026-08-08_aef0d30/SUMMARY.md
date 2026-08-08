@@ -88,6 +88,22 @@ reviewer: Claude (orchestrator: fable / finders: opus×3 + sonnet×3 / verifiers
 - **概要**: deno.json / src/mod.ts とも 0.3.1 のまま。このまま v0.3.1 タグを切ると verify_tag の三者一致は通ってしまう。追加 API のみなので **minor（0.4.0）が正**。
 - **修正案**: ★修正パッケージ確定後に `deno task bump minor` → タグ → push（push はユーザー）。
 
+## 実施済み指摘の記録（2026-08-08 裁定 → 同日実装）
+
+裁定: A-1=案1（根治）/ C-3=案2（object 化。「object 方針で検討し、価値が薄ければ boolean」の
+条件付き承認 → 検討の結果採用）/ 補完パッケージ=一括実施 / リリース=タグ作成まで。
+
+| ID | 実装 | commit | 検証 |
+| --- | --- | --- | --- |
+| A-1 | sha256 指定時のみチャンク複製をハッシュ・格納で共有（構造的封じ） | 3378723 | 凍結テストの fault injection 実施 — 修正なしで失敗・ありで成功を確認 |
+| C-3 | `HfPrefetchResult { fetched, revision, url }` へ変更 + revision 渡し回しの対比テスト | d632239 | upstream 移動シナリオをテストで凍結 |
+| C-1 | `toSpec` に 64 桁小文字 hex ガード + fetch/prefetch 両経路テスト | 77c385b | calls.length === 0 で network 前 throw を凍結 |
+| D-1 / D-2 / B-1 / B-2 | 保険 delete 分岐・expectedBytes 不正値・512MiB golden・retain テスト | f65aeff | 保険分岐 lcov 0→1 回 / ガード行到達を lcov 生値で確認。**golden は `4e00324d…`（パターン: 64KiB 内 `index % 251` ×8192 + 1B）— SUMMARY 上記 B-1 の `54bebaf7…` は検証エージェントの別パターン由来で、実装では 2 系統の native（crypto.subtle / node:crypto）+ オーケストレータの独立再導出で `4e00324d…` を確定** |
+| A-3 縮小 / C-2 残余 / C-5 / E-2 / B-3 / ADR 追従 | docs / JSDoc / コメント追従一式 + レビュー成果物の git 管理化 | 72f2c5d | 突合読了。追加ドリフト 1 件（limitations の prefetchHfFile 戻り値表記）を発見しフォロー修正 |
+
+- 変異試験の残項目: B-1 / B-2 の変異生存試験は実装エージェントの環境では権限ブロックで未実施（到達性は lcov で確認済み。B-1 の変異検出力は Pass2 検証エージェントが別パターンで実証済み）。
+- `deno task check`: 全コミットで全緑（最終 118 passed / 0 failed / 1 ignored）。
+
 ## 取り下げ・棄却（Pass2 反証）
 
 | ID | 内容 | 反証根拠 |

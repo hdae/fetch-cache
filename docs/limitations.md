@@ -40,7 +40,8 @@
   使われない（バイト列を手元に持たないため。どちらも `fetchHfFile` で読み出すときには
   通常どおり効く）。
 - **prefetch は既存エントリを検証しない**（DECIDED: docs/decisions/0005 §5）。
-  `prefetchUrl` / `prefetchHfFile` はエントリがあれば network に出ずに false を返すため、
+  `prefetchUrl` / `prefetchHfFile` はエントリがあれば network に出ない（`prefetchUrl` は
+  false、`prefetchHfFile` は `fetched: false` を返す）ため、
   `sha256` を渡しても既存の内容は照合されない（温める API であって検査する API ではない）。
   既存の内容を疑うなら `fetchBytes`（self-heal 付き）か `evictUrl` を使う。
 - **`prefetchUrl` は single-flight の対象外**（DECIDED: docs/decisions/0005）。合流契約
