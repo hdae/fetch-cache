@@ -1040,6 +1040,29 @@ Deno.test("fetchBytes: 確保できないほど巨大な申告でも取得は落
   }
 });
 
+Deno.test("fetchBytes: 不正な expectedBytes（非整数・0 以下）は確保ヒントを捨てて蓄積経路で完走する", async () => {
+  // allocateHint の入口ガード（Number.isSafeInteger / size <= 0）。上の巨大申告テストは
+  // 確保そのものが RangeError になる別分岐で、こちらは確保を試みる前に弾かれる側。
+  // 「申告が外れても取得は落とさない」という by-design 契約（docs/limitations.md）を凍結する。
+  for (const expectedBytes of [1.5, -1, 0]) {
+    const cacheName = uniqueCacheName();
+    const { fetch } = mockFetch(() =>
+      chunkedResponse([new Uint8Array([1, 2, 3]), new Uint8Array([4, 5])])
+    );
+    try {
+      const bytes = await fetchBytes(URL_A, {
+        cacheName,
+        fetch,
+        expectedBytes,
+      });
+      assertEquals(bytes, BYTES_A, `expectedBytes=${expectedBytes}`);
+      assertEquals(isTightView(bytes), true, `expectedBytes=${expectedBytes}`);
+    } finally {
+      await caches.delete(cacheName);
+    }
+  }
+});
+
 // --- prefetchUrl（streaming put・検証は読み出し側に一本化）---
 
 Deno.test("prefetchUrl: body を streaming で格納し、以後の fetchBytes は network に出ない", async () => {
@@ -1306,6 +1329,53 @@ Deno.test("prefetchUrl: sha256 不一致は put ごと reject させ、エント
   } finally {
     await caches.delete(cacheName);
   }
+});
+
+Deno.test("prefetchUrl: stream の error を握り潰す非準拠 Cache でも印付きの不正エントリは残さない", async () => {
+  const wrong = "f".repeat(64);
+  const entries = new Map<string, Response>();
+  const deleted: string[] = [];
+  // 準拠実装なら controller.error() は put の reject として現れるが、それを無視して
+  // エントリを作ってしまう Cache 実装に備えた保険（put 後の delete → throw）の凍結。
+  // NOTE: put は**必ず body を消費してから** resolve すること。消費しないと TransformStream
+  //       の flush（= 不一致の検出そのもの）が走らず、この分岐に入らない。
+  const lenientCaches: CacheStorage = {
+    open: () => {
+      const wrapper = {
+        match: (request: RequestInfo | URL) =>
+          Promise.resolve(entries.get(String(request))),
+        put: async (request: RequestInfo | URL, response: Response) => {
+          await response.arrayBuffer().catch(() => {});
+          entries.set(String(request), response);
+        },
+        delete: (request: RequestInfo | URL) => {
+          deleted.push(String(request));
+          return Promise.resolve(entries.delete(String(request)));
+        },
+        keys: () => Promise.resolve([] as Request[]),
+      };
+      return Promise.resolve(wrapper);
+    },
+    has: () => Promise.resolve(false),
+    delete: () => Promise.resolve(false),
+    keys: () => Promise.resolve([]),
+    match: () => Promise.resolve(undefined),
+  };
+  const { fetch } = mockFetch(() =>
+    chunkedResponse([BYTES_A.slice(0, 2), BYTES_A.slice(2)])
+  );
+
+  const error = await assertRejects(
+    () => prefetchUrl(URL_A, { fetch, sha256: wrong, caches: lenientCaches }),
+    Error,
+  );
+  // put が resolve しても、落ちる理由は cache 書込み失敗ではなく取得内容の不正のまま。
+  assertStringIncludes(error.message, "SHA-256 不一致");
+  assertStringIncludes(error.message, BYTES_A_SHA256);
+  assertEquals(error.message.includes("キャッシュ書込みに失敗"), false);
+  // 印は以後の検証を丸ごと省かせるので、残ると恒久的に効いてしまう。
+  assertEquals(deleted, [URL_A]);
+  assertEquals(entries.has(URL_A), false);
 });
 
 Deno.test("prefetchUrl: 通過中検証のチャンクは呼び出し側の書き換えから隔離される（印と中身が乖離しない）", async () => {

@@ -635,6 +635,8 @@ export const prefetchUrl = async (
           // エントリを作る手順が生まれる（MUST: 印の健全性を呼び出し側の行儀に依存させない
           // — DECIDED: docs/decisions/0005 §5）。印が無ければ乖離は無害なので複製しない。
           const owned = hasher === undefined ? chunk : chunk.slice();
+          // update は戻った時点で owned への参照を持たない（sha256.ts の MUST 契約）。
+          // だから複製を先へ流して以後どう扱われても、ハッシュ側は影響を受けない。
           hasher?.update(owned);
           emit?.({ loaded, total });
           controller.enqueue(owned);
