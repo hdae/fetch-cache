@@ -19,7 +19,7 @@
 
 import { createSha256 } from "./sha256.ts";
 
-export const VERSION = "0.3.1";
+export const VERSION = "0.4.0";
 
 /** ダウンロード進捗。`total` は content-length ヘッダがあるときだけ入る。 */
 export type FetchProgress = { loaded: number; total?: number };
