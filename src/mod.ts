@@ -7,12 +7,17 @@
  * 対応する（throw は破損扱い＝validate と同じ縮退経路）。`caches` が無いランタイム
  * （Node.js 等）では素の fetch にフォールバックする＝キャッシュは正しさの要件ではなく最適化。
  * `prefetchUrl` は body をそのまま cache へ流し込む streaming 版で、巨大アセットを
- * ヒープに載せずに温めるためにある（検証は読み出し時 = `fetchBytes` に一本化）。
+ * ヒープに載せずに温めるためにある（`sha256` を渡せば通過中に検証し、通ったエントリにだけ
+ * 検証済みマーカーを焼く。渡さなければ検証は読み出し時 = `fetchBytes` に一本化）。
  *
- * MUST: 実行時依存ゼロ。fetch / caches / crypto.subtle など Web 標準 API のみを使う。
+ * MUST: 実行時依存ゼロ。fetch / caches / crypto.subtle など Web 標準 API のみを使う
+ * （通過中の逐次ハッシュだけは一括専用の crypto.subtle で賄えないため純 TS 実装を内包する
+ * — src/sha256.ts）。
  *
  * @module
  */
+
+import { createSha256 } from "./sha256.ts";
 
 export const VERSION = "0.3.1";
 
@@ -85,9 +90,13 @@ export type FetchBytesOptions = {
    * docs/decisions/0005）。
    * NOTE: 印は `validate` **全体**の通過を意味する（HF 層なら expectedBytes / sha256 /
    *       カスタム validate の全部）。同じ URL に別の検証ロジックを当てるなら印も変えること。
-   * NOTE: 印が焼かれるのは「このオプション付きで network 取得した」エントリだけで、
-   *       既存エントリや `prefetchUrl` が書いたエントリ（未検証）には付かない。
-   *       single-flight の合流者も印を見ない（常に自分の validate を走らせる = 安全側）。
+   * NOTE: 印が焼かれるのは「このオプション付きで network 取得した」エントリと
+   *       「`prefetchUrl` に `sha256` を渡して通過中検証を通した」エントリだけで、既存エントリや
+   *       検証なし prefetch が書いたエントリには付かない。single-flight の合流者も印を見ない
+   *       （常に自分の validate を走らせる = 安全側）。
+   *       prefetch 由来の印が意味するのは sha256 の一致だけなので、同じ URL に sha256 以外の
+   *       検証（カスタム validate 等）も当てているなら、その分はヒット時に省かれる
+   *       （sha256 一致 = バイト同一なので実害は宣言の食い違いに限られる）。
    */
   verifiedMarker?: string;
   /**
@@ -474,6 +483,21 @@ export type PrefetchUrlOptions = {
   /** Cache Storage の名前空間。既定 "fetch-cache"（fetchBytes と同じ）。 */
   cacheName?: string;
   /**
+   * 期待 SHA-256（64 桁小文字 hex）。指定すると**通過中に**逐次ハッシュして検証する
+   * （バイト列はヒープに溜めない）。省略時は従来どおり無検証で格納する。
+   *
+   * 一致したときだけエントリが成立し、同時に検証済みマーカー（この sha256）が焼かれる
+   * ため、以後 `fetchBytes` の `verifiedMarker` に同じ値を渡せばヒット時の再ハッシュを
+   * 省ける。不一致なら stream を error にして `cache.put` ごと reject させる ＝
+   * **印付きの不正エントリは構造的に生まれない**（DECIDED: docs/decisions/0005）。
+   *
+   * NOTE: 印は「この sha256 に一致した」ことだけを主張する。読み出し側が sha256 以外の
+   *       検証も宣言していて `verifiedMarker` で省いてよいかは、呼び出し側の判断。
+   * NOTE: 既存エントリがあるときは network に出ないので検証も走らない（戻り値 false）。
+   *       既存の内容を検証したいなら `fetchBytes`（self-heal 付き）を使うこと。
+   */
+  sha256?: string;
+  /**
    * ダウンロード進捗（チャンク毎）。既にキャッシュ済みで network に出ないときは呼ばれない。
    * リスナーの throw は取得を落とさない（fetchBytes と同じ隔離）。
    */
@@ -492,11 +516,13 @@ export type PrefetchUrlOptions = {
  * チャンク数個ぶんで済む。戻り値は「network から取得して格納した」なら true、
  * 「既にエントリがあって何もしなかった」なら false。
  *
- * **検証しない**: prefetch はバイト列を手元に持たないので `validate` を走らせられない。
- * 完全性の検証は読み出し側（`fetchBytes` の `validate` → 失敗なら evict → 取り直し）に
- * 一本化する。したがって未検証バイトが一時的にキャッシュへ載る（TOCTOU）が、self-heal が
- * あるので恒久化はしない（DECIDED: docs/decisions/0005）。壊れた物を置きたくない用途では
- * `fetchBytes` を使うこと。
+ * **検証は `sha256` を渡したときだけ**: 渡せば通過中に逐次ハッシュして突合し、一致した
+ * ものだけがエントリとして成立する（同時に検証済みマーカーが焼かれ、以後の `fetchBytes` は
+ * `verifiedMarker` で再ハッシュを省ける）。渡さなければ従来どおり無検証で格納し、完全性の
+ * 検証は読み出し側（`fetchBytes` の `validate` → 失敗なら evict → 取り直し）に一本化する
+ * — その場合は未検証バイトが一時的にキャッシュへ載る（TOCTOU。self-heal があるので恒久化は
+ * しない）。`validate` フックそのものは持てない（バイト列が手元に無いため）ので、sha256 以外の
+ * 検証をしたい用途では `fetchBytes` を使うこと（DECIDED: docs/decisions/0005）。
  *
  * **single-flight の対象外**: `fetchBytes` の合流（ADR 0004）は「leader の保存形 raw を
  * 合流者へ渡す」契約だが、prefetch は raw を持たないため合流できない。同一 URL の並行
@@ -509,7 +535,9 @@ export type PrefetchUrlOptions = {
  * ADR 0001 とはここが違う）。呼び出し側は throw を受けたら `fetchBytes` へフォールバック
  * すればよい（そちらは全量をヒープに載せる代わりに cache 失敗でも結果を返す）。
  * 転送が途中で切れた場合、`cache.put` 自体が reject してエントリは成立しない
- * （中途半端なエントリは残らない）。
+ * （中途半端なエントリは残らない）。sha256 不一致も同じ経路でエントリを潰すが、
+ * そちらは cache の失敗ではなく取得内容の不正なので、期待値と実測値を含む専用のエラーを
+ * 投げる（fetchBytes へ逃げても同じ物が落ちてくるため）。
  */
 export const prefetchUrl = async (
   url: string | URL,
@@ -523,6 +551,15 @@ export const prefetchUrl = async (
   if (method !== "GET") {
     throw new Error(
       `fetch-cache: prefetchUrl は GET 専用です（${method} は Cache API に格納できません） (${requestUrl})`,
+    );
+  }
+
+  // 形式不正の申告は必ず不一致になる（＝全量ダウンロードしてから落ちる）。呼び出し側のバグ
+  // なので network に出る前に fail loud で弾く。
+  const expectedSha256 = opts.sha256;
+  if (expectedSha256 !== undefined && !/^[0-9a-f]{64}$/.test(expectedSha256)) {
+    throw new Error(
+      `fetch-cache: sha256 は 64 桁の小文字 hex で指定してください: ${expectedSha256} (${requestUrl})`,
     );
   }
 
@@ -556,26 +593,57 @@ export const prefetchUrl = async (
   const emit = opts.onProgress === undefined
     ? undefined
     : isolateProgress(opts.onProgress, requestUrl);
+  const hasher = expectedSha256 === undefined ? undefined : createSha256();
+  const mismatch = (actual: string): Error =>
+    new Error(
+      `fetch-cache: prefetch の SHA-256 不一致: ${actual} != ${expectedSha256} (${requestUrl})`,
+    );
+  // 不一致は put の reject として現れるが、それは cache I/O の失敗ではなく取得内容の不正。
+  // put のラップメッセージに埋もれさせず本来のエラーを投げるため、ここで捕まえておく。
+  let integrityError: Error | undefined;
+
+  // 検証済みマーカーは Response の構築時点で焼く。put の成立と通過中検証の通過が不可分に
+  // なり、「印だけ付いた不正エントリ」が構造的に作れなくなる（DECIDED: docs/decisions/0005）。
+  const markerInit = expectedSha256 === undefined
+    ? undefined
+    : { headers: { [VERIFIED_HEADER]: expectedSha256 } };
+
   const body = response.body;
   let stored: Response;
   if (body === null) {
     // body が null のランタイム向けフォールバック（この経路だけは全量が一度ヒープに載る）。
     const bytes = new Uint8Array(await response.arrayBuffer());
     emit?.({ loaded: bytes.length, total });
-    stored = new Response(bytes);
+    if (hasher !== undefined) {
+      hasher.update(bytes);
+      const actual = hasher.hex();
+      // ここはまだ put していないので、そのまま throw すればエントリは作られない。
+      if (actual !== expectedSha256) throw mismatch(actual);
+    }
+    stored = new Response(bytes, markerInit);
   } else {
-    // 素通しの TransformStream で進捗だけ数える（バッファはしない＝ヒープに溜めない）。
+    // 素通しの TransformStream で進捗を数え、sha256 指定時はチャンク毎に取り込む
+    // （バッファはしない＝ヒープに溜めない）。
     let loaded = 0;
     const counted = body.pipeThrough(
       new TransformStream<Uint8Array, Uint8Array>({
         transform(chunk, controller) {
           loaded += chunk.byteLength;
+          hasher?.update(chunk);
           emit?.({ loaded, total });
           controller.enqueue(chunk);
         },
+        flush(controller) {
+          if (hasher === undefined) return;
+          const actual = hasher.hex();
+          if (actual === expectedSha256) return;
+          // stream を error にして cache.put ごと reject させる（＝エントリ不成立）。
+          integrityError = mismatch(actual);
+          controller.error(integrityError);
+        },
       }),
     );
-    stored = new Response(counted);
+    stored = new Response(counted, markerInit);
   }
 
   try {
@@ -583,10 +651,17 @@ export const prefetchUrl = async (
   } catch (error) {
     // 転送中断も quota 超過もここに集まる（どちらも put の reject として現れる）。原因は
     // cause に残し、「手元にバイトが無い＝縮退できない」ことを呼び出し側へ伝える。
+    if (integrityError !== undefined) throw integrityError;
     throw new Error(
       `fetch-cache: prefetch のキャッシュ書込みに失敗しました（バイト列は手元に残らないため fetchBytes へフォールバックしてください） (${requestUrl})`,
       { cause: error },
     );
+  }
+  if (integrityError !== undefined) {
+    // 保険: stream の error を無視してエントリを作る Cache 実装があっても、印付きの不正
+    // エントリだけは残さない（印は以後の検証を省かせるので、残ると恒久的に効いてしまう）。
+    await cache.delete(requestUrl).catch(() => {});
+    throw integrityError;
   }
   return true;
 };

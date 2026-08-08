@@ -58,7 +58,17 @@ const failingCacheStorage = (overrides: Partial<Cache>): CacheStorage => ({
 });
 
 const URL_A = "https://example.com/assets/a.bin";
+const URL_B = "https://example.com/assets/b.bin";
 const BYTES_A = new Uint8Array([1, 2, 3, 4, 5]);
+
+/** 期待 sha256 の組み立て（native の一括 digest — prefetch の通過中検証の対照）。 */
+const sha256HexOf = async (bytes: Uint8Array<ArrayBuffer>): Promise<string> =>
+  Array.from(
+    new Uint8Array(await crypto.subtle.digest("SHA-256", bytes)),
+    (byte) => byte.toString(16).padStart(2, "0"),
+  ).join("");
+
+const BYTES_A_SHA256 = await sha256HexOf(BYTES_A);
 
 /** decodeGzip テスト用の gzip 圧縮（CompressionStream = Web 標準）。 */
 const gzipBytes = async (
@@ -1236,6 +1246,122 @@ Deno.test("prefetchUrl: body が null の応答も空エントリとして成立
   } finally {
     await caches.delete(cacheName);
   }
+});
+
+// --- prefetch の通過中 sha256 検証（opt-in。省略時は従来どおり無検証） ---
+
+Deno.test("prefetchUrl: sha256 一致で印付きエントリが成立し、以後のヒットは検証を省ける", async () => {
+  const cacheName = uniqueCacheName();
+  // チャンク分割して届いても分割位置に依らず同じダイジェストになることを込みで確かめる。
+  const { fetch, calls } = mockFetch(() =>
+    chunkedResponse([BYTES_A.slice(0, 2), BYTES_A.slice(2)])
+  );
+  let validateCalls = 0;
+  try {
+    assertEquals(
+      await prefetchUrl(URL_A, { cacheName, fetch, sha256: BYTES_A_SHA256 }),
+      true,
+    );
+    const cache = await caches.open(cacheName);
+    const cached = await cache.match(URL_A);
+    assertExists(cached);
+    // 印は期待 sha256 そのもの（fetchBytes の verifiedMarker へそのまま渡せる）。
+    assertEquals(cached.headers.get("x-fetch-cache-verified"), BYTES_A_SHA256);
+    assertEquals(new Uint8Array(await cached.arrayBuffer()), BYTES_A);
+
+    const bytes = await fetchBytes(URL_A, {
+      cacheName,
+      fetch,
+      verifiedMarker: BYTES_A_SHA256,
+      validate: () => {
+        validateCalls++;
+      },
+    });
+    assertEquals(bytes, BYTES_A);
+    assertEquals(calls.length, 1); // ヒット（network に出ない）。
+    assertEquals(validateCalls, 0); // 印が一致するので再ハッシュしない。
+  } finally {
+    await caches.delete(cacheName);
+  }
+});
+
+Deno.test("prefetchUrl: sha256 不一致は put ごと reject させ、エントリを成立させない", async () => {
+  const cacheName = uniqueCacheName();
+  const wrong = "f".repeat(64);
+  const { fetch } = mockFetch(() =>
+    chunkedResponse([BYTES_A.slice(0, 2), BYTES_A.slice(2)])
+  );
+  try {
+    const error = await assertRejects(
+      () => prefetchUrl(URL_A, { cacheName, fetch, sha256: wrong }),
+      Error,
+    );
+    // 期待値と実測値の両方を出す（どちらが違うのか分からないと呼び出し側は調べようがない）。
+    assertStringIncludes(error.message, "SHA-256 不一致");
+    assertStringIncludes(error.message, BYTES_A_SHA256);
+    assertStringIncludes(error.message, wrong);
+
+    const cache = await caches.open(cacheName);
+    assertEquals(await cache.match(URL_A), undefined); // 印付きの不正エントリは残らない。
+  } finally {
+    await caches.delete(cacheName);
+  }
+});
+
+Deno.test("prefetchUrl: body が null の応答でも sha256 は検証される", async () => {
+  const cacheName = uniqueCacheName();
+  const emptySha256 = await sha256HexOf(new Uint8Array(0));
+  const { fetch } = mockFetch(() => new Response(null));
+  try {
+    assertEquals(
+      await prefetchUrl(URL_A, { cacheName, fetch, sha256: emptySha256 }),
+      true,
+    );
+    await assertRejects(
+      () =>
+        prefetchUrl(URL_B, {
+          cacheName,
+          fetch,
+          sha256: BYTES_A_SHA256, // 空バイト列とは一致しない。
+        }),
+      Error,
+      "SHA-256 不一致",
+    );
+    const cache = await caches.open(cacheName);
+    assertEquals(await cache.match(URL_B), undefined);
+  } finally {
+    await caches.delete(cacheName);
+  }
+});
+
+Deno.test("prefetchUrl: sha256 未指定なら印は付かない（既定の無検証格納は不変）", async () => {
+  const cacheName = uniqueCacheName();
+  const { fetch } = mockFetch(() => new Response(BYTES_A));
+  try {
+    await prefetchUrl(URL_A, { cacheName, fetch });
+    const cache = await caches.open(cacheName);
+    const cached = await cache.match(URL_A);
+    assertExists(cached);
+    assertEquals(cached.headers.get("x-fetch-cache-verified"), null);
+  } finally {
+    await caches.delete(cacheName);
+  }
+});
+
+Deno.test("prefetchUrl: 形式不正の sha256 は network に出る前に fail loud", async () => {
+  const cacheName = uniqueCacheName();
+  const { fetch, calls } = mockFetch(() => new Response(BYTES_A));
+  const error = await assertRejects(
+    () =>
+      prefetchUrl(URL_A, {
+        cacheName,
+        fetch,
+        sha256: BYTES_A_SHA256.toUpperCase(), // 大文字 hex は必ず不一致になる申告ミス。
+      }),
+    Error,
+  );
+  assertStringIncludes(error.message, "64 桁の小文字 hex");
+  assertEquals(calls.length, 0); // 全量ダウンロードしてから落ちる、を避ける。
 });
 
 // --- 検証済みマーカー（opt-in。既定はヒット毎に validate）---
