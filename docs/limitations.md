@@ -21,6 +21,25 @@
   （Content-Encoding 越しでは解凍後サイズと不一致が正常）、突合は誤検知バグになる。真の
   切断は stream エラーで throw 済み。整合性検証は `validate`（HF 層の sha256 /
   expectedBytes）に委譲する。
+- **`expectedBytes` / content-length は確保ヒントであって検証ではない**（DECIDED:
+  docs/decisions/0005）。受信バッファを事前確保して RAM ピークを 1N に抑えるためだけに使い、
+  申告と実受信がずれても取得は落とさない（超過なら蓄積経路へ、不足なら実長へ詰め直す）。
+  長さの検証がしたいなら `validate`（HF 層の `expectedBytes`）で行う。
+- **`prefetchUrl` は検証せず、縮退もしない**（DECIDED: docs/decisions/0005）。body を
+  そのまま cache へ流すためバイト列を手元に持てず、`validate` を走らせられない。検証は
+  読み出し時（`fetchBytes`）の self-heal に一本化する＝**未検証バイトが一時的にキャッシュへ
+  載る**（次の読み出しで evict されるので恒久化しない）。`caches` 不在・open 失敗・HTTP
+  エラー・転送中断・put 失敗（quota 等）はすべて throw する（手元にバイトが無く「続行」に
+  意味が無いため。ADR 0001 の縮退契約は `fetchBytes` 専用）。
+- **`prefetchUrl` は single-flight の対象外**（DECIDED: docs/decisions/0005）。合流契約
+  （ADR 0004）は leader の保存形 raw を共有することが本体で、streaming の leader は raw を
+  持たない。同一 URL の並行 prefetch はそれぞれ network に出る（内容同一の
+  last-writer-wins で整合性は壊れない）。
+- **検証済みマーカーはローカル格納を信頼する opt-in**（`verifiedMarker` /
+  HF 層 `trustCachedSha256`。DECIDED: docs/decisions/0005）。既定はヒット毎の全量検証で不変。
+  印は「保存時に validate を通った」という自己申告であり、格納後の改竄・ビット腐敗は検出
+  できない。印が付くのは opt-in で network 取得したエントリだけで、既存エントリ・
+  `prefetchUrl` が書いたエントリ・single-flight の合流者は通常どおり検証する。
 - **decode 後（利用形）はキャッシュしない**: cache に入るのは常に保存形 raw で、`decode` は
   毎呼び出し実行される（storage 節約と引き換えの CPU コスト。トレードオフの選択は
   呼び出し側 — DECIDED: docs/decisions/0003）。また `validate` は decode 併用時も保存形

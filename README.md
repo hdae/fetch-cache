@@ -23,6 +23,11 @@ corrupted cache entries. A thin HuggingFace Hub layer (`./hf`) is included.
   URL) join one in-flight download (cached GETs only — `cache: false` opts
   out); joiners share the stored raw bytes and apply their own `validate` /
   `decode`, and `onProgress` fans out to every joined caller
+- **Memory-conscious downloads**: the receive buffer is preallocated when the
+  size is known (`expectedBytes`, or content-length as a fallback) and stored
+  without an extra full-size copy, keeping the heap at one copy of the asset
+  instead of two; `prefetchUrl` streams a response straight into the cache and
+  never materializes it at all
 - **HuggingFace layer**: resolves mutable refs (`"main"` etc.) to the current
   commit SHA, then fetches and caches via immutable SHA-pinned URLs; parallel
   multi-file downloads with `expectedBytes` / `sha256` integrity checks
@@ -104,6 +109,57 @@ to the cache after decoding. The decoded form is never cached, so `decode`
 runs on every call (storage savings traded for CPU; see
 [docs/limitations.md](docs/limitations.md)).
 
+### Large assets (multi-GB models)
+
+```typescript
+import { fetchBytes, prefetchUrl } from "@hdae/fetch-cache";
+
+// Warm the cache without ever holding the file in the JS heap: the network
+// response body is piped straight into Cache Storage.
+// true  = downloaded and stored, false = an entry was already there.
+await prefetchUrl(url, {
+  onProgress: ({ loaded, total }) => console.log(loaded, total),
+});
+
+// Materialize it later, one file at a time — this is where validation happens.
+const bytes = await fetchBytes(url, { validate, expectedBytes: 1234 });
+```
+
+`prefetchUrl` cannot validate (it never sees the bytes), so verification is
+concentrated in the read path: `fetchBytes` validates, and a bad entry is
+evicted and re-fetched (self-heal). This means unverified bytes may sit in the
+cache until the first read — do pass a `validate` when you read them back.
+Unlike `fetchBytes`, `prefetchUrl` never degrades: a missing `caches`, an HTTP
+error, an interrupted transfer or a failing put (quota) all throw, because
+storing is its only job and it has no bytes to hand back. Fall back to
+`fetchBytes` when it throws. It is also not part of single-flight — see
+[docs/limitations.md](docs/limitations.md) and
+[ADR 0005](docs/decisions/0005-streaming-prefetch-and-verified-marker.md).
+
+`expectedBytes` on `fetchBytes` is an allocation hint only (never a check): the
+receive buffer is allocated once up front instead of concatenating chunks at
+the end, which halves the peak heap for large files. A wrong hint costs
+nothing — the download simply falls back to the chunked path.
+
+### Skipping re-validation on cache hits (opt-in)
+
+```typescript
+// Bakes the marker into the cached entry after validation succeeds, and skips
+// `validate` on later hits whose marker matches. Default (no marker): every
+// cache hit is validated, exactly as before.
+const bytes = await fetchBytes(url, {
+  validate: async (bytes) => {/* e.g. sha256 check */},
+  verifiedMarker: "sha256:1a2b…",
+});
+```
+
+This trades verification for start-up time on huge assets, and it is a decision
+to **trust local storage**: the marker only claims "these bytes passed
+`validate` when they were stored", so tampering or bit rot after the fact is
+not detectable (the marker would be rewritten with them). Entries written by
+`prefetchUrl`, entries stored before you opted in, and single-flight joiners
+carry no marker and are validated normally.
+
 ### Auth & abort
 
 ```typescript
@@ -184,6 +240,10 @@ const files = await fetchHfFiles(
 
 A few things worth knowing:
 
+- `trustCachedSha256: true` (opt-in) bakes the declared `sha256` into the
+  cached entry and skips re-hashing on later hits whose marker matches — the
+  `verifiedMarker` trust boundary above applies. Default: every cache hit is
+  hashed in full.
 - The HF layer uses its own default cache namespace `"fetch-cache-hf"`
   (the generic layer uses `"fetch-cache"`), so `clearCache()` does not touch
   HF downloads — use `clearCache("fetch-cache-hf")`.
