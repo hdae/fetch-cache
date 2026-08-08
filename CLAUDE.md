@@ -5,9 +5,12 @@ Deno / ブラウザ両対応の「URL ベースの Cache API 付きダウンロ�
 
 ## Layout
 
-- `src/mod.ts` — `.` エントリ（汎用 cache 層: fetchBytes / prefetchUrl / evictUrl /
-  clearCache / listCachedUrls / VERSION 焼き込み）。
-- `src/hf/mod.ts` — `./hf` エントリ（HuggingFace 層。cache 層の上に実装）。
+- `src/mod.ts` — `.` エントリ（汎用 cache 層: fetchBytes / prefetchUrl / decodeGzip /
+  evictUrl / clearCache / listCachedUrls / VERSION 焼き込み）。
+- `src/sha256.ts` — 内部モジュール（非公開）。通過中検証用の純 TS インクリメンタル
+  SHA-256。materialize 済みバイト列は native の一括 digest のまま（ADR 0005 §5）。
+- `src/hf/mod.ts` — `./hf` エントリ（HuggingFace 層: fetchHfFile / fetchHfFiles /
+  prefetchHfFile / resolveHfRevision / hfResolveUrl / isCommitSha。cache 層の上に実装）。
 - `src/testing/` — テスト専用の mock fetch ヘルパ（publish 対象外）。
 - `scripts/` — version 単一真実源（deno.json）+ drift ガード一式（bump / verify_tag）。
 - `docs/` — 設計ドキュメント（下記 Docs 参照）。

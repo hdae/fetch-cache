@@ -25,12 +25,18 @@
   docs/decisions/0005）。受信バッファを事前確保して RAM ピークを 1N に抑えるためだけに使い、
   申告と実受信がずれても取得は落とさない（超過なら蓄積経路へ、不足なら実長へ詰め直す）。
   長さの検証がしたいなら `validate`（HF 層の `expectedBytes`）で行う。
-- **`prefetchUrl` は検証せず、縮退もしない**（DECIDED: docs/decisions/0005）。body を
-  そのまま cache へ流すためバイト列を手元に持てず、`validate` を走らせられない。検証は
-  読み出し時（`fetchBytes`）の self-heal に一本化する＝**未検証バイトが一時的にキャッシュへ
-  載る**（次の読み出しで evict されるので恒久化しない）。`caches` 不在・open 失敗・HTTP
-  エラー・転送中断・put 失敗（quota 等）はすべて throw する（手元にバイトが無く「続行」に
+- **`prefetchUrl` の検証は `sha256` 指定時のみ・縮退はしない**（DECIDED:
+  docs/decisions/0005 §5）。body をそのまま cache へ流すためバイト列を手元に持てず、
+  `validate` フックは走らせられない。唯一の例外が `sha256`（64 桁小文字 hex）で、指定時は
+  通過中に逐次ハッシュして突合し、一致したものだけがエントリとして成立する（同時に検証済み
+  マーカーが焼かれる）。**未指定なら未検証バイトが一時的にキャッシュへ載る**（読み出し時の
+  self-heal で evict されるので恒久化しない）。`caches` 不在・open 失敗・HTTP エラー・転送
+  中断・put 失敗（quota 等）・sha256 不一致はすべて throw する（手元にバイトが無く「続行」に
   意味が無いため。ADR 0001 の縮退契約は `fetchBytes` 専用）。
+- **prefetch は既存エントリを検証しない**（DECIDED: docs/decisions/0005 §5）。
+  `prefetchUrl` / `prefetchHfFile` はエントリがあれば network に出ずに false を返すため、
+  `sha256` を渡しても既存の内容は照合されない（温める API であって検査する API ではない）。
+  既存の内容を疑うなら `fetchBytes`（self-heal 付き）か `evictUrl` を使う。
 - **`prefetchUrl` は single-flight の対象外**（DECIDED: docs/decisions/0005）。合流契約
   （ADR 0004）は leader の保存形 raw を共有することが本体で、streaming の leader は raw を
   持たない。同一 URL の並行 prefetch はそれぞれ network に出る（内容同一の
@@ -38,8 +44,14 @@
 - **検証済みマーカーはローカル格納を信頼する opt-in**（`verifiedMarker` /
   HF 層 `trustCachedSha256`。DECIDED: docs/decisions/0005）。既定はヒット毎の全量検証で不変。
   印は「保存時に validate を通った」という自己申告であり、格納後の改竄・ビット腐敗は検出
-  できない。印が付くのは opt-in で network 取得したエントリだけで、既存エントリ・
-  `prefetchUrl` が書いたエントリ・single-flight の合流者は通常どおり検証する。
+  できない。印が付くのは opt-in で network 取得したエントリと `sha256` 付き prefetch が
+  通したエントリだけで、既存エントリ・無検証 prefetch が書いたエントリ・single-flight の
+  合流者は通常どおり検証する。
+- **prefetch 由来の印は sha256 の一致だけを主張する**（DECIDED: docs/decisions/0005 §5）。
+  `fetchBytes` 側の印は `validate` 全体の通過を意味するが、prefetch はハッシュしか計算して
+  いない。HF 層で `spec.validate`（カスタム検証）を宣言しつつ `trustCachedSha256: true` で
+  読むと、そのカスタム検証は prefetch 済みエントリのヒットで省かれる（sha256 一致 = バイト
+  同一なので、実害は宣言そのものが食い違っていた場合に限られるという判断）。
 - **decode 後（利用形）はキャッシュしない**: cache に入るのは常に保存形 raw で、`decode` は
   毎呼び出し実行される（storage 節約と引き換えの CPU コスト。トレードオフの選択は
   呼び出し側 — DECIDED: docs/decisions/0003）。また `validate` は decode 併用時も保存形
@@ -49,6 +61,10 @@
 
 - **`fetchHfFiles` の部分キャッシュ**: 1 ファイルの失敗で全体が reject するが、成功済み
   ファイルのキャッシュ書込みは取り消されない（リトライは即ヒット。テストで凍結済み）。
+- **prefetch の複数ファイル版は無い**（DECIDED: docs/decisions/0005 §5）。`prefetchHfFile`
+  のみを提供する。数 GB 級の並列 prefetch は帯域の奪い合いにしかならないため、並行度の選択は
+  呼び出し側に残す（`resolveHfRevision` で 1 回解決 → `revision` に SHA を渡して必要な順に
+  呼ぶ）。
 - **revision 解決は HF の実装挙動依存**: `/api/{kind}/{repo}/revision/{ref}` が
   `{"sha": …}` を返すのは仕様保証ではない（応答に sha が無ければ throw）。
 

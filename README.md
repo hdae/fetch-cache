@@ -27,7 +27,8 @@ corrupted cache entries. A thin HuggingFace Hub layer (`./hf`) is included.
   size is known (`expectedBytes`, or content-length as a fallback) and stored
   without an extra full-size copy, keeping the heap at one copy of the asset
   instead of two; `prefetchUrl` streams a response straight into the cache and
-  never materializes it at all
+  never materializes it at all — optionally verifying a `sha256` **in flight**,
+  so a corrupted download never becomes a cache entry
 - **HuggingFace layer**: resolves mutable refs (`"main"` etc.) to the current
   commit SHA, then fetches and caches via immutable SHA-pinned URLs; parallel
   multi-file downloads with `expectedBytes` / `sha256` integrity checks
@@ -125,14 +126,31 @@ await prefetchUrl(url, {
 const bytes = await fetchBytes(url, { validate, expectedBytes: 1234 });
 ```
 
-`prefetchUrl` cannot validate (it never sees the bytes), so verification is
-concentrated in the read path: `fetchBytes` validates, and a bad entry is
-evicted and re-fetched (self-heal). This means unverified bytes may sit in the
-cache until the first read — do pass a `validate` when you read them back.
+Pass a `sha256` to verify **in flight**, without ever buffering the file:
+
+```typescript
+// Hashed chunk by chunk as it streams into the cache. On a mismatch the put is
+// rejected, so the entry never comes into existence; on a match the entry is
+// stored with a verified marker baked in, which the read path can trust.
+await prefetchUrl(url, { sha256: "1a2b…" }); // 64 lowercase hex digits
+
+const bytes = await fetchBytes(url, {
+  validate: verifySha256,
+  verifiedMarker: "1a2b…", // marker matches -> no re-hashing on this hit
+});
+```
+
+Without `sha256`, `prefetchUrl` cannot validate (it never sees the bytes), so
+verification is concentrated in the read path: `fetchBytes` validates, and a bad
+entry is evicted and re-fetched (self-heal). That means unverified bytes may sit
+in the cache until the first read — do pass a `validate` when you read them
+back. Either way, an entry that is already there is never re-checked:
+prefetching returns `false` without touching the network.
+
 Unlike `fetchBytes`, `prefetchUrl` never degrades: a missing `caches`, an HTTP
-error, an interrupted transfer or a failing put (quota) all throw, because
-storing is its only job and it has no bytes to hand back. Fall back to
-`fetchBytes` when it throws. It is also not part of single-flight — see
+error, an interrupted transfer, a failing put (quota) or a `sha256` mismatch all
+throw, because storing is its only job and it has no bytes to hand back. Fall
+back to `fetchBytes` when it throws. It is also not part of single-flight — see
 [docs/limitations.md](docs/limitations.md) and
 [ADR 0005](docs/decisions/0005-streaming-prefetch-and-verified-marker.md).
 
@@ -156,9 +174,11 @@ const bytes = await fetchBytes(url, {
 This trades verification for start-up time on huge assets, and it is a decision
 to **trust local storage**: the marker only claims "these bytes passed
 `validate` when they were stored", so tampering or bit rot after the fact is
-not detectable (the marker would be rewritten with them). Entries written by
-`prefetchUrl`, entries stored before you opted in, and single-flight joiners
-carry no marker and are validated normally.
+not detectable (the marker would be rewritten with them). Entries stored before
+you opted in and single-flight joiners carry no marker and are validated
+normally; `prefetchUrl` writes one only when it verified a `sha256` in flight,
+and that marker claims the hash match alone (any extra checks your `validate`
+performs are skipped on those hits).
 
 ### Auth & abort
 
@@ -238,12 +258,42 @@ const files = await fetchHfFiles(
 );
 ```
 
+For multi-GB models, warm the cache first with `prefetchHfFile` — nothing is
+ever held in the JS heap, and a declared `sha256` is verified in flight:
+
+```typescript
+import { prefetchHfFile, resolveHfRevision } from "@hdae/fetch-cache/hf";
+
+const ref = { repo: "owner/name" };
+// Resolve the revision once, then prefetch against the immutable SHA (no
+// repeated resolution requests, no chance of files drifting across revisions).
+const revision = await resolveHfRevision(ref);
+const spec = { path: "model.safetensors", sha256: "1a2b…" };
+
+// true = downloaded and stored, false = an entry was already there.
+// A mismatching hash rejects the put, so the entry never comes into existence.
+await prefetchHfFile({ ...ref, revision }, spec, {
+  onProgress: ({ path, loaded, total }) => console.log(path, loaded, total),
+});
+
+// Reading it back is a cache hit, and the marker skips the full re-hash.
+const model = await fetchHfFile({ ...ref, revision }, spec, {
+  trustCachedSha256: true,
+});
+```
+
+There is no multi-file prefetch on purpose: downloading several multi-GB files
+in parallel only splits the same bandwidth, so the loop (and its concurrency) is
+left to you.
+
 A few things worth knowing:
 
 - `trustCachedSha256: true` (opt-in) bakes the declared `sha256` into the
   cached entry and skips re-hashing on later hits whose marker matches — the
   `verifiedMarker` trust boundary above applies. Default: every cache hit is
-  hashed in full.
+  hashed in full. Entries warmed by `prefetchHfFile` carry the same marker; note
+  that it certifies the hash only, so a custom `validate` on that file is
+  skipped on those hits.
 - The HF layer uses its own default cache namespace `"fetch-cache-hf"`
   (the generic layer uses `"fetch-cache"`), so `clearCache()` does not touch
   HF downloads — use `clearCache("fetch-cache-hf")`.
