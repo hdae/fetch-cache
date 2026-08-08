@@ -15,6 +15,7 @@ import {
   type DecodeBytes,
   fetchBytes,
   type FetchProgress,
+  prefetchUrl,
   type ValidateBytes,
 } from "../mod.ts";
 
@@ -265,6 +266,64 @@ export const fetchHfFile = async (
     init: opts.init,
   });
   return await fetchResolvedFile(ref, revision, toSpec(file), opts);
+};
+
+/** `prefetchHfFile` のオプション（cache 層 `prefetchUrl` と同じく縮退しない＝fail loud）。 */
+export type HfPrefetchOptions = {
+  /** 既定 "fetch-cache-hf"（fetchHfFile / fetchHfFiles と同じ名前空間）。 */
+  cacheName?: string;
+  /** ファイル毎の進捗（path 付き）。既にエントリがあるときは呼ばれない。 */
+  onProgress?: (progress: FetchProgress & { path: string }) => void;
+  /** fetch へそのまま渡す RequestInit。revision 解決とファイル取得の両方へ渡る。 */
+  init?: RequestInit;
+  fetch?: typeof globalThis.fetch;
+  /** CacheStorage の差し替え（cache 層へそのまま渡す）。既定 globalThis.caches。 */
+  caches?: CacheStorage;
+};
+
+/**
+ * HuggingFace のファイルを**ヒープに全量を載せずに**キャッシュへ温める（streaming prefetch）。
+ * 可変 ref は `fetchHfFile` と同じ流儀で現在の SHA へ解決してから SHA 固定 URL で取得するので、
+ * 温めたエントリはそのまま `fetchHfFile` のヒットになる。戻り値は「取得して格納した」なら
+ * true、「既にエントリがあって何もしなかった」なら false。
+ *
+ * `spec.sha256` があれば cache 層の通過中検証（`prefetchUrl` の `sha256`）へ自動で流れ、
+ * 一致したエントリにだけ検証済みマーカーが焼かれる。以後 `trustCachedSha256: true` で読めば
+ * ヒット時の再ハッシュを省ける（数 GB のモデルで起動毎の全量ハッシュを避ける本命の使い方）。
+ * NOTE: 焼かれる印が主張するのは sha256 の一致だけ。`expectedBytes` は sha256 一致が
+ *       バイト同一を含意するので実質包含されるが、`spec.validate`（カスタム検証）は
+ *       `trustCachedSha256` 有効時にヒットで省かれる（DECIDED: docs/decisions/0005）。
+ *
+ * **縮退しない（fail loud）**: `caches` 不在・HTTP エラー・転送中断・put 失敗・sha256 不一致は
+ * すべて throw する（cache 層 `prefetchUrl` の契約をそのまま継承）。fallback は `fetchHfFile`。
+ *
+ * NOTE: 複数ファイルを温めるときは `resolveHfRevision` で 1 回だけ SHA を解決し、
+ *       `revision` にその SHA を渡して呼ぶこと（毎回の解決リクエストが省け、ファイル間で
+ *       revision がずれる余地も無くなる）。並行度の選択は呼び出し側に委ねる — 数 GB 級では
+ *       逐次の方が望ましいことが多く、ライブラリ側で並列版を決め打ちしない。
+ */
+export const prefetchHfFile = async (
+  ref: HfRepoRef,
+  file: string | HfFileSpec,
+  opts: HfPrefetchOptions = {},
+): Promise<boolean> => {
+  const revision = await resolveHfRevision(ref, {
+    fetch: opts.fetch,
+    init: opts.init,
+  });
+  const spec = toSpec(file);
+  const url = hfResolveUrl({ ...ref, revision, path: spec.path });
+  const onProgress = opts.onProgress;
+  return await prefetchUrl(url, {
+    cacheName: opts.cacheName ?? DEFAULT_CACHE_NAME,
+    sha256: spec.sha256,
+    onProgress: onProgress === undefined
+      ? undefined
+      : (progress) => onProgress({ ...progress, path: spec.path }),
+    init: opts.init,
+    fetch: opts.fetch,
+    caches: opts.caches,
+  });
 };
 
 /**
