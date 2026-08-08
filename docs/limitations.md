@@ -8,9 +8,11 @@
   `cache: false` の並行呼び出しは合流せずそれぞれ network に出る（「毎回取りに行く」意図と
   非 GET の非冪等性を尊重。put は last-writer-wins で内容同一のため整合性は壊れない）。
   合流キーは (cacheName, URL) のみで、**合流者の `fetch` / `caches` / `init` /
-  `onCacheError` は使われない**（取得は先行呼び出しのオプションで走る。認証ヘッダ違いを
-  区別しないのはキャッシュキーが URL のみの設計と同じ割り切り）。取得失敗は合流全員へ
-  伝播する。
+  `onCacheError` / `expectedBytes` / `verifiedMarker` は使われない**（取得は先行呼び出しの
+  オプションで走る。認証ヘッダ違いを区別しないのはキャッシュキーが URL のみの設計と同じ
+  割り切り）。印を焼くのも leader の `verifiedMarker` だけで、合流者の指定は読み出し
+  （ヒット時に検証を省くかの判定）・書き込み（焼く印の内容）とも使われない。取得失敗は
+  合流全員へ伝播する。
 - **非 GET はキャッシュ非対応**: Cache API は GET しか格納できない。cache 有効 + 非 GET は
   fail-loud に throw する（`cache: false` で素の fetch は可）。POST 応答のキャッシュは
   スコープ外（DECIDED: docs/decisions/0002）。
@@ -33,6 +35,10 @@
   self-heal で evict されるので恒久化しない）。`caches` 不在・open 失敗・HTTP エラー・転送
   中断・put 失敗（quota 等）・sha256 不一致はすべて throw する（手元にバイトが無く「続行」に
   意味が無いため。ADR 0001 の縮退契約は `fetchBytes` 専用）。
+- **prefetch が見る検証指定は `sha256` だけ**（DECIDED: docs/decisions/0005 §5）。
+  `prefetchHfFile` に `spec.expectedBytes` / `spec.validate` を渡しても prefetch では
+  使われない（バイト列を手元に持たないため。どちらも `fetchHfFile` で読み出すときには
+  通常どおり効く）。
 - **prefetch は既存エントリを検証しない**（DECIDED: docs/decisions/0005 §5）。
   `prefetchUrl` / `prefetchHfFile` はエントリがあれば network に出ずに false を返すため、
   `sha256` を渡しても既存の内容は照合されない（温める API であって検査する API ではない）。

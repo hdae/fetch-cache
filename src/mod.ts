@@ -401,8 +401,9 @@ const acquireAndDecode = async (
  * 各呼び出しが自分のオプションで適用する。取得失敗は合流した全呼び出しへ伝播し、フライト
  * 終了後の呼び出しは新規に取得する（失敗は記憶しない）。`onProgress` は合流者へも fan-out
  * され、合流時に直近の進捗が 1 回即時通知される。NOTE: 合流者の `fetch` / `caches` /
- * `init` / `onCacheError` は使われない — 取得は先行呼び出しのオプションで走っている
- * （DECIDED: docs/decisions/0004、docs/limitations.md）。
+ * `init` / `onCacheError` / `expectedBytes` / `verifiedMarker` は使われない — 取得は先行
+ * 呼び出しのオプションで走っている（印を焼くのも leader の値だけで、合流者の指定は読み出し・
+ * 書き込みとも使われない。DECIDED: docs/decisions/0004、docs/limitations.md）。
  *
  * NOTE: `caches` が無いランタイム（Node.js 等）では `cache` 指定に関わらず素の fetch に
  *       フォールバックする（キャッシュは最適化であり正しさの要件ではない）。

@@ -47,6 +47,9 @@ const rotr = (word: number, bits: number): number =>
  * 64 バイトブロック 1 個を圧縮して state を更新する。`schedule` は使い回しのスクラッチ
  * （ブロック毎の確保を避ける）。中間値は int32 として扱い、加算結果は `>>> 0` で mod 2^32 へ
  * 畳む（加数は高々 5 個 = 2^35 未満なので double で厳密に表現できる）。
+ *
+ * スクラッチは `update` と `hex()` で共有してよい: schedule[0..15] は毎回ブロックから全上書き
+ * され、16..63 はそこから導かれるので、前のブロックの内容が持ち越されることはない。
  */
 const compress = (
   state: Uint32Array,

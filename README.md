@@ -167,7 +167,7 @@ nothing — the download simply falls back to the chunked path.
 // cache hit is validated, exactly as before.
 const bytes = await fetchBytes(url, {
   validate: async (bytes) => {/* e.g. sha256 check */},
-  verifiedMarker: "sha256:1a2b…",
+  verifiedMarker: "1a2b…", // any string; the sha256 hex is the typical choice
 });
 ```
 

@@ -178,9 +178,12 @@ const sha256Hex = async (bytes: Uint8Array): Promise<string> => {
   }
   const digest = await crypto.subtle.digest(
     "SHA-256",
-    // MUST: 全量コピーしない — 数 GB 級ではコピー 1 回が一時 RAM を倍増させる。cache 層が
+    // MUST: 手前で余計なコピーを作らない — 数 GB 級ではコピー 1 回ぶんが効く。cache 層が
     // 渡す bytes は tight な ArrayBuffer 背面なのでそのまま渡せる。部分ビュー・
     // SharedArrayBuffer 背面（WebCrypto が拒否する）が来たときだけコピーで背面を保証する。
+    // NOTE: これでピークが 1N になるわけではない。WebCrypto は仕様上 digest の入力を内部で
+    //       コピーするため、ここでの削減は 3N → 2N。読み出し経路に残る 2N を消す手段は
+    //       再ハッシュ自体を省く `trustCachedSha256`（印）の方（DECIDED: docs/decisions/0005）。
     isTightView(bytes) ? bytes : new Uint8Array(bytes),
   );
   return Array.from(
@@ -320,6 +323,9 @@ export type HfPrefetchResult = {
  * NOTE: 焼かれる印が主張するのは sha256 の一致だけ。`expectedBytes` は sha256 一致が
  *       バイト同一を含意するので実質包含されるが、`spec.validate`（カスタム検証）は
  *       `trustCachedSha256` 有効時にヒットで省かれる（DECIDED: docs/decisions/0005）。
+ * NOTE: prefetch が spec から見るのは `sha256` だけ。`expectedBytes`（`fetchHfFile` では
+ *       検証 + 確保ヒント）も `spec.validate` も、渡しても prefetch では使われない
+ *       （バイト列を手元に持たないため。docs/limitations.md）。
  *
  * **縮退しない（fail loud）**: `caches` 不在・HTTP エラー・転送中断・put 失敗・sha256 不一致は
  * すべて throw する（cache 層 `prefetchUrl` の契約をそのまま継承）。fallback は `fetchHfFile`。
