@@ -629,9 +629,15 @@ export const prefetchUrl = async (
       new TransformStream<Uint8Array, Uint8Array>({
         transform(chunk, controller) {
           loaded += chunk.byteLength;
-          hasher?.update(chunk);
+          // 通過中検証があるときはチャンクを複製し、ハッシュと格納へ同じ複製を渡す。元の
+          // チャンクは呼び出し側（fetch 差し替えや onProgress リスナー）が参照を握ったまま
+          // update 後に書き換えられるため、共有すると「印は付いたが中身がハッシュと違う」
+          // エントリを作る手順が生まれる（MUST: 印の健全性を呼び出し側の行儀に依存させない
+          // — DECIDED: docs/decisions/0005 §5）。印が無ければ乖離は無害なので複製しない。
+          const owned = hasher === undefined ? chunk : chunk.slice();
+          hasher?.update(owned);
           emit?.({ loaded, total });
-          controller.enqueue(chunk);
+          controller.enqueue(owned);
         },
         flush(controller) {
           if (hasher === undefined) return;

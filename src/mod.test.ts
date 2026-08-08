@@ -1308,6 +1308,48 @@ Deno.test("prefetchUrl: sha256 不一致は put ごと reject させ、エント
   }
 });
 
+Deno.test("prefetchUrl: 通過中検証のチャンクは呼び出し側の書き換えから隔離される（印と中身が乖離しない）", async () => {
+  const cacheName = uniqueCacheName();
+  // 呼び出し側が参照を握ったままのバッファを 1 チャンクだけ流し、onProgress（ハッシュ直後・
+  // 格納前に同期で走る呼び出し側コード）で書き換える敵対的な輸送を再現する。隔離が無いと
+  // 「印はハッシュ時の内容・格納は書き換え後の内容」という乖離エントリが成立してしまう。
+  const buffer = new Uint8Array(16).fill(0x11);
+  const expected = await sha256HexOf(buffer.slice());
+  const { fetch } = mockFetch(() =>
+    new Response(
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(buffer);
+          controller.close();
+        },
+      }),
+    )
+  );
+  try {
+    assertEquals(
+      await prefetchUrl(URL_A, {
+        cacheName,
+        fetch,
+        sha256: expected,
+        onProgress: () => buffer.fill(0x22),
+      }),
+      true,
+    );
+    const cache = await caches.open(cacheName);
+    const cached = await cache.match(URL_A);
+    assertExists(cached);
+    const stored = new Uint8Array(await cached.arrayBuffer());
+    // 印が主張するハッシュと格納内容が必ず一致する（書き換え前の内容が格納される）。
+    assertEquals(
+      await sha256HexOf(stored),
+      cached.headers.get("x-fetch-cache-verified"),
+    );
+    assertEquals(stored, new Uint8Array(16).fill(0x11));
+  } finally {
+    await caches.delete(cacheName);
+  }
+});
+
 Deno.test("prefetchUrl: body が null の応答でも sha256 は検証される", async () => {
   const cacheName = uniqueCacheName();
   const emptySha256 = await sha256HexOf(new Uint8Array(0));
