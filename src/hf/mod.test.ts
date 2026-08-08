@@ -2,6 +2,7 @@ import {
   assertEquals,
   assertExists,
   assertRejects,
+  assertStrictEquals,
   assertStringIncludes,
 } from "@std/assert";
 import {
@@ -537,6 +538,134 @@ Deno.test("fetchHfFiles: onProgress に path が付く", async () => {
       },
     );
     assertEquals(paths, new Set(["a.bin", "b.bin"]));
+  } finally {
+    await caches.delete(cacheName);
+  }
+});
+
+// --- sha256 検証のコピー回避 / 検証済みマーカー ---
+
+/**
+ * `crypto.subtle.digest` を差し替えて「何が渡ったか」を観測する。数 GB 級では digest 前の
+ * 全量コピー 1 回が一時 RAM を倍増させるため、コピーの有無は仕様として凍結する価値がある。
+ */
+const spyDigest = (): {
+  args: unknown[];
+  restore: () => void;
+} => {
+  const original = crypto.subtle.digest;
+  const args: unknown[] = [];
+  const patched: typeof crypto.subtle.digest = (algorithm, data) => {
+    args.push(data);
+    return original.call(crypto.subtle, algorithm, data);
+  };
+  crypto.subtle.digest = patched;
+  return {
+    args,
+    restore: () => {
+      crypto.subtle.digest = original;
+    },
+  };
+};
+
+Deno.test("sha256 検証: digest には validate が受け取った view がそのまま渡る（コピーしない）", async () => {
+  const cacheName = uniqueCacheName();
+  const { fetch } = mockFetch(() => new Response(BYTES));
+  const seenByValidate: Uint8Array[] = [];
+  const digest = spyDigest();
+  try {
+    await fetchHfFile(
+      { repo: REPO, revision: SHA },
+      {
+        path: "model.onnx",
+        sha256: BYTES_SHA256,
+        // built-in（sha256）と同じ raw を受け取るカスタム validate で、実体の同一性を観測する。
+        validate: (bytes) => {
+          seenByValidate.push(bytes);
+        },
+      },
+      { cacheName, fetch },
+    );
+    assertEquals(digest.args.length, 1);
+    // コピーしていれば別インスタンスになる（tight view はそのまま渡すのが仕様）。
+    assertStrictEquals<unknown>(digest.args[0], seenByValidate[0]);
+  } finally {
+    digest.restore();
+    await caches.delete(cacheName);
+  }
+});
+
+Deno.test("trustCachedSha256: 印が一致するヒットでは再ハッシュしない（opt-in）", async () => {
+  const cacheName = uniqueCacheName();
+  const { fetch, calls } = mockFetch(() => new Response(BYTES));
+  const spec = { path: "model.onnx", sha256: BYTES_SHA256 };
+  const digest = spyDigest();
+  try {
+    await fetchHfFile({ repo: REPO, revision: SHA }, spec, {
+      cacheName,
+      fetch,
+      trustCachedSha256: true,
+    });
+    await fetchHfFile({ repo: REPO, revision: SHA }, spec, {
+      cacheName,
+      fetch,
+      trustCachedSha256: true,
+    });
+    assertEquals(calls.length, 1); // 2 回目はキャッシュヒット。
+    assertEquals(digest.args.length, 1); // ハッシュは保存時の 1 回だけ。
+  } finally {
+    digest.restore();
+    await caches.delete(cacheName);
+  }
+});
+
+Deno.test("trustCachedSha256: 既定（未指定）はヒット毎に再ハッシュする", async () => {
+  const cacheName = uniqueCacheName();
+  const { fetch, calls } = mockFetch(() => new Response(BYTES));
+  const spec = { path: "model.onnx", sha256: BYTES_SHA256 };
+  const digest = spyDigest();
+  try {
+    await fetchHfFile({ repo: REPO, revision: SHA }, spec, {
+      cacheName,
+      fetch,
+    });
+    await fetchHfFile({ repo: REPO, revision: SHA }, spec, {
+      cacheName,
+      fetch,
+    });
+    assertEquals(calls.length, 1);
+    assertEquals(digest.args.length, 2); // 現行挙動（毎回検証）を維持。
+  } finally {
+    digest.restore();
+    await caches.delete(cacheName);
+  }
+});
+
+Deno.test("HfFileSpec.expectedBytes は受信バッファの確保ヒントとして cache 層へ流れる", async () => {
+  const cacheName = uniqueCacheName();
+  // 同一インスタンスを 2 回 enqueue し、間で書き換える。事前確保経路なら読み取り時に
+  // 即コピーされるので内容が保たれる（cache 層のテストと同じ観測手法）。
+  let controller!: ReadableStreamDefaultController<Uint8Array<ArrayBuffer>>;
+  const stream = new ReadableStream<Uint8Array<ArrayBuffer>>({
+    start(c) {
+      controller = c;
+    },
+  });
+  const { fetch } = mockFetch(() => new Response(stream)); // content-length なし。
+  const reused = new Uint8Array([1, 2, 3]);
+  const firstChunk = Promise.withResolvers<void>();
+  try {
+    const promise = fetchHfFile(
+      { repo: REPO, revision: SHA },
+      { path: "model.onnx", expectedBytes: 6 },
+      { cacheName, fetch, onProgress: () => firstChunk.resolve() },
+    );
+    controller.enqueue(reused);
+    await firstChunk.promise;
+    reused.set([4, 5, 6]);
+    controller.enqueue(reused);
+    controller.close();
+    assertEquals(await promise, new Uint8Array([1, 2, 3, 4, 5, 6]));
   } finally {
     await caches.delete(cacheName);
   }

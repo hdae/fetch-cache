@@ -146,7 +146,27 @@ export type HfFetchOptions = {
   fetch?: typeof globalThis.fetch;
   /** CacheStorage の差し替え（cache 層へそのまま渡す）。既定 globalThis.caches。 */
   caches?: CacheStorage;
+  /**
+   * **opt-in**: `sha256` を宣言したファイルについて、保存時に検証済みマーカーを焼き、
+   * 以後のキャッシュヒットで印が一致したら検証（expectedBytes / sha256 / カスタム validate）を
+   * まるごと省く。既定 false = 現行どおりヒット毎に全量ハッシュする。
+   *
+   * MUST: これは「ローカル格納を信頼する」選択である（cache 層 `verifiedMarker` の信頼境界を
+   * そのまま継承 — 格納後の改竄・ビット腐敗は検出できない）。数 GB のモデルで起動毎の
+   * 再ハッシュが重すぎる場合の逃げ道であり、既定にはしない（DECIDED: docs/decisions/0005）。
+   * NOTE: 印が付くのは「このオプション付きで network から取得して保存した」エントリだけ。
+   *       既存のキャッシュには印が無いので、次に取り直すまでは通常どおり検証が走る。
+   */
+  trustCachedSha256?: boolean;
 };
+
+/**
+ * buffer 全体を占める ArrayBuffer 背面の view か（= そのまま digest へ渡せるか）。
+ * SharedArrayBuffer 背面はここで弾く（述語が主張する `Uint8Array<ArrayBuffer>` を嘘にしない）。
+ */
+const isTightView = (bytes: Uint8Array): bytes is Uint8Array<ArrayBuffer> =>
+  bytes.buffer instanceof ArrayBuffer && bytes.byteOffset === 0 &&
+  bytes.byteLength === bytes.buffer.byteLength;
 
 /** バイト列をハッシュして小文字 hex を返す（sha256 検証用）。crypto.subtle が無ければ throw。 */
 const sha256Hex = async (bytes: Uint8Array): Promise<string> => {
@@ -157,8 +177,10 @@ const sha256Hex = async (bytes: Uint8Array): Promise<string> => {
   }
   const digest = await crypto.subtle.digest(
     "SHA-256",
-    // SharedArrayBuffer 由来でも digest に渡せるようコピーで ArrayBuffer 背面を保証する。
-    new Uint8Array(bytes),
+    // MUST: 全量コピーしない — 数 GB 級ではコピー 1 回が一時 RAM を倍増させる。cache 層が
+    // 渡す bytes は tight な ArrayBuffer 背面なのでそのまま渡せる。部分ビュー・
+    // SharedArrayBuffer 背面（WebCrypto が拒否する）が来たときだけコピーで背面を保証する。
+    isTightView(bytes) ? bytes : new Uint8Array(bytes),
   );
   return Array.from(
     new Uint8Array(digest),
@@ -212,6 +234,10 @@ const fetchResolvedFile = (
     cacheName: opts.cacheName ?? DEFAULT_CACHE_NAME,
     validate: buildValidate(spec),
     decode: spec.decode,
+    // 既に持っているバイト数申告を受信バッファの確保ヒントとして流す（検証は validate 側）。
+    expectedBytes: spec.expectedBytes,
+    // マーカーは sha256 を宣言したファイルにだけ意味がある（印 = その sha256 の検証済み）。
+    verifiedMarker: opts.trustCachedSha256 === true ? spec.sha256 : undefined,
     onProgress: onProgress === undefined
       ? undefined
       : (progress) => onProgress({ ...progress, path: spec.path }),

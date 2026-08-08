@@ -6,6 +6,8 @@
  * （self-heal）。`decode` フックで「保存形 ≠ 利用形」（例: gzip のまま保存・解凍して返す）に
  * 対応する（throw は破損扱い＝validate と同じ縮退経路）。`caches` が無いランタイム
  * （Node.js 等）では素の fetch にフォールバックする＝キャッシュは正しさの要件ではなく最適化。
+ * `prefetchUrl` は body をそのまま cache へ流し込む streaming 版で、巨大アセットを
+ * ヒープに載せずに温めるためにある（検証は読み出し時 = `fetchBytes` に一本化）。
  *
  * MUST: 実行時依存ゼロ。fetch / caches / crypto.subtle など Web 標準 API のみを使う。
  *
@@ -62,6 +64,33 @@ export type FetchBytesOptions = {
    */
   decode?: DecodeBytes;
   /**
+   * 受信バイト数の事前申告（**確保ヒントのみ** — 検証には使わない）。分かっているときは
+   * 受信バッファを 1 本先に確保してチャンクを直接書き込むため、チャンク蓄積 → 連結で
+   * 一瞬 2N になるヒープのピークが 1N で済む（数 GB 級で実害）。省略時は content-length を
+   * ヒントに使う。申告が実受信とずれたら黙って蓄積経路へ落ちる（超過なら継ぎ足し、不足なら
+   * 実長へ詰め直す）— content-length を信頼しない現行方針（docs/limitations.md）と同じく、
+   * ヒントが外れても取得は落とさない。長さの検証がしたいなら `validate` で行う。
+   */
+  expectedBytes?: number;
+  /**
+   * 検証済みマーカー（**opt-in**。省略時は現行どおりヒット毎に `validate` が走る）。
+   *
+   * 指定すると network 取得物の `validate` 通過後、この文字列を印としてキャッシュエントリへ
+   * 焼き込み、以後のキャッシュヒットで印が一致したときだけ `validate` を丸ごと省く
+   * （典型は sha256 hex。数 GB のモデルで毎回の再ハッシュを避ける用途）。
+   *
+   * MUST: これは「ローカル格納を信頼する」選択である。印は「このエントリのバイト列は保存時に
+   * validate を通った」という自己申告に過ぎず、格納後の改竄・ビット腐敗は検出できない
+   * （マーカーごと書き換えられる）。信頼境界を移す判断なので既定は据え置き（DECIDED:
+   * docs/decisions/0005）。
+   * NOTE: 印は `validate` **全体**の通過を意味する（HF 層なら expectedBytes / sha256 /
+   *       カスタム validate の全部）。同じ URL に別の検証ロジックを当てるなら印も変えること。
+   * NOTE: 印が焼かれるのは「このオプション付きで network 取得した」エントリだけで、
+   *       既存エントリや `prefetchUrl` が書いたエントリ（未検証）には付かない。
+   *       single-flight の合流者も印を見ない（常に自分の validate を走らせる = 安全側）。
+   */
+  verifiedMarker?: string;
+  /**
    * ダウンロード進捗（チャンク毎）。キャッシュヒット時は呼ばれない。進捗は任意情報であり、
    * リスナーの throw は取得を落とさない（console.warn で通知して続行 — single-flight の
    * 合流フライトで 1 リスナーの事故が他の呼び出しを巻き添えにしないため。
@@ -112,12 +141,32 @@ const readTotal = (response: Response): number | undefined => {
 };
 
 /**
+ * 受信バッファの事前確保。サイズ申告は信頼しないので、不正値（非整数・負・巨大すぎて
+ * RangeError）は「ヒント無し」に落として蓄積経路へ委ねる（取得は落とさない）。
+ */
+const allocateHint = (size: number): Uint8Array<ArrayBuffer> | undefined => {
+  if (!Number.isSafeInteger(size) || size <= 0) return undefined;
+  try {
+    return new Uint8Array(size);
+  } catch {
+    return undefined;
+  }
+};
+
+/**
  * body を streaming で読み切り、チャンク毎に onProgress を発火する。
  * body が null のランタイム向けに arrayBuffer フォールバックを持つ（そのときは読み切り後に 1 回発火）。
+ *
+ * サイズが分かるとき（`expectedBytes` か content-length）は 1 本のバッファを先に確保して
+ * チャンクを直接書き込む。チャンク蓄積 → 連結だと連結の瞬間に N + N がヒープに載るため
+ * （数 GB 級で実害）、ピークを 1N に抑えるのが目的。申告が外れたら蓄積経路へ落ちるだけで、
+ * 申告そのものは検証に使わない（docs/limitations.md の「content-length と突合しない」を維持）。
+ * 戻り値は常に buffer 全体を占める tight view（呼び出し側の zero-copy 前提を壊さない）。
  */
 const readBody = async (
   response: Response,
   onProgress?: (progress: FetchProgress) => void,
+  expectedBytes?: number,
 ): Promise<Uint8Array<ArrayBuffer>> => {
   const total = readTotal(response);
   const body = response.body;
@@ -126,15 +175,31 @@ const readBody = async (
     onProgress?.({ loaded: bytes.length, total });
     return bytes;
   }
+  const hint = expectedBytes ?? total;
+  let buffer = hint === undefined ? undefined : allocateHint(hint);
   const chunks: Uint8Array[] = [];
   let loaded = 0;
   const reader = body.getReader();
   while (true) {
     const { done, value } = await reader.read();
     if (done) break;
-    chunks.push(value);
+    if (buffer !== undefined) {
+      if (loaded + value.length > buffer.length) {
+        // 申告超過（Content-Encoding 越しの content-length 等）。ここまでの内容を蓄積経路へ
+        // 引き継いで以降は従来どおり溜める。
+        chunks.push(buffer.subarray(0, loaded));
+        buffer = undefined;
+      } else {
+        buffer.set(value, loaded);
+      }
+    }
+    if (buffer === undefined) chunks.push(value);
     loaded += value.length;
     onProgress?.({ loaded, total });
+  }
+  // 申告不足（宣言 > 実受信）のときだけ実長へ詰め直す（tight view を保つ）。
+  if (buffer !== undefined) {
+    return loaded === buffer.length ? buffer : buffer.slice(0, loaded);
   }
   const bytes = new Uint8Array(loaded);
   let offset = 0;
@@ -146,15 +211,44 @@ const readBody = async (
 };
 
 /**
+ * 検証済みマーカーを載せるレスポンスヘッダ。Cache API はヘッダごと格納するので、印は
+ * エントリと同じ寿命を持つ（エントリが消えれば印も消える＝取り違えない）。
+ */
+const VERIFIED_HEADER = "x-fetch-cache-verified";
+
+/**
+ * 保存用 Response を組み立てる。bytes を直接 body にすると実装が全量コピーする
+ * （Deno 2.9.4 実測: 512MiB の `new Response(bytes)` で RSS が +512MiB）ため、1 チャンクの
+ * stream として渡してコピーを避ける（同 +4MiB）。受信バッファの事前確保（`expectedBytes`）と
+ * 合わせて network 経路のヒープを 1N に保つのが狙いで、格納内容は完全に同じ。
+ * `marker` があれば検証済みマーカーを焼く。
+ */
+const storableResponse = (bytes: Uint8Array, marker?: string): Response => {
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(bytes);
+      controller.close();
+    },
+  });
+  return marker === undefined
+    ? new Response(body)
+    : new Response(body, { headers: { [VERIFIED_HEADER]: marker } });
+};
+
+/**
  * validate（raw の完全性検証）→ decode（保存形 → 利用形）の共有経路。キャッシュヒット側と
  * network 側で必ずこの順・この意味論を共有する（経路毎に別実装すると契約が黙って乖離する）。
  * throw はどちら由来でも「破損」として呼び出し側の縮退経路に乗る。
+ *
+ * `verified` はキャッシュヒットでマーカーが一致したときだけ true になり、validate を省く
+ * （opt-in — `FetchBytesOptions.verifiedMarker`）。decode は利用形を作る変換なので常に走る。
  */
 const validateAndDecode = async (
   raw: Uint8Array,
   opts: FetchBytesOptions,
+  verified = false,
 ): Promise<Uint8Array> => {
-  await opts.validate?.(raw);
+  if (!verified) await opts.validate?.(raw);
   return opts.decode === undefined ? raw : await opts.decode(raw);
 };
 
@@ -224,11 +318,15 @@ const acquireAndDecode = async (
 
   if (cache !== undefined) {
     let cachedBytes: Uint8Array<ArrayBuffer> | undefined;
+    // 検証済みマーカーが一致したエントリだけ validate を省く（opt-in。既定は毎回検証）。
+    let verified = false;
     try {
       const cached = await cache.match(requestUrl);
-      cachedBytes = cached === undefined
-        ? undefined
-        : new Uint8Array(await cached.arrayBuffer());
+      if (cached !== undefined) {
+        verified = opts.verifiedMarker !== undefined &&
+          cached.headers.get(VERIFIED_HEADER) === opts.verifiedMarker;
+        cachedBytes = new Uint8Array(await cached.arrayBuffer());
+      }
     } catch (error) {
       // 読出し失敗は miss と同じ扱いで network へ縮退する。
       onCacheError({ op: "match", url: requestUrl, error });
@@ -237,7 +335,7 @@ const acquireAndDecode = async (
       try {
         return {
           raw: cachedBytes,
-          decoded: await validateAndDecode(cachedBytes, opts),
+          decoded: await validateAndDecode(cachedBytes, opts, verified),
         };
       } catch {
         // 破損キャッシュ（validate 拒否 or decode 不能）。真実源から取り直すため evict して
@@ -261,14 +359,17 @@ const acquireAndDecode = async (
       `fetch-cache: HTTP ${response.status} ${response.statusText} (${requestUrl})`,
     );
   }
-  const bytes = await readBody(response, emitProgress);
+  const bytes = await readBody(response, emitProgress, opts.expectedBytes);
   // validate / decode 成功後にのみ cache.put（不正物・decode 不能物をキャッシュに残さない）。
   // 失敗はそのまま throw。put するのは常に保存形 raw（decode 前）。
   const decoded = await validateAndDecode(bytes, opts);
   if (cache !== undefined) {
+    // Response の組み立ては try の外（不正な verifiedMarker は cache I/O 失敗ではなく
+    // 呼び出し側のバグなので、縮退で黙らせず fail loud に出す）。
+    const stored = storableResponse(bytes, opts.verifiedMarker);
     // put 失敗（quota 超過等）は成功したダウンロードを巻き添えにしない（縮退+通知）。
     try {
-      await cache.put(requestUrl, new Response(bytes));
+      await cache.put(requestUrl, stored);
     } catch (error) {
       onCacheError({ op: "put", url: requestUrl, error });
     }
@@ -298,6 +399,9 @@ const acquireAndDecode = async (
  *       フォールバックする（キャッシュは最適化であり正しさの要件ではない）。
  * NOTE: cache I/O の失敗（quota 超過等）もダウンロードを落とさず network 側へ縮退して続行し、
  *       `onCacheError`（既定 console.warn）で通知する（DECIDED: docs/decisions/0001）。
+ * NOTE: `expectedBytes`（受信バッファの確保ヒント）と `verifiedMarker`（検証済みマーカーで
+ *       ヒット時の validate を省く opt-in）は既定挙動を変えない追加オプション
+ *       （DECIDED: docs/decisions/0005）。
  */
 export const fetchBytes = async (
   url: string | URL,
@@ -364,6 +468,127 @@ export const fetchBytes = async (
   inflight.set(key, { promise, listeners, state });
   const { decoded } = await promise;
   return decoded;
+};
+
+export type PrefetchUrlOptions = {
+  /** Cache Storage の名前空間。既定 "fetch-cache"（fetchBytes と同じ）。 */
+  cacheName?: string;
+  /**
+   * ダウンロード進捗（チャンク毎）。既にキャッシュ済みで network に出ないときは呼ばれない。
+   * リスナーの throw は取得を落とさない（fetchBytes と同じ隔離）。
+   */
+  onProgress?: (progress: FetchProgress) => void;
+  /** fetch へそのまま渡す RequestInit（Authorization / AbortSignal など）。GET のみ。 */
+  init?: RequestInit;
+  /** fetch の差し替え（テスト・カスタム輸送用）。既定 globalThis.fetch。 */
+  fetch?: typeof globalThis.fetch;
+  /** CacheStorage の差し替え（テストの故障注入用）。既定 globalThis.caches。 */
+  caches?: CacheStorage;
+};
+
+/**
+ * URL の内容を**ヒープに全量を載せずに**キャッシュへ格納する（streaming prefetch）。
+ * network 応答の body をそのまま `cache.put` へ流すため、数 GB 級でも JS ヒープの使用は
+ * チャンク数個ぶんで済む。戻り値は「network から取得して格納した」なら true、
+ * 「既にエントリがあって何もしなかった」なら false。
+ *
+ * **検証しない**: prefetch はバイト列を手元に持たないので `validate` を走らせられない。
+ * 完全性の検証は読み出し側（`fetchBytes` の `validate` → 失敗なら evict → 取り直し）に
+ * 一本化する。したがって未検証バイトが一時的にキャッシュへ載る（TOCTOU）が、self-heal が
+ * あるので恒久化はしない（DECIDED: docs/decisions/0005）。壊れた物を置きたくない用途では
+ * `fetchBytes` を使うこと。
+ *
+ * **single-flight の対象外**: `fetchBytes` の合流（ADR 0004）は「leader の保存形 raw を
+ * 合流者へ渡す」契約だが、prefetch は raw を持たないため合流できない。同一 URL の並行
+ * prefetch はそれぞれ network に出る（put は内容同一の last-writer-wins で整合性は壊れない
+ * — `cache: false` と同じ割り切り）。
+ *
+ * **縮退しない（fail loud）**: `caches` が無い / open 失敗 / HTTP エラー / 転送中断 /
+ * put 失敗（quota 超過等）はすべて throw する。cache への格納がこの関数の唯一の仕事であり、
+ * 手元にバイトも残らないので「続行」に意味が無いため（`fetchBytes` の縮退契約
+ * ADR 0001 とはここが違う）。呼び出し側は throw を受けたら `fetchBytes` へフォールバック
+ * すればよい（そちらは全量をヒープに載せる代わりに cache 失敗でも結果を返す）。
+ * 転送が途中で切れた場合、`cache.put` 自体が reject してエントリは成立しない
+ * （中途半端なエントリは残らない）。
+ */
+export const prefetchUrl = async (
+  url: string | URL,
+  opts: PrefetchUrlOptions = {},
+): Promise<boolean> => {
+  const requestUrl = typeof url === "string" ? url : url.href;
+
+  // Cache API は GET しか格納できない。prefetch は「キャッシュへ入れる」ことが目的なので
+  // 非 GET に縮退の余地は無い（fetchBytes の cache:false に相当する逃げ道も持たない）。
+  const method = (opts.init?.method ?? "GET").toUpperCase();
+  if (method !== "GET") {
+    throw new Error(
+      `fetch-cache: prefetchUrl は GET 専用です（${method} は Cache API に格納できません） (${requestUrl})`,
+    );
+  }
+
+  const cacheStorage = opts.caches ?? globalCaches();
+  if (cacheStorage === undefined) {
+    throw new Error(
+      `fetch-cache: このランタイムには caches が無いため prefetch できません（fetchBytes を使ってください） (${requestUrl})`,
+    );
+  }
+  const cache = await cacheStorage.open(opts.cacheName ?? DEFAULT_CACHE_NAME);
+
+  // 既存エントリがあれば network に出ない（検証はしない — 読み出し側の self-heal に委ねる）。
+  // match が返す Response の body は消費しないので、接続/ファイルハンドルを解放しておく。
+  const existing = await cache.match(requestUrl);
+  if (existing !== undefined) {
+    await existing.body?.cancel().catch(() => {});
+    return false;
+  }
+
+  const fetchImpl = opts.fetch ?? globalThis.fetch;
+  const response = await fetchImpl(requestUrl, opts.init);
+  if (!response.ok) {
+    // 未消費 body は接続リソースを保持し続けるため解放してから throw する（fetchBytes と同じ）。
+    await response.body?.cancel().catch(() => {});
+    throw new Error(
+      `fetch-cache: HTTP ${response.status} ${response.statusText} (${requestUrl})`,
+    );
+  }
+
+  const total = readTotal(response);
+  const emit = opts.onProgress === undefined
+    ? undefined
+    : isolateProgress(opts.onProgress, requestUrl);
+  const body = response.body;
+  let stored: Response;
+  if (body === null) {
+    // body が null のランタイム向けフォールバック（この経路だけは全量が一度ヒープに載る）。
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    emit?.({ loaded: bytes.length, total });
+    stored = new Response(bytes);
+  } else {
+    // 素通しの TransformStream で進捗だけ数える（バッファはしない＝ヒープに溜めない）。
+    let loaded = 0;
+    const counted = body.pipeThrough(
+      new TransformStream<Uint8Array, Uint8Array>({
+        transform(chunk, controller) {
+          loaded += chunk.byteLength;
+          emit?.({ loaded, total });
+          controller.enqueue(chunk);
+        },
+      }),
+    );
+    stored = new Response(counted);
+  }
+
+  try {
+    await cache.put(requestUrl, stored);
+  } catch (error) {
+    // 転送中断も quota 超過もここに集まる（どちらも put の reject として現れる）。原因は
+    // cause に残し、「手元にバイトが無い＝縮退できない」ことを呼び出し側へ伝える。
+    throw new Error(
+      `fetch-cache: prefetch のキャッシュ書込みに失敗しました（バイト列は手元に残らないため fetchBytes へフォールバックしてください） (${requestUrl})`,
+      { cause: error },
+    );
+  }
+  return true;
 };
 
 /**
