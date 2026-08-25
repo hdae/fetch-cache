@@ -2,7 +2,6 @@ import {
   assertEquals,
   assertExists,
   assertRejects,
-  assertStrictEquals,
   assertStringIncludes,
 } from "@std/assert";
 import {
@@ -13,16 +12,35 @@ import {
   prefetchHfFile,
   resolveHfRevision,
 } from "./mod.ts";
-import { mockFetch, uniqueCacheName } from "../testing/mock_fetch.ts";
+import { mockFetch } from "../testing/mock_fetch.ts";
+
+// 名前空間は内部固定 1 個（cache 層と共通 — DECIDED: docs/decisions/0006 §3）。
+const CACHE_NAME = "fetch-cache";
 
 const SHA = "0123456789abcdef0123456789abcdef01234567";
+const MOVED = "89abcdef0123456789abcdef0123456789abcdef";
 const REPO = "owner/name";
 const BYTES = new Uint8Array([10, 20, 30, 40]);
+const BYTES_2 = new Uint8Array([50, 60]);
+const sha256HexOf = async (bytes: Uint8Array<ArrayBuffer>): Promise<string> =>
+  Array.from(
+    new Uint8Array(await crypto.subtle.digest("SHA-256", bytes)),
+    (byte) => byte.toString(16).padStart(2, "0"),
+  ).join("");
 // BYTES の SHA-256（テスト起動時に一度だけ計算。ネットワークには出ない）。
-const BYTES_SHA256 = Array.from(
-  new Uint8Array(await crypto.subtle.digest("SHA-256", BYTES)),
-  (byte) => byte.toString(16).padStart(2, "0"),
-).join("");
+const BYTES_SHA256 = await sha256HexOf(BYTES);
+const BYTES_2_SHA256 = await sha256HexOf(BYTES_2);
+
+/** cache 層の直列化形式（ゴールデン）。sha256 指定時の既定キーの実体を凍結する。 */
+const keyUrl = (...elements: (string | number | boolean)[]): string =>
+  "https://fetch-cache.invalid/v1/" +
+  elements.map((element) => encodeURIComponent(JSON.stringify(element))).join(
+    "/",
+  );
+
+/** sha256 指定時の既定キー ["hf", kind, repo, path, sha256] の直列化 URL。 */
+const contentKeyUrl = (path: string, sha256: string): string =>
+  keyUrl("hf", "model", REPO, path, sha256);
 
 Deno.test("hfResolveUrl: kind ごとのパス接頭辞と revision/path を組み立てる", () => {
   assertEquals(
@@ -148,33 +166,39 @@ Deno.test("resolveHfRevision: HTTP エラー時は body を cancel して接続�
 });
 
 Deno.test("fetchHfFile: 可変 ref は解決 1 回 → SHA 固定 URL で取得する", async () => {
-  const cacheName = uniqueCacheName();
   const { fetch, calls } = mockFetch((url) =>
     url.includes("/api/") ? Response.json({ sha: SHA }) : new Response(BYTES)
   );
   try {
-    const bytes = await fetchHfFile({ repo: REPO }, "a.bin", {
-      cacheName,
-      fetch,
-    });
+    const bytes = await fetchHfFile({ repo: REPO }, "a.bin", { fetch });
     assertEquals(bytes, BYTES);
     assertEquals(calls, [
       "https://huggingface.co/api/models/owner/name/revision/main",
       `https://huggingface.co/owner/name/resolve/${SHA}/a.bin`,
     ]);
   } finally {
-    await caches.delete(cacheName);
+    await caches.delete(CACHE_NAME);
+  }
+});
+
+Deno.test("fetchHfFile: sha256 無しの既定キーは SHA 固定 resolve URL（従来どおり）", async () => {
+  const url = `https://huggingface.co/owner/name/resolve/${SHA}/a.bin`;
+  const { fetch } = mockFetch(() => new Response(BYTES));
+  try {
+    await fetchHfFile({ repo: REPO, revision: SHA }, "a.bin", { fetch });
+    const cache = await caches.open(CACHE_NAME);
+    assertExists(await cache.match(url)); // 鮮度シグナルが無い以上 revision 入りキーに倒す。
+  } finally {
+    await caches.delete(CACHE_NAME);
   }
 });
 
 Deno.test("fetchHfFile: init は revision 解決とファイル取得の両方へ渡る", async () => {
-  const cacheName = uniqueCacheName();
   const { fetch, calls, inits } = mockFetch((url) =>
     url.includes("/api/") ? Response.json({ sha: SHA }) : new Response(BYTES)
   );
   try {
     await fetchHfFile({ repo: REPO }, "a.bin", {
-      cacheName,
       fetch,
       init: { headers: { authorization: "Bearer hf_token" } },
     });
@@ -186,12 +210,11 @@ Deno.test("fetchHfFile: init は revision 解決とファイル取得の両方�
       );
     }
   } finally {
-    await caches.delete(cacheName);
+    await caches.delete(CACHE_NAME);
   }
 });
 
 Deno.test("fetchHfFile: ファイル取得の 404 は fail-loud に伝播する", async () => {
-  const cacheName = uniqueCacheName();
   const { fetch } = mockFetch((url) =>
     url.includes("/api/")
       ? Response.json({ sha: SHA })
@@ -199,28 +222,133 @@ Deno.test("fetchHfFile: ファイル取得の 404 は fail-loud に伝播する"
   );
   try {
     const error = await assertRejects(
-      () => fetchHfFile({ repo: REPO }, "missing.bin", { cacheName, fetch }),
+      () => fetchHfFile({ repo: REPO }, "missing.bin", { fetch }),
       Error,
     );
     assertStringIncludes(error.message, "HTTP 404");
   } finally {
-    await caches.delete(cacheName);
+    await caches.delete(CACHE_NAME);
   }
 });
 
-Deno.test("fetchHfFile: 破損キャッシュは sha256 validate で evict され再取得される（self-heal）", async () => {
-  const cacheName = uniqueCacheName();
-  const url = `https://huggingface.co/owner/name/resolve/${SHA}/model.onnx`;
+Deno.test("fetchHfFile: sha256 一致で取得され、既定キーは内容キー（revision 非依存）になる", async () => {
   const { fetch, calls } = mockFetch(() => new Response(BYTES));
   try {
-    // 壊れたバイト列を SHA 固定 URL のキーへ直接仕込む（fault injection）。
-    const cache = await caches.open(cacheName);
-    await cache.put(url, new Response(new Uint8Array([9, 9])));
+    const bytes = await fetchHfFile(
+      { repo: REPO, revision: SHA },
+      { path: "model.onnx", sha256: BYTES_SHA256 },
+      { fetch },
+    );
+    assertEquals(bytes, BYTES);
+    assertEquals(calls, [
+      `https://huggingface.co/owner/name/resolve/${SHA}/model.onnx`,
+    ]);
+
+    // 格納は内容キー ["hf", kind, repo, path, sha256] 側（resolve URL 側ではない）。
+    const cache = await caches.open(CACHE_NAME);
+    assertExists(await cache.match(contentKeyUrl("model.onnx", BYTES_SHA256)));
+    assertEquals(
+      await cache.match(
+        `https://huggingface.co/owner/name/resolve/${SHA}/model.onnx`,
+      ),
+      undefined,
+    );
+
+    // 2回目はキャッシュヒット（SHA 固定 URL なので解決リクエストも出ない）。
+    await fetchHfFile(
+      { repo: REPO, revision: SHA },
+      { path: "model.onnx", sha256: BYTES_SHA256 },
+      { fetch },
+    );
+    assertEquals(calls.length, 1);
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
+Deno.test("fetchHfFile: revision が動いてもバイト不変なら内容キーでヒットする（再ダウンロードしない）", async () => {
+  // README 更新だけで revision が動くケース: sha256 が同じ = 同じ内容キー = ヒット。
+  const { fetch, calls } = mockFetch(() => new Response(BYTES));
+  const spec = { path: "model.onnx", sha256: BYTES_SHA256 };
+  try {
+    await fetchHfFile({ repo: REPO, revision: SHA }, spec, { fetch });
+    assertEquals(calls.length, 1);
+
+    const again = await fetchHfFile({ repo: REPO, revision: MOVED }, spec, {
+      fetch,
+    });
+    assertEquals(again, BYTES);
+    assertEquals(calls.length, 1); // 別 revision の URL でも network に出ない。
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
+Deno.test("fetchHfFile: revision 切り替えで内容が違えば別エントリとして共存する（ピンポンしない）", async () => {
+  const urlOf = (revision: string) =>
+    `https://huggingface.co/owner/name/resolve/${revision}/model.onnx`;
+  const { fetch, calls } = mockFetch((url) =>
+    new Response(url === urlOf(SHA) ? BYTES : BYTES_2)
+  );
+  try {
+    const specA = { path: "model.onnx", sha256: BYTES_SHA256 };
+    const specB = { path: "model.onnx", sha256: BYTES_2_SHA256 };
+    await fetchHfFile({ repo: REPO, revision: SHA }, specA, { fetch });
+    await fetchHfFile({ repo: REPO, revision: MOVED }, specB, { fetch });
+    assertEquals(calls.length, 2); // 内容が違うので取得は 2 回。
+
+    // 行き来してもヒットのまま（内容毎にエントリが共存 = 既定キーに sha256 が入るため）。
+    assertEquals(
+      await fetchHfFile({ repo: REPO, revision: SHA }, specA, { fetch }),
+      BYTES,
+    );
+    assertEquals(
+      await fetchHfFile({ repo: REPO, revision: MOVED }, specB, { fetch }),
+      BYTES_2,
+    );
+    assertEquals(calls.length, 2);
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
+Deno.test("fetchHfFile: spec.key で既定キーを上書きできる", async () => {
+  const { fetch } = mockFetch(() => new Response(BYTES));
+  try {
+    await fetchHfFile(
+      { repo: REPO, revision: SHA },
+      {
+        path: "model.onnx",
+        sha256: BYTES_SHA256,
+        key: ["my-app", "model.onnx"], // 安定キー（有界ストレージと引き換えのピンポンは cache 層で凍結済み）。
+      },
+      { fetch },
+    );
+    const cache = await caches.open(CACHE_NAME);
+    assertExists(await cache.match(keyUrl("my-app", "model.onnx")));
+    assertEquals(
+      await cache.match(contentKeyUrl("model.onnx", BYTES_SHA256)),
+      undefined,
+    );
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
+Deno.test("fetchHfFile: 破損キャッシュは sha256 で検知され再取得される（self-heal）", async () => {
+  const { fetch, calls } = mockFetch(() => new Response(BYTES));
+  try {
+    // 壊れたバイト列を内容キーへ直接仕込む（fault injection。記録ヘッダ無し = 実ハッシュ突合）。
+    const cache = await caches.open(CACHE_NAME);
+    await cache.put(
+      contentKeyUrl("model.onnx", BYTES_SHA256),
+      new Response(new Uint8Array([9, 9])),
+    );
 
     const bytes = await fetchHfFile(
       { repo: REPO, revision: SHA },
       { path: "model.onnx", sha256: BYTES_SHA256 },
-      { cacheName, fetch },
+      { fetch },
     );
     assertEquals(bytes, BYTES);
     assertEquals(calls.length, 1); // evict → network 1 回。
@@ -229,42 +357,15 @@ Deno.test("fetchHfFile: 破損キャッシュは sha256 validate で evict さ�
     await fetchHfFile(
       { repo: REPO, revision: SHA },
       { path: "model.onnx", sha256: BYTES_SHA256 },
-      { cacheName, fetch },
+      { fetch },
     );
     assertEquals(calls.length, 1);
   } finally {
-    await caches.delete(cacheName);
-  }
-});
-
-Deno.test("fetchHfFile: sha256 一致で取得・キャッシュされる", async () => {
-  const cacheName = uniqueCacheName();
-  const { fetch, calls } = mockFetch(() => new Response(BYTES));
-  try {
-    const bytes = await fetchHfFile(
-      { repo: REPO, revision: SHA },
-      { path: "model.onnx", sha256: BYTES_SHA256 },
-      { cacheName, fetch },
-    );
-    assertEquals(bytes, BYTES);
-    assertEquals(calls, [
-      `https://huggingface.co/owner/name/resolve/${SHA}/model.onnx`,
-    ]);
-
-    // 2回目はキャッシュヒット（SHA 固定 URL なので解決リクエストも出ない）。
-    await fetchHfFile(
-      { repo: REPO, revision: SHA },
-      { path: "model.onnx", sha256: BYTES_SHA256 },
-      { cacheName, fetch },
-    );
-    assertEquals(calls.length, 1);
-  } finally {
-    await caches.delete(cacheName);
+    await caches.delete(CACHE_NAME);
   }
 });
 
 Deno.test("fetchHfFile: sha256 不一致は throw し、キャッシュしない", async () => {
-  const cacheName = uniqueCacheName();
   const { fetch } = mockFetch(() => new Response(BYTES));
   const wrongSha = "0".repeat(64);
   try {
@@ -273,26 +374,23 @@ Deno.test("fetchHfFile: sha256 不一致は throw し、キャッシュしない
         fetchHfFile(
           { repo: REPO, revision: SHA },
           { path: "model.onnx", sha256: wrongSha },
-          { cacheName, fetch },
+          { fetch },
         ),
       Error,
     );
     assertStringIncludes(error.message, "SHA-256 不一致");
 
-    const cache = await caches.open(cacheName);
+    const cache = await caches.open(CACHE_NAME);
     assertEquals(
-      await cache.match(
-        `https://huggingface.co/owner/name/resolve/${SHA}/model.onnx`,
-      ),
+      await cache.match(contentKeyUrl("model.onnx", wrongSha)),
       undefined,
     );
   } finally {
-    await caches.delete(cacheName);
+    await caches.delete(CACHE_NAME);
   }
 });
 
 Deno.test("fetchHfFile: expectedBytes 不一致は throw する", async () => {
-  const cacheName = uniqueCacheName();
   const { fetch } = mockFetch(() => new Response(BYTES));
   try {
     const error = await assertRejects(
@@ -300,18 +398,17 @@ Deno.test("fetchHfFile: expectedBytes 不一致は throw する", async () => {
         fetchHfFile(
           { repo: REPO, revision: SHA },
           { path: "model.onnx", expectedBytes: BYTES.length + 1 },
-          { cacheName, fetch },
+          { fetch },
         ),
       Error,
     );
     assertStringIncludes(error.message, "バイト数不一致");
   } finally {
-    await caches.delete(cacheName);
+    await caches.delete(CACHE_NAME);
   }
 });
 
 Deno.test("fetchHfFiles: revision API は 1 回だけ・並列結果が名前にマップされる", async () => {
-  const cacheName = uniqueCacheName();
   const bytesA = new Uint8Array([1, 1, 1]);
   const bytesB = new Uint8Array([2, 2]);
   const { fetch, calls } = mockFetch((url) => {
@@ -326,7 +423,7 @@ Deno.test("fetchHfFiles: revision API は 1 回だけ・並列結果が名前に
     const files = await fetchHfFiles(
       { repo: REPO }, // revision 省略 = "main"（可変 ref → 解決が走る）。
       { a: "a.bin", b: { path: "sub/b.bin", expectedBytes: 2 } },
-      { cacheName, fetch },
+      { fetch },
     );
     assertEquals(files.a, bytesA);
     assertEquals(files.b, bytesB);
@@ -339,18 +436,17 @@ Deno.test("fetchHfFiles: revision API は 1 回だけ・並列結果が名前に
       2, // 取得は解決済み SHA 固定 URL で行われる。
     );
   } finally {
-    await caches.delete(cacheName);
+    await caches.delete(CACHE_NAME);
   }
 });
 
 Deno.test("fetchHfFiles: 1 ファイルの失敗で全体が reject し、成功分のキャッシュは残る", async () => {
-  const cacheName = uniqueCacheName();
   const bytesA = new Uint8Array([1, 1, 1]);
   const urlA = `https://huggingface.co/owner/name/resolve/${SHA}/a.bin`;
   // b の 404 は「a がキャッシュ済み」になるまで遅延させ、全体 reject 時点の
   // キャッシュ状態を決定的にする（Promise.all は成功分の put を取り消さない）。
   const awaitACached = async (): Promise<void> => {
-    const cache = await caches.open(cacheName);
+    const cache = await caches.open(CACHE_NAME);
     while ((await cache.match(urlA)) === undefined) {
       await new Promise((resolve) => setTimeout(resolve, 1));
     }
@@ -367,7 +463,7 @@ Deno.test("fetchHfFiles: 1 ファイルの失敗で全体が reject し、成功
         fetchHfFiles(
           { repo: REPO },
           { a: "a.bin", b: "missing.bin" },
-          { cacheName, fetch },
+          { fetch },
         ),
       Error,
     );
@@ -376,19 +472,16 @@ Deno.test("fetchHfFiles: 1 ファイルの失敗で全体が reject し、成功
     // 成功済み a のキャッシュ副作用は取り消されない＝リトライは即ヒット（README 記載の仕様）。
     const callsBefore = calls.length;
     const again = await fetchHfFile({ repo: REPO, revision: SHA }, "a.bin", {
-      cacheName,
       fetch,
     });
     assertEquals(again, bytesA);
     assertEquals(calls.length, callsBefore); // network 0 回。
   } finally {
-    await caches.delete(cacheName);
+    await caches.delete(CACHE_NAME);
   }
 });
 
 Deno.test("fetchHfFile: decode は利用形を返し、cache は保存形 raw のまま（sha256 は raw に照合）", async () => {
-  const cacheName = uniqueCacheName();
-  const url = `https://huggingface.co/owner/name/resolve/${SHA}/dict.gz`;
   const { fetch, calls } = mockFetch(() => new Response(BYTES));
   const spec = {
     path: "dict.gz",
@@ -397,31 +490,30 @@ Deno.test("fetchHfFile: decode は利用形を返し、cache は保存形 raw �
   };
   try {
     const first = await fetchHfFile({ repo: REPO, revision: SHA }, spec, {
-      cacheName,
       fetch,
     });
     assertEquals(first, new Uint8Array([4])); // 戻り値は decode 適用後の利用形。
 
-    // cache に入るのは sha256 の照合対象と同じ保存形 raw。
-    const cache = await caches.open(cacheName);
-    const cachedResponse = await cache.match(url);
+    // cache に入るのは sha256 の照合対象と同じ保存形 raw（内容キー側）。
+    const cache = await caches.open(CACHE_NAME);
+    const cachedResponse = await cache.match(
+      contentKeyUrl("dict.gz", BYTES_SHA256),
+    );
     assertExists(cachedResponse);
     assertEquals(new Uint8Array(await cachedResponse.arrayBuffer()), BYTES);
 
     // ヒット側も sha256（raw）→ decode の同じ経路で network 0 回。
     const second = await fetchHfFile({ repo: REPO, revision: SHA }, spec, {
-      cacheName,
       fetch,
     });
     assertEquals(second, new Uint8Array([4]));
     assertEquals(calls.length, 1);
   } finally {
-    await caches.delete(cacheName);
+    await caches.delete(CACHE_NAME);
   }
 });
 
 Deno.test("fetchHfFile: カスタム validate は保存形 raw を受け、throw は不正扱いでキャッシュしない", async () => {
-  const cacheName = uniqueCacheName();
   const { fetch } = mockFetch(() => new Response(BYTES));
   const seen: Uint8Array[] = [];
   try {
@@ -434,7 +526,7 @@ Deno.test("fetchHfFile: カスタム validate は保存形 raw を受け、throw
         },
         decode: (raw) => new Uint8Array([raw.length]),
       },
-      { cacheName, fetch },
+      { fetch },
     );
     assertEquals(bytes, new Uint8Array([4]));
     assertEquals(seen, [BYTES]); // decode 前の raw を受ける。
@@ -449,12 +541,12 @@ Deno.test("fetchHfFile: カスタム validate は保存形 raw を受け、throw
               throw new Error("magic 不一致");
             },
           },
-          { cacheName, fetch },
+          { fetch },
         ),
       Error,
       "magic 不一致",
     );
-    const cache = await caches.open(cacheName);
+    const cache = await caches.open(CACHE_NAME);
     assertEquals(
       await cache.match(
         `https://huggingface.co/owner/name/resolve/${SHA}/b.bin`,
@@ -462,12 +554,11 @@ Deno.test("fetchHfFile: カスタム validate は保存形 raw を受け、throw
       undefined, // 不正物は保存されない（cache 層の契約が HF 層でも生きる）。
     );
   } finally {
-    await caches.delete(cacheName);
+    await caches.delete(CACHE_NAME);
   }
 });
 
 Deno.test("fetchHfFile: built-in 検証（expectedBytes）が落ちたらカスタム validate は走らない", async () => {
-  const cacheName = uniqueCacheName();
   const { fetch } = mockFetch(() => new Response(BYTES));
   let customCalled = false;
   try {
@@ -482,19 +573,18 @@ Deno.test("fetchHfFile: built-in 検証（expectedBytes）が落ちたらカス�
               customCalled = true;
             },
           },
-          { cacheName, fetch },
+          { fetch },
         ),
       Error,
     );
     assertStringIncludes(error.message, "バイト数不一致");
     assertEquals(customCalled, false); // 安価な built-in が先に落ちる（合成順の凍結）。
   } finally {
-    await caches.delete(cacheName);
+    await caches.delete(CACHE_NAME);
   }
 });
 
 Deno.test("fetchHfFiles: decode はファイル毎に独立して適用される", async () => {
-  const cacheName = uniqueCacheName();
   const dictBytes = new Uint8Array([5, 5, 5]);
   const metaBytes = new Uint8Array([7, 7]);
   const { fetch } = mockFetch((url) => {
@@ -513,17 +603,16 @@ Deno.test("fetchHfFiles: decode はファイル毎に独立して適用される
         },
         meta: "meta.json",
       },
-      { cacheName, fetch },
+      { fetch },
     );
     assertEquals(files.dict, new Uint8Array([3])); // decode 指定ファイルだけ利用形。
     assertEquals(files.meta, metaBytes); // 指定なしは raw のまま（従来互換）。
   } finally {
-    await caches.delete(cacheName);
+    await caches.delete(CACHE_NAME);
   }
 });
 
 Deno.test("fetchHfFiles: onProgress に path が付く", async () => {
-  const cacheName = uniqueCacheName();
   const { fetch } = mockFetch((url) =>
     url.includes("/api/") ? Response.json({ sha: SHA }) : new Response(BYTES)
   );
@@ -533,22 +622,21 @@ Deno.test("fetchHfFiles: onProgress に path が付く", async () => {
       { repo: REPO },
       { a: "a.bin", b: "b.bin" },
       {
-        cacheName,
         fetch,
         onProgress: (progress) => paths.add(progress.path),
       },
     );
     assertEquals(paths, new Set(["a.bin", "b.bin"]));
   } finally {
-    await caches.delete(cacheName);
+    await caches.delete(CACHE_NAME);
   }
 });
 
-// --- sha256 検証のコピー回避 / 検証済みマーカー ---
+// --- 記録ハッシュ（既定 = ローカル格納を信頼）と recheck ---
 
 /**
- * `crypto.subtle.digest` を差し替えて「何が渡ったか」を観測する。数 GB 級では digest 前の
- * 全量コピー 1 回が一時 RAM を倍増させるため、コピーの有無は仕様として凍結する価値がある。
+ * `crypto.subtle.digest` を差し替えて「何回・何が渡ったか」を観測する。既定 trust の
+ * 「ヒットでは再ハッシュしない」は外形からは見えないため、ここで凍結する。
  */
 const spyDigest = (): {
   args: unknown[];
@@ -570,7 +658,6 @@ const spyDigest = (): {
 };
 
 Deno.test("sha256 検証: digest には validate が受け取った view がそのまま渡る（コピーしない）", async () => {
-  const cacheName = uniqueCacheName();
   const { fetch } = mockFetch(() => new Response(BYTES));
   const seenByValidate: Uint8Array[] = [];
   const digest = spyDigest();
@@ -585,65 +672,66 @@ Deno.test("sha256 検証: digest には validate が受け取った view がそ�
           seenByValidate.push(bytes);
         },
       },
-      { cacheName, fetch },
+      { fetch },
     );
     assertEquals(digest.args.length, 1);
     // コピーしていれば別インスタンスになる（tight view はそのまま渡すのが仕様）。
-    assertStrictEquals<unknown>(digest.args[0], seenByValidate[0]);
+    assertEquals(digest.args[0] === seenByValidate[0], true);
   } finally {
     digest.restore();
-    await caches.delete(cacheName);
+    await caches.delete(CACHE_NAME);
   }
 });
 
-Deno.test("trustCachedSha256: 印が一致するヒットでは再ハッシュしない（opt-in）", async () => {
-  const cacheName = uniqueCacheName();
+Deno.test("既定: 記録一致のヒットでは再ハッシュしない（ハッシュは保存時の 1 回だけ）", async () => {
   const { fetch, calls } = mockFetch(() => new Response(BYTES));
   const spec = { path: "model.onnx", sha256: BYTES_SHA256 };
   const digest = spyDigest();
   try {
-    await fetchHfFile({ repo: REPO, revision: SHA }, spec, {
-      cacheName,
-      fetch,
-      trustCachedSha256: true,
-    });
-    await fetchHfFile({ repo: REPO, revision: SHA }, spec, {
-      cacheName,
-      fetch,
-      trustCachedSha256: true,
-    });
+    await fetchHfFile({ repo: REPO, revision: SHA }, spec, { fetch });
+    await fetchHfFile({ repo: REPO, revision: SHA }, spec, { fetch });
     assertEquals(calls.length, 1); // 2 回目はキャッシュヒット。
-    assertEquals(digest.args.length, 1); // ハッシュは保存時の 1 回だけ。
+    assertEquals(digest.args.length, 1); // ローカル格納を信頼（DECIDED: docs/decisions/0006 §2）。
   } finally {
     digest.restore();
-    await caches.delete(cacheName);
+    await caches.delete(CACHE_NAME);
   }
 });
 
-Deno.test("trustCachedSha256: 既定（未指定）はヒット毎に再ハッシュする", async () => {
-  const cacheName = uniqueCacheName();
+Deno.test("recheck: true ならヒット時に実バイトを再ハッシュして突合する（opt-out）", async () => {
   const { fetch, calls } = mockFetch(() => new Response(BYTES));
   const spec = { path: "model.onnx", sha256: BYTES_SHA256 };
   const digest = spyDigest();
   try {
+    await fetchHfFile({ repo: REPO, revision: SHA }, spec, { fetch });
     await fetchHfFile({ repo: REPO, revision: SHA }, spec, {
-      cacheName,
       fetch,
-    });
-    await fetchHfFile({ repo: REPO, revision: SHA }, spec, {
-      cacheName,
-      fetch,
+      recheck: true,
     });
     assertEquals(calls.length, 1);
-    assertEquals(digest.args.length, 2); // 現行挙動（毎回検証）を維持。
+    assertEquals(digest.args.length, 2); // 保存時 1 + recheck ヒット 1。
   } finally {
     digest.restore();
-    await caches.delete(cacheName);
+    await caches.delete(CACHE_NAME);
+  }
+});
+
+Deno.test("recheck: sha256 の無いファイルには影響しない（単独指定 throw を HF 層が回避する）", async () => {
+  const { fetch } = mockFetch(() => new Response(BYTES));
+  try {
+    // cache 層は recheck 単独指定を throw で弾くが、HF 層は sha256 の無い spec には
+    // recheck を渡さないので普通に取得できる。
+    const bytes = await fetchHfFile({ repo: REPO, revision: SHA }, "a.bin", {
+      fetch,
+      recheck: true,
+    });
+    assertEquals(bytes, BYTES);
+  } finally {
+    await caches.delete(CACHE_NAME);
   }
 });
 
 Deno.test("HfFileSpec.expectedBytes は受信バッファの確保ヒントとして cache 層へ流れる", async () => {
-  const cacheName = uniqueCacheName();
   // 同一インスタンスを 2 回 enqueue し、間で書き換える。事前確保経路なら読み取り時に
   // 即コピーされるので内容が保たれる（cache 層のテストと同じ観測手法）。
   let controller!: ReadableStreamDefaultController<Uint8Array<ArrayBuffer>>;
@@ -659,7 +747,7 @@ Deno.test("HfFileSpec.expectedBytes は受信バッファの確保ヒントと�
     const promise = fetchHfFile(
       { repo: REPO, revision: SHA },
       { path: "model.onnx", expectedBytes: 6 },
-      { cacheName, fetch, onProgress: () => firstChunk.resolve() },
+      { fetch, onProgress: () => firstChunk.resolve() },
     );
     controller.enqueue(reused);
     await firstChunk.promise;
@@ -668,14 +756,13 @@ Deno.test("HfFileSpec.expectedBytes は受信バッファの確保ヒントと�
     controller.close();
     assertEquals(await promise, new Uint8Array([1, 2, 3, 4, 5, 6]));
   } finally {
-    await caches.delete(cacheName);
+    await caches.delete(CACHE_NAME);
   }
 });
 
 // --- prefetchHfFile（streaming prefetch + 通過中 sha256 検証） ---
 
 Deno.test("prefetchHfFile: 可変 ref を解決 1 回 → SHA 固定 URL で温め、以後の取得はヒットする", async () => {
-  const cacheName = uniqueCacheName();
   const { fetch, calls } = mockFetch((url) =>
     url.includes("/api/")
       ? new Response(JSON.stringify({ sha: SHA }))
@@ -683,7 +770,7 @@ Deno.test("prefetchHfFile: 可変 ref を解決 1 回 → SHA 固定 URL で温�
   );
   try {
     assertEquals(
-      await prefetchHfFile({ repo: REPO }, "model.onnx", { cacheName, fetch }),
+      await prefetchHfFile({ repo: REPO }, "model.onnx", { fetch }),
       {
         fetched: true,
         revision: SHA,
@@ -697,21 +784,16 @@ Deno.test("prefetchHfFile: 可変 ref を解決 1 回 → SHA 固定 URL で温�
 
     // 温めたエントリは SHA 固定 URL のヒットになる（revision 解決の 1 回だけ増える）。
     assertEquals(
-      await fetchHfFile({ repo: REPO, revision: SHA }, "model.onnx", {
-        cacheName,
-        fetch,
-      }),
+      await fetchHfFile({ repo: REPO, revision: SHA }, "model.onnx", { fetch }),
       BYTES,
     );
     assertEquals(calls.length, 2);
   } finally {
-    await caches.delete(cacheName);
+    await caches.delete(CACHE_NAME);
   }
 });
 
 Deno.test("prefetchHfFile: 戻り値の revision / url が温めたエントリを指し、渡し回せば upstream が動いてもヒットする", async () => {
-  const cacheName = uniqueCacheName();
-  const MOVED = "89abcdef0123456789abcdef0123456789abcdef";
   // 温めた後に upstream が動くリポジトリ（可変 ref のまま読むと別 SHA を引く状況）。
   let head = SHA;
   const { fetch, calls } = mockFetch((url) =>
@@ -721,13 +803,12 @@ Deno.test("prefetchHfFile: 戻り値の revision / url が温めたエントリ�
   );
   try {
     const result = await prefetchHfFile({ repo: REPO }, "model.onnx", {
-      cacheName,
       fetch,
     });
     // 可変 ref を渡しても、どの SHA を温めたかが戻り値で分かる。
     assertEquals(result.revision, SHA);
-    // url は温めたエントリのキャッシュキーそのもの。
-    const cache = await caches.open(cacheName);
+    // sha256 無しでは url が温めたエントリのキャッシュキーそのもの。
+    const cache = await caches.open(CACHE_NAME);
     assertExists(await cache.match(result.url));
 
     head = MOVED;
@@ -737,31 +818,28 @@ Deno.test("prefetchHfFile: 戻り値の revision / url が温めたエントリ�
       await fetchHfFile(
         { repo: REPO, revision: result.revision },
         "model.onnx",
-        { cacheName, fetch },
+        { fetch },
       ),
       BYTES,
     );
     assertEquals(calls.length, warmed);
 
-    // 対比: 可変 ref のまま読むと動いた先の SHA を引き、温めたエントリは丸ごとミスする。
-    await fetchHfFile({ repo: REPO }, "model.onnx", { cacheName, fetch });
+    // 対比: 可変 ref のまま読むと動いた先の SHA を引き、温めたエントリは丸ごとミスする
+    // （sha256 が無い = revision 入りキーの宿命。内容キーにしたければ sha256 を渡す）。
+    await fetchHfFile({ repo: REPO }, "model.onnx", { fetch });
     assertEquals(calls.length, warmed + 2); // revision 解決 + ファイル取得。
   } finally {
-    await caches.delete(cacheName);
+    await caches.delete(CACHE_NAME);
   }
 });
 
-Deno.test("prefetchHfFile: spec.sha256 は通過中検証へ流れ、trustCachedSha256 のヒットは無ハッシュになる", async () => {
-  const cacheName = uniqueCacheName();
+Deno.test("prefetchHfFile: spec.sha256 で内容キーに温まり、読み出しと無ハッシュで噛み合う", async () => {
   const { fetch, calls } = mockFetch(() => new Response(BYTES));
   const spec = { path: "model.onnx", sha256: BYTES_SHA256 };
   const digest = spyDigest();
   try {
     assertEquals(
-      await prefetchHfFile({ repo: REPO, revision: SHA }, spec, {
-        cacheName,
-        fetch,
-      }),
+      await prefetchHfFile({ repo: REPO, revision: SHA }, spec, { fetch }),
       {
         fetched: true,
         revision: SHA,
@@ -770,46 +848,30 @@ Deno.test("prefetchHfFile: spec.sha256 は通過中検証へ流れ、trustCached
     );
     // prefetch 側は純 TS の逐次ハッシュ（native の一括 digest は使わない）。
     assertEquals(digest.args.length, 0);
+    // 格納は fetchHfFile と同じ既定キー式 = 内容キー側（噛み合わせが構造的に保証される）。
+    const cache = await caches.open(CACHE_NAME);
+    assertExists(await cache.match(contentKeyUrl("model.onnx", BYTES_SHA256)));
 
     assertEquals(
-      await fetchHfFile({ repo: REPO, revision: SHA }, spec, {
-        cacheName,
-        fetch,
-        trustCachedSha256: true,
-      }),
+      await fetchHfFile({ repo: REPO, revision: SHA }, spec, { fetch }),
       BYTES,
     );
     assertEquals(calls.length, 1); // ヒット。
-    assertEquals(digest.args.length, 0); // 印が一致 = 再ハッシュしない（一気通貫）。
-  } finally {
-    digest.restore();
-    await caches.delete(cacheName);
-  }
-});
+    assertEquals(digest.args.length, 0); // 記録一致 = 再ハッシュしない（温める→読むの全経路で 0 回）。
 
-Deno.test("prefetchHfFile: 印を信じない既定の読み出しは従来どおり検証する", async () => {
-  const cacheName = uniqueCacheName();
-  const { fetch } = mockFetch(() => new Response(BYTES));
-  const spec = { path: "model.onnx", sha256: BYTES_SHA256 };
-  const digest = spyDigest();
-  try {
-    await prefetchHfFile({ repo: REPO, revision: SHA }, spec, {
-      cacheName,
-      fetch,
-    });
-    await fetchHfFile({ repo: REPO, revision: SHA }, spec, {
-      cacheName,
-      fetch,
-    });
-    assertEquals(digest.args.length, 1); // opt-in しなければヒット毎に検証（既定不変）。
+    // revision が動いても内容キーなのでヒットのまま。
+    assertEquals(
+      await fetchHfFile({ repo: REPO, revision: MOVED }, spec, { fetch }),
+      BYTES,
+    );
+    assertEquals(calls.length, 1);
   } finally {
     digest.restore();
-    await caches.delete(cacheName);
+    await caches.delete(CACHE_NAME);
   }
 });
 
 Deno.test("prefetchHfFile: sha256 不一致は throw し、エントリを残さない", async () => {
-  const cacheName = uniqueCacheName();
   const wrong = "a".repeat(64);
   const { fetch } = mockFetch(() => new Response(BYTES));
   try {
@@ -818,37 +880,30 @@ Deno.test("prefetchHfFile: sha256 不一致は throw し、エントリを残さ
         prefetchHfFile(
           { repo: REPO, revision: SHA },
           { path: "model.onnx", sha256: wrong },
-          { cacheName, fetch },
+          { fetch },
         ),
       Error,
     );
     assertStringIncludes(error.message, "SHA-256 不一致");
     assertStringIncludes(error.message, BYTES_SHA256);
 
-    const cache = await caches.open(cacheName);
+    const cache = await caches.open(CACHE_NAME);
     assertEquals(
-      await cache.match(
-        `https://huggingface.co/${REPO}/resolve/${SHA}/model.onnx`,
-      ),
+      await cache.match(contentKeyUrl("model.onnx", wrong)),
       undefined,
     );
   } finally {
-    await caches.delete(cacheName);
+    await caches.delete(CACHE_NAME);
   }
 });
 
 Deno.test("prefetchHfFile: 既にエントリがあれば network に出ず false を返す", async () => {
-  const cacheName = uniqueCacheName();
   const { fetch, calls } = mockFetch(() => new Response(BYTES));
   try {
-    await fetchHfFile({ repo: REPO, revision: SHA }, "model.onnx", {
-      cacheName,
-      fetch,
-    });
+    await fetchHfFile({ repo: REPO, revision: SHA }, "model.onnx", { fetch });
     assertEquals(calls.length, 1);
     assertEquals(
       await prefetchHfFile({ repo: REPO, revision: SHA }, "model.onnx", {
-        cacheName,
         fetch,
       }),
       {
@@ -859,7 +914,29 @@ Deno.test("prefetchHfFile: 既にエントリがあれば network に出ず fals
     );
     assertEquals(calls.length, 1);
   } finally {
-    await caches.delete(cacheName);
+    await caches.delete(CACHE_NAME);
+  }
+});
+
+Deno.test("prefetchHfFile: spec.key で温め先を上書きできる（読み出しも同じ key で噛み合う）", async () => {
+  const { fetch, calls } = mockFetch(() => new Response(BYTES));
+  const spec = {
+    path: "model.onnx",
+    sha256: BYTES_SHA256,
+    key: ["my-app", "model"],
+  };
+  try {
+    await prefetchHfFile({ repo: REPO, revision: SHA }, spec, { fetch });
+    const cache = await caches.open(CACHE_NAME);
+    assertExists(await cache.match(keyUrl("my-app", "model")));
+
+    assertEquals(
+      await fetchHfFile({ repo: REPO, revision: SHA }, spec, { fetch }),
+      BYTES,
+    );
+    assertEquals(calls.length, 1); // 同じ key なのでヒット。
+  } finally {
+    await caches.delete(CACHE_NAME);
   }
 });
 
@@ -871,9 +948,9 @@ Deno.test("fetchHfFile: 形式不正の sha256 は network に出る前に fail 
     () =>
       fetchHfFile(
         { repo: REPO, revision: SHA },
-        // 大文字 hex は sha256Hex の出力（常に小文字）と必ず食い違う = 成立し得ない申告。
+        // 大文字 hex は sha256 hex の出力（常に小文字）と必ず食い違う = 成立し得ない申告。
         { path: "model.onnx", sha256: BYTES_SHA256.toUpperCase() },
-        { cacheName: uniqueCacheName(), fetch },
+        { fetch },
       ),
     Error,
   );
@@ -890,7 +967,7 @@ Deno.test("prefetchHfFile: 形式不正の sha256 は network に出る前に fa
       prefetchHfFile(
         { repo: REPO, revision: SHA },
         { path: "model.onnx", sha256: BYTES_SHA256.toUpperCase() },
-        { cacheName: uniqueCacheName(), fetch },
+        { fetch },
       ),
     Error,
   );
@@ -900,7 +977,6 @@ Deno.test("prefetchHfFile: 形式不正の sha256 は network に出る前に fa
 });
 
 Deno.test("prefetchHfFile: onProgress には path が付き、init は解決と取得の両方へ渡る", async () => {
-  const cacheName = uniqueCacheName();
   const { fetch, calls, inits } = mockFetch((url) =>
     url.includes("/api/")
       ? new Response(JSON.stringify({ sha: SHA }))
@@ -910,7 +986,6 @@ Deno.test("prefetchHfFile: onProgress には path が付き、init は解決と�
   const events: { path: string; loaded: number }[] = [];
   try {
     await prefetchHfFile({ repo: REPO }, "model.onnx", {
-      cacheName,
       fetch,
       init,
       onProgress: ({ path, loaded }) => events.push({ path, loaded }),
@@ -920,6 +995,6 @@ Deno.test("prefetchHfFile: onProgress には path が付き、init は解決と�
     assertEquals(inits[0], init);
     assertEquals(inits[1], init);
   } finally {
-    await caches.delete(cacheName);
+    await caches.delete(CACHE_NAME);
   }
 });

@@ -9,9 +9,11 @@ import {
   type CacheErrorContext,
   clearCache,
   decodeGzip,
+  evict,
   evictUrl,
   fetchBytes,
   listCachedUrls,
+  listKeys,
   prefetchUrl,
 } from "./mod.ts";
 import {
@@ -19,6 +21,10 @@ import {
   mockFetch,
   uniqueCacheName,
 } from "./testing/mock_fetch.ts";
+
+// 名前空間は内部固定 1 個（DECIDED: docs/decisions/0006 §3）。テストの隔離は
+// 「テスト毎に finally で名前空間ごと削除」+「ファイル内逐次実行」で行う。
+const CACHE_NAME = "fetch-cache";
 
 // Cache.keys() の型は Deno のバージョンで揺れる（2.8: 型に無し / 2.9+: 必須メソッド）。
 // 両対応のため wrapper は keys を必須で持ち（2.8 では余剰プロパティとして無害）、実体が
@@ -60,8 +66,9 @@ const failingCacheStorage = (overrides: Partial<Cache>): CacheStorage => ({
 const URL_A = "https://example.com/assets/a.bin";
 const URL_B = "https://example.com/assets/b.bin";
 const BYTES_A = new Uint8Array([1, 2, 3, 4, 5]);
+const BYTES_B = new Uint8Array([6, 7, 8]);
 
-/** 期待 sha256 の組み立て（native の一括 digest — prefetch の通過中検証の対照）。 */
+/** 期待 sha256 の組み立て（native の一括 digest — 実装と独立な対照）。 */
 const sha256HexOf = async (bytes: Uint8Array<ArrayBuffer>): Promise<string> =>
   Array.from(
     new Uint8Array(await crypto.subtle.digest("SHA-256", bytes)),
@@ -69,6 +76,21 @@ const sha256HexOf = async (bytes: Uint8Array<ArrayBuffer>): Promise<string> =>
   ).join("");
 
 const BYTES_A_SHA256 = await sha256HexOf(BYTES_A);
+const BYTES_B_SHA256 = await sha256HexOf(BYTES_B);
+
+// 記録ハッシュのヘッダ名（公開契約として凍結 — DECIDED: docs/decisions/0006 §2）。
+const SHA_HEADER = "x-fetch-cache-sha256";
+
+/**
+ * 配列キーの直列化形式のゴールデン（保存形式は公開契約として凍結する）:
+ * 予約 origin `https://fetch-cache.invalid/v1/` + セグメント毎に JSON.stringify →
+ * encodeURIComponent。実装のヘルパを使わずテスト側で独立に組み立てる（トートロジー回避）。
+ */
+const keyUrl = (...elements: (string | number | boolean)[]): string =>
+  "https://fetch-cache.invalid/v1/" +
+  elements.map((element) => encodeURIComponent(JSON.stringify(element))).join(
+    "/",
+  );
 
 /** decodeGzip テスト用の gzip 圧縮（CompressionStream = Web 標準）。 */
 const gzipBytes = async (
@@ -79,7 +101,7 @@ const gzipBytes = async (
   return new Uint8Array(await new Response(stream).arrayBuffer());
 };
 
-// Cache.keys() の実装有無はランタイム依存（Deno 2.9 で実装）。listCachedUrls のテストを
+// Cache.keys() の実装有無はランタイム依存（Deno 2.9 で実装）。keys() に依存するテストを
 // 実行時サポートで分岐する（実装側 supportsKeys と同じ feature-detect）。
 const probeName = uniqueCacheName();
 const probeCache = await caches.open(probeName);
@@ -89,39 +111,36 @@ const runtimeHasCacheKeys =
 await caches.delete(probeName); // probe の名前空間を残さない。
 
 Deno.test("fetchBytes: ミスで fetch 1回、2回目はキャッシュヒットで fetch 0回", async () => {
-  const cacheName = uniqueCacheName();
   const { fetch, calls } = mockFetch(() => new Response(BYTES_A));
   try {
-    const first = await fetchBytes(URL_A, { cacheName, fetch });
+    const first = await fetchBytes(URL_A, { fetch });
     assertEquals(first, BYTES_A);
     assertEquals(calls, [URL_A]);
 
-    const second = await fetchBytes(URL_A, { cacheName, fetch });
+    const second = await fetchBytes(URL_A, { fetch });
     assertEquals(second, BYTES_A);
     assertEquals(calls.length, 1); // ヒット時は network に出ない。
   } finally {
-    await caches.delete(cacheName);
+    await caches.delete(CACHE_NAME);
   }
 });
 
 Deno.test("fetchBytes: cache:false は Cache API を触らず毎回 fetch する", async () => {
-  const cacheName = uniqueCacheName();
   const { fetch, calls } = mockFetch(() => new Response(BYTES_A));
   try {
-    await fetchBytes(URL_A, { cacheName, cache: false, fetch });
-    await fetchBytes(URL_A, { cacheName, cache: false, fetch });
+    await fetchBytes(URL_A, { cache: false, fetch });
+    await fetchBytes(URL_A, { cache: false, fetch });
     assertEquals(calls.length, 2);
 
     // cache:false ではキャッシュに書き込まれない。
-    const cache = await caches.open(cacheName);
+    const cache = await caches.open(CACHE_NAME);
     assertEquals(await cache.match(URL_A), undefined);
   } finally {
-    await caches.delete(cacheName);
+    await caches.delete(CACHE_NAME);
   }
 });
 
 Deno.test("fetchBytes: 破損キャッシュは evict して network から取り直す（self-heal）", async () => {
-  const cacheName = uniqueCacheName();
   const corrupt = new Uint8Array([9, 9, 9]);
   const { fetch, calls } = mockFetch(() => new Response(BYTES_A));
   const validate = (bytes: Uint8Array) => {
@@ -129,29 +148,27 @@ Deno.test("fetchBytes: 破損キャッシュは evict して network から取�
   };
   try {
     // 破損エントリを直接キャッシュへ仕込む。
-    const cache = await caches.open(cacheName);
+    const cache = await caches.open(CACHE_NAME);
     await cache.put(URL_A, new Response(corrupt));
 
-    const healed = await fetchBytes(URL_A, { cacheName, validate, fetch });
+    const healed = await fetchBytes(URL_A, { validate, fetch });
     assertEquals(healed, BYTES_A);
     assertEquals(calls.length, 1); // evict → network 1回。
 
     // 取り直した正常物がキャッシュされている（再呼び出しで fetch 0回）。
-    await fetchBytes(URL_A, { cacheName, validate, fetch });
+    await fetchBytes(URL_A, { validate, fetch });
     assertEquals(calls.length, 1);
   } finally {
-    await caches.delete(cacheName);
+    await caches.delete(CACHE_NAME);
   }
 });
 
 Deno.test("fetchBytes: network 取得物の validate 失敗は throw し、キャッシュしない", async () => {
-  const cacheName = uniqueCacheName();
   const { fetch, calls } = mockFetch(() => new Response(BYTES_A));
   try {
     await assertRejects(
       () =>
         fetchBytes(URL_A, {
-          cacheName,
           fetch,
           validate: () => {
             throw new Error("常に不正");
@@ -162,15 +179,14 @@ Deno.test("fetchBytes: network 取得物の validate 失敗は throw し、キ�
     );
     assertEquals(calls.length, 1);
 
-    const cache = await caches.open(cacheName);
+    const cache = await caches.open(CACHE_NAME);
     assertEquals(await cache.match(URL_A), undefined); // 不正物は保存されない。
   } finally {
-    await caches.delete(cacheName);
+    await caches.delete(CACHE_NAME);
   }
 });
 
 Deno.test("fetchBytes: onProgress はチャンク毎に loaded を累積し、content-length があれば total を持つ", async () => {
-  const cacheName = uniqueCacheName();
   const chunks = [new Uint8Array([1, 2, 3]), new Uint8Array([4, 5, 6, 7])];
   const { fetch } = mockFetch(() =>
     chunkedResponse(chunks, { "content-length": "7" })
@@ -178,7 +194,6 @@ Deno.test("fetchBytes: onProgress はチャンク毎に loaded を累積し、co
   const events: { loaded: number; total?: number }[] = [];
   try {
     const bytes = await fetchBytes(URL_A, {
-      cacheName,
       fetch,
       onProgress: (progress) => events.push(progress),
     });
@@ -188,61 +203,56 @@ Deno.test("fetchBytes: onProgress はチャンク毎に loaded を累積し、co
     // キャッシュヒット時は onProgress が呼ばれない。
     events.length = 0;
     await fetchBytes(URL_A, {
-      cacheName,
       fetch,
       onProgress: (progress) => events.push(progress),
     });
     assertEquals(events, []);
   } finally {
-    await caches.delete(cacheName);
+    await caches.delete(CACHE_NAME);
   }
 });
 
 Deno.test("fetchBytes: content-length が無ければ total は undefined", async () => {
-  const cacheName = uniqueCacheName();
   const { fetch } = mockFetch(() =>
     chunkedResponse([new Uint8Array([1, 2, 3])])
   );
   const events: { loaded: number; total?: number }[] = [];
   try {
     await fetchBytes(URL_A, {
-      cacheName,
       fetch,
       onProgress: (progress) => events.push(progress),
     });
     assertEquals(events, [{ loaded: 3, total: undefined }]);
   } finally {
-    await caches.delete(cacheName);
+    await caches.delete(CACHE_NAME);
   }
 });
 
 Deno.test("fetchBytes: HTTP エラーは status 入りメッセージで throw する", async () => {
-  const cacheName = uniqueCacheName();
   const { fetch } = mockFetch(() =>
     new Response("missing", { status: 404, statusText: "Not Found" })
   );
   try {
     const error = await assertRejects(
-      () => fetchBytes(URL_A, { cacheName, fetch }),
+      () => fetchBytes(URL_A, { fetch }),
       Error,
     );
     assertStringIncludes(error.message, "fetch-cache: HTTP 404 Not Found");
     assertStringIncludes(error.message, URL_A);
   } finally {
-    await caches.delete(cacheName);
+    await caches.delete(CACHE_NAME);
   }
 });
 
 Deno.test("single-flight: 同一 URL の並行呼び出しは 1 フライトに合流し fetch は 1 回", async () => {
-  const cacheName = uniqueCacheName();
   const gate = Promise.withResolvers<void>();
   const { fetch, calls } = mockFetch(async () => {
     await gate.promise;
     return new Response(BYTES_A);
   });
   try {
-    const first = fetchBytes(URL_A, { cacheName, fetch });
-    const second = fetchBytes(URL_A, { cacheName, fetch });
+    const first = fetchBytes(URL_A, { fetch });
+    const second = fetchBytes(URL_A, { fetch });
     gate.resolve();
     const [a, b] = await Promise.all([first, second]);
     assertEquals(a, BYTES_A);
@@ -250,15 +260,14 @@ Deno.test("single-flight: 同一 URL の並行呼び出しは 1 フライトに�
     assertEquals(calls.length, 1);
 
     // 収束後は正常な 1 エントリでヒットする（フライトは閉じている）。
-    await fetchBytes(URL_A, { cacheName, fetch });
+    await fetchBytes(URL_A, { fetch });
     assertEquals(calls.length, 1);
   } finally {
-    await caches.delete(cacheName);
+    await caches.delete(CACHE_NAME);
   }
 });
 
 Deno.test("single-flight: decode は合流後に各呼び出しが自分のものを適用する", async () => {
-  const cacheName = uniqueCacheName();
   const original = new Uint8Array([10, 20, 30, 40]);
   const compressed = await gzipBytes(original);
   const gate = Promise.withResolvers<void>();
@@ -268,33 +277,27 @@ Deno.test("single-flight: decode は合流後に各呼び出しが自分のも�
   });
   try {
     // 先行呼び出しは decode あり、合流者は decode なし。合流者には保存形 raw が渡る。
-    const withDecode = fetchBytes(URL_A, {
-      cacheName,
-      fetch,
-      decode: decodeGzip,
-    });
-    const withoutDecode = fetchBytes(URL_A, { cacheName, fetch });
+    const withDecode = fetchBytes(URL_A, { fetch, decode: decodeGzip });
+    const withoutDecode = fetchBytes(URL_A, { fetch });
     gate.resolve();
     const [decoded, raw] = await Promise.all([withDecode, withoutDecode]);
     assertEquals(decoded, original);
     assertEquals(raw, compressed);
     assertEquals(calls.length, 1);
   } finally {
-    await caches.delete(cacheName);
+    await caches.delete(CACHE_NAME);
   }
 });
 
 Deno.test("single-flight: 合流者の validate 失敗はその呼び出しだけ throw する", async () => {
-  const cacheName = uniqueCacheName();
   const gate = Promise.withResolvers<void>();
   const { fetch, calls } = mockFetch(async () => {
     await gate.promise;
     return new Response(BYTES_A);
   });
   try {
-    const leader = fetchBytes(URL_A, { cacheName, fetch });
+    const leader = fetchBytes(URL_A, { fetch });
     const strictJoiner = fetchBytes(URL_A, {
-      cacheName,
       fetch,
       validate: () => {
         throw new Error("joiner だけの検証失敗");
@@ -305,12 +308,11 @@ Deno.test("single-flight: 合流者の validate 失敗はその呼び出しだ�
     await assertRejects(() => strictJoiner, Error, "joiner だけの検証失敗");
     assertEquals(calls.length, 1);
   } finally {
-    await caches.delete(cacheName);
+    await caches.delete(CACHE_NAME);
   }
 });
 
 Deno.test("single-flight: 取得失敗は合流全員へ伝播するが、失敗は記憶されず次の呼び出しで再取得する", async () => {
-  const cacheName = uniqueCacheName();
   const gate = Promise.withResolvers<void>();
   let attempt = 0;
   const { fetch, calls } = mockFetch(async () => {
@@ -321,23 +323,22 @@ Deno.test("single-flight: 取得失敗は合流全員へ伝播するが、失敗
       : new Response(BYTES_A);
   });
   try {
-    const first = fetchBytes(URL_A, { cacheName, fetch });
-    const second = fetchBytes(URL_A, { cacheName, fetch });
+    const first = fetchBytes(URL_A, { fetch });
+    const second = fetchBytes(URL_A, { fetch });
     gate.resolve();
     await assertRejects(() => first, Error, "HTTP 503");
     await assertRejects(() => second, Error, "HTTP 503");
     assertEquals(calls.length, 1);
 
     // フライトは閉じているので、次の呼び出しは新規に取得して成功する。
-    assertEquals(await fetchBytes(URL_A, { cacheName, fetch }), BYTES_A);
+    assertEquals(await fetchBytes(URL_A, { fetch }), BYTES_A);
     assertEquals(calls.length, 2);
   } finally {
-    await caches.delete(cacheName);
+    await caches.delete(CACHE_NAME);
   }
 });
 
 Deno.test("single-flight: onProgress は合流者へも fan-out される", async () => {
-  const cacheName = uniqueCacheName();
   const gate = Promise.withResolvers<void>();
   const { fetch } = mockFetch(async () => {
     await gate.promise;
@@ -350,12 +351,10 @@ Deno.test("single-flight: onProgress は合流者へも fan-out される", asyn
   const joinerProgress: number[] = [];
   try {
     const leader = fetchBytes(URL_A, {
-      cacheName,
       fetch,
       onProgress: (p) => leaderProgress.push(p.loaded),
     });
     const joiner = fetchBytes(URL_A, {
-      cacheName,
       fetch,
       onProgress: (p) => joinerProgress.push(p.loaded),
     });
@@ -364,12 +363,11 @@ Deno.test("single-flight: onProgress は合流者へも fan-out される", asyn
     assertEquals(leaderProgress, [2, 5]);
     assertEquals(joinerProgress, [2, 5]);
   } finally {
-    await caches.delete(cacheName);
+    await caches.delete(CACHE_NAME);
   }
 });
 
 Deno.test("single-flight: 途中合流者には直近の進捗が合流時に 1 回即時通知される", async () => {
-  const cacheName = uniqueCacheName();
   // 手動制御ストリームで「チャンク1 → 合流 → チャンク2」の順序を決定的に作る。
   let controller!: ReadableStreamDefaultController<Uint8Array<ArrayBuffer>>;
   const stream = new ReadableStream<Uint8Array<ArrayBuffer>>({
@@ -382,7 +380,6 @@ Deno.test("single-flight: 途中合流者には直近の進捗が合流時に 1 
   const leaderFirstChunk = Promise.withResolvers<void>();
   try {
     const leader = fetchBytes(URL_A, {
-      cacheName,
       fetch,
       onProgress: (p) => {
         leaderProgress.push(p.loaded);
@@ -393,7 +390,6 @@ Deno.test("single-flight: 途中合流者には直近の進捗が合流時に 1 
     await leaderFirstChunk.promise; // ここで state.last = {loaded: 2}
     const joinerProgress: number[] = [];
     const joiner = fetchBytes(URL_A, {
-      cacheName,
       fetch,
       onProgress: (p) => joinerProgress.push(p.loaded),
     });
@@ -405,12 +401,11 @@ Deno.test("single-flight: 途中合流者には直近の進捗が合流時に 1 
     assertEquals(leaderProgress, [2, 5]);
     assertEquals(joinerProgress, [2, 5]);
   } finally {
-    await caches.delete(cacheName);
+    await caches.delete(CACHE_NAME);
   }
 });
 
 Deno.test("single-flight: onProgress リスナーの throw は取得を巻き添えにしない（隔離+警告）", async () => {
-  const cacheName = uniqueCacheName();
   const gate = Promise.withResolvers<void>();
   const { fetch } = mockFetch(async () => {
     await gate.promise;
@@ -425,14 +420,12 @@ Deno.test("single-flight: onProgress リスナーの throw は取得を巻き添
   try {
     // leader 自身のリスナーが事故を起こしても、合流フライト全体（joiner の取得）は続行する。
     const bad = fetchBytes(URL_A, {
-      cacheName,
       fetch,
       onProgress: () => {
         throw new Error("リスナー事故");
       },
     });
     const good = fetchBytes(URL_A, {
-      cacheName,
       fetch,
       onProgress: (p) => seen.push(p.loaded),
     });
@@ -444,7 +437,7 @@ Deno.test("single-flight: onProgress リスナーの throw は取得を巻き添
     assertEquals(warns.some((w) => w.includes("onProgress")), true);
   } finally {
     console.warn = origWarn;
-    await caches.delete(cacheName);
+    await caches.delete(CACHE_NAME);
   }
 });
 
@@ -461,33 +454,30 @@ Deno.test("single-flight: cache:false の呼び出しは合流しない（毎回
   assertEquals(calls.length, 2);
 });
 
-Deno.test("single-flight: cacheName が異なる呼び出しは合流しない（キーは cacheName + URL）", async () => {
-  const cacheA = uniqueCacheName();
-  const cacheB = uniqueCacheName();
+Deno.test("single-flight: 同一 URL でも key の有無でキーが違えば合流しない", async () => {
+  // 合流キーは cache と同じキー空間（key ?? URL）。URL キーと配列キーは別エントリなので
+  // 別フライトになる（DECIDED: docs/decisions/0006）。
   const gate = Promise.withResolvers<void>();
   const { fetch, calls } = mockFetch(async () => {
     await gate.promise;
     return new Response(BYTES_A);
   });
   try {
-    const first = fetchBytes(URL_A, { cacheName: cacheA, fetch });
-    const second = fetchBytes(URL_A, { cacheName: cacheB, fetch });
+    const urlKeyed = fetchBytes(URL_A, { fetch });
+    const arrayKeyed = fetchBytes(URL_A, { fetch, key: ["k1"] });
     gate.resolve();
-    await Promise.all([first, second]);
+    await Promise.all([urlKeyed, arrayKeyed]);
     assertEquals(calls.length, 2);
   } finally {
-    await caches.delete(cacheA);
-    await caches.delete(cacheB);
+    await caches.delete(CACHE_NAME);
   }
 });
 
 Deno.test("fetchBytes: body が null の応答は arrayBuffer フォールバックで空 bytes・onProgress 1回", async () => {
-  const cacheName = uniqueCacheName();
   const { fetch, calls } = mockFetch(() => new Response(null));
   const events: { loaded: number; total?: number }[] = [];
   try {
     const bytes = await fetchBytes(URL_A, {
-      cacheName,
       fetch,
       onProgress: (progress) => events.push(progress),
     });
@@ -495,26 +485,25 @@ Deno.test("fetchBytes: body が null の応答は arrayBuffer フォールバッ
     assertEquals(events, [{ loaded: 0, total: undefined }]);
 
     // 空エントリとしてキャッシュされ、2 回目はヒットする。
-    const second = await fetchBytes(URL_A, { cacheName, fetch });
+    const second = await fetchBytes(URL_A, { fetch });
     assertEquals(second, new Uint8Array(0));
     assertEquals(calls.length, 1);
   } finally {
-    await caches.delete(cacheName);
+    await caches.delete(CACHE_NAME);
   }
 });
 
 Deno.test("fetchBytes: self-heal の再取得も validate 失敗なら throw し、エントリは残らない", async () => {
-  const cacheName = uniqueCacheName();
   const { fetch, calls } = mockFetch(() => new Response(BYTES_A));
   const validate = () => {
     throw new Error("常に不正");
   };
   try {
-    const cache = await caches.open(cacheName);
+    const cache = await caches.open(CACHE_NAME);
     await cache.put(URL_A, new Response(new Uint8Array([9])));
 
     await assertRejects(
-      () => fetchBytes(URL_A, { cacheName, validate, fetch }),
+      () => fetchBytes(URL_A, { validate, fetch }),
       Error,
       "常に不正",
     );
@@ -523,18 +512,16 @@ Deno.test("fetchBytes: self-heal の再取得も validate 失敗なら throw し
     // 破損エントリは evict 済みで、不正な取得物も put されない。
     assertEquals(await cache.match(URL_A), undefined);
   } finally {
-    await caches.delete(cacheName);
+    await caches.delete(CACHE_NAME);
   }
 });
 
 Deno.test("fetchBytes: async validate の reject も拾い、resolve は通す", async () => {
-  const cacheName = uniqueCacheName();
   const { fetch } = mockFetch(() => new Response(BYTES_A));
   try {
     await assertRejects(
       () =>
         fetchBytes(URL_A, {
-          cacheName,
           fetch,
           validate: () => Promise.reject(new Error("async 不正")),
         }),
@@ -543,67 +530,62 @@ Deno.test("fetchBytes: async validate の reject も拾い、resolve は通す",
     );
 
     const bytes = await fetchBytes(URL_A, {
-      cacheName,
       fetch,
       validate: () => Promise.resolve(),
     });
     assertEquals(bytes, BYTES_A);
   } finally {
-    await caches.delete(cacheName);
+    await caches.delete(CACHE_NAME);
   }
 });
 
 Deno.test("fetchBytes: fetch の transport 例外は握りつぶさず伝播する", async () => {
-  const cacheName = uniqueCacheName();
   const { fetch } = mockFetch(() =>
     Promise.reject(new Error("connection refused"))
   );
   try {
     await assertRejects(
-      () => fetchBytes(URL_A, { cacheName, fetch }),
+      () => fetchBytes(URL_A, { fetch }),
       Error,
       "connection refused",
     );
   } finally {
-    await caches.delete(cacheName);
+    await caches.delete(CACHE_NAME);
   }
 });
 
 Deno.test("fetchBytes / evictUrl: URL オブジェクト入力は文字列と同じキーになる", async () => {
-  const cacheName = uniqueCacheName();
   const { fetch, calls } = mockFetch(() => new Response(BYTES_A));
   try {
-    const bytes = await fetchBytes(new URL(URL_A), { cacheName, fetch });
+    const bytes = await fetchBytes(new URL(URL_A), { fetch });
     assertEquals(bytes, BYTES_A);
 
     // 文字列入力で同一キーにヒットする（URL→href の正規化が一致）。
-    await fetchBytes(URL_A, { cacheName, fetch });
+    await fetchBytes(URL_A, { fetch });
     assertEquals(calls.length, 1);
 
-    assertEquals(await evictUrl(new URL(URL_A), { cacheName }), true);
+    assertEquals(await evictUrl(new URL(URL_A)), true);
   } finally {
-    await caches.delete(cacheName);
+    await caches.delete(CACHE_NAME);
   }
 });
 
 Deno.test("fetchBytes: 正常キャッシュヒットは validate 通過で network に出ない", async () => {
-  const cacheName = uniqueCacheName();
   const { fetch, calls } = mockFetch(() => new Response(BYTES_A));
   const validate = (bytes: Uint8Array) => {
     if (bytes.length !== BYTES_A.length) throw new Error("破損");
   };
   try {
-    await fetchBytes(URL_A, { cacheName, validate, fetch });
-    const second = await fetchBytes(URL_A, { cacheName, validate, fetch });
+    await fetchBytes(URL_A, { validate, fetch });
+    const second = await fetchBytes(URL_A, { validate, fetch });
     assertEquals(second, BYTES_A);
     assertEquals(calls.length, 1); // ヒット + validate 通過 → network 0 回。
   } finally {
-    await caches.delete(cacheName);
+    await caches.delete(CACHE_NAME);
   }
 });
 
 Deno.test("fetchBytes: HTTP エラー時は body を cancel して接続リソースを解放する", async () => {
-  const cacheName = uniqueCacheName();
   let response: Response | undefined;
   const { fetch } = mockFetch(() => {
     response = new Response("missing", {
@@ -613,20 +595,18 @@ Deno.test("fetchBytes: HTTP エラー時は body を cancel して接続リソ�
     return response;
   });
   try {
-    await assertRejects(() => fetchBytes(URL_A, { cacheName, fetch }), Error);
+    await assertRejects(() => fetchBytes(URL_A, { fetch }), Error);
     assertEquals(response?.bodyUsed, true); // cancel 済み＝disturbed。
   } finally {
-    await caches.delete(cacheName);
+    await caches.delete(CACHE_NAME);
   }
 });
 
 Deno.test("fetchBytes: cache.put 失敗は成功したダウンロードを巻き添えにせず通知する", async () => {
-  const cacheName = uniqueCacheName();
   const { fetch } = mockFetch(() => new Response(BYTES_A));
   const notified: CacheErrorContext[] = [];
   try {
     const bytes = await fetchBytes(URL_A, {
-      cacheName,
       fetch,
       caches: failingCacheStorage({
         put: () => Promise.reject(new Error("quota exceeded")),
@@ -638,17 +618,15 @@ Deno.test("fetchBytes: cache.put 失敗は成功したダウンロードを巻�
     assertEquals(notified[0].op, "put");
     assertEquals(notified[0].url, URL_A);
   } finally {
-    await caches.delete(cacheName);
+    await caches.delete(CACHE_NAME);
   }
 });
 
 Deno.test("fetchBytes: cache 読出し失敗は miss として network へ縮退し通知する", async () => {
-  const cacheName = uniqueCacheName();
   const { fetch, calls } = mockFetch(() => new Response(BYTES_A));
   const notified: CacheErrorContext[] = [];
   try {
     const bytes = await fetchBytes(URL_A, {
-      cacheName,
       fetch,
       caches: failingCacheStorage({
         match: () => Promise.reject(new Error("storage broken")),
@@ -659,12 +637,11 @@ Deno.test("fetchBytes: cache 読出し失敗は miss として network へ縮退
     assertEquals(calls.length, 1); // network へ縮退して取得。
     assertEquals(notified.map((context) => context.op), ["match"]); // put は成功。
   } finally {
-    await caches.delete(cacheName);
+    await caches.delete(CACHE_NAME);
   }
 });
 
 Deno.test("fetchBytes: caches.open 失敗はキャッシュ無しの素の fetch へ縮退する", async () => {
-  const cacheName = uniqueCacheName();
   const { fetch, calls } = mockFetch(() => new Response(BYTES_A));
   const notified: CacheErrorContext[] = [];
   const brokenCaches: CacheStorage = {
@@ -675,7 +652,6 @@ Deno.test("fetchBytes: caches.open 失敗はキャッシュ無しの素の fetch
     match: (request, options) => caches.match(request, options),
   };
   const bytes = await fetchBytes(URL_A, {
-    cacheName,
     fetch,
     caches: brokenCaches,
     onCacheError: (context) => notified.push(context),
@@ -686,18 +662,16 @@ Deno.test("fetchBytes: caches.open 失敗はキャッシュ無しの素の fetch
 });
 
 Deno.test("fetchBytes: self-heal 中の evict 失敗でも再取得は続行し通知する", async () => {
-  const cacheName = uniqueCacheName();
   const { fetch, calls } = mockFetch(() => new Response(BYTES_A));
   const notified: CacheErrorContext[] = [];
   const validate = (bytes: Uint8Array) => {
     if (bytes.length !== BYTES_A.length) throw new Error("破損");
   };
   try {
-    const cache = await caches.open(cacheName);
+    const cache = await caches.open(CACHE_NAME);
     await cache.put(URL_A, new Response(new Uint8Array([9])));
 
     const bytes = await fetchBytes(URL_A, {
-      cacheName,
       validate,
       fetch,
       caches: failingCacheStorage({
@@ -709,17 +683,15 @@ Deno.test("fetchBytes: self-heal 中の evict 失敗でも再取得は続行し�
     assertEquals(calls.length, 1);
     assertEquals(notified.map((context) => context.op), ["delete"]);
   } finally {
-    await caches.delete(cacheName);
+    await caches.delete(CACHE_NAME);
   }
 });
 
 Deno.test("fetchBytes: init（ヘッダ・signal）は fetch へそのまま渡る", async () => {
-  const cacheName = uniqueCacheName();
   const { fetch, inits } = mockFetch(() => new Response(BYTES_A));
   const controller = new AbortController();
   try {
     await fetchBytes(URL_A, {
-      cacheName,
       fetch,
       init: {
         headers: { authorization: "Bearer token" },
@@ -733,23 +705,21 @@ Deno.test("fetchBytes: init（ヘッダ・signal）は fetch へそのまま渡�
     );
     assertStrictEquals(inits[0]?.signal, controller.signal);
   } finally {
-    await caches.delete(cacheName);
+    await caches.delete(CACHE_NAME);
   }
 });
 
 Deno.test("fetchBytes: GET 以外はキャッシュ有効のままだと throw、cache:false なら通る", async () => {
-  const cacheName = uniqueCacheName();
   const { fetch, calls, inits } = mockFetch(() => new Response(BYTES_A));
   try {
     const error = await assertRejects(
-      () => fetchBytes(URL_A, { cacheName, fetch, init: { method: "POST" } }),
+      () => fetchBytes(URL_A, { fetch, init: { method: "POST" } }),
       Error,
     );
     assertStringIncludes(error.message, "cache: false");
     assertEquals(calls.length, 0); // fetch 前に fail loud。
 
     const bytes = await fetchBytes(URL_A, {
-      cacheName,
       fetch,
       cache: false,
       init: { method: "POST" },
@@ -757,36 +727,34 @@ Deno.test("fetchBytes: GET 以外はキャッシュ有効のままだと throw�
     assertEquals(bytes, BYTES_A);
     assertEquals(inits[0]?.method, "POST");
   } finally {
-    await caches.delete(cacheName);
+    await caches.delete(CACHE_NAME);
   }
 });
 
 Deno.test("fetchBytes: decode は利用形を返し、cache には保存形 raw がそのまま入る", async () => {
-  const cacheName = uniqueCacheName();
   const { fetch, calls } = mockFetch(() => new Response(BYTES_A));
   const decode = (raw: Uint8Array) => raw.map((byte) => byte * 2);
   const decoded = new Uint8Array([2, 4, 6, 8, 10]);
   try {
-    const first = await fetchBytes(URL_A, { cacheName, fetch, decode });
+    const first = await fetchBytes(URL_A, { fetch, decode });
     assertEquals(first, decoded);
 
     // cache に入るのは decode 前の保存形 raw（保存形 ≠ 利用形）。
-    const cache = await caches.open(cacheName);
+    const cache = await caches.open(CACHE_NAME);
     const cachedResponse = await cache.match(URL_A);
     assertExists(cachedResponse);
     assertEquals(new Uint8Array(await cachedResponse.arrayBuffer()), BYTES_A);
 
     // キャッシュヒット側にも decode が適用され、network には出ない。
-    const second = await fetchBytes(URL_A, { cacheName, fetch, decode });
+    const second = await fetchBytes(URL_A, { fetch, decode });
     assertEquals(second, decoded);
     assertEquals(calls.length, 1);
   } finally {
-    await caches.delete(cacheName);
+    await caches.delete(CACHE_NAME);
   }
 });
 
 Deno.test("fetchBytes: validate は decode 前の保存形 raw を受ける（両経路で契約を凍結）", async () => {
-  const cacheName = uniqueCacheName();
   const { fetch } = mockFetch(() => new Response(BYTES_A));
   const seen: Uint8Array[] = [];
   const validate = (bytes: Uint8Array) => {
@@ -794,41 +762,26 @@ Deno.test("fetchBytes: validate は decode 前の保存形 raw を受ける（�
   };
   const decode = (raw: Uint8Array) => new Uint8Array([raw.length]);
   try {
-    const first = await fetchBytes(URL_A, {
-      cacheName,
-      fetch,
-      validate,
-      decode,
-    });
+    const first = await fetchBytes(URL_A, { fetch, validate, decode });
     assertEquals(first, new Uint8Array([5])); // network 側: 戻り値は decode 適用後。
-    const second = await fetchBytes(URL_A, {
-      cacheName,
-      fetch,
-      validate,
-      decode,
-    });
+    const second = await fetchBytes(URL_A, { fetch, validate, decode });
     assertEquals(second, new Uint8Array([5])); // ヒット側も同じ利用形。
     assertEquals(seen, [BYTES_A, BYTES_A]); // validate は両経路とも raw（decoded ではない）。
   } finally {
-    await caches.delete(cacheName);
+    await caches.delete(CACHE_NAME);
   }
 });
 
 Deno.test("fetchBytes: キャッシュヒットの decode 失敗は evict して network から取り直す（self-heal）", async () => {
-  const cacheName = uniqueCacheName();
   const original = new Uint8Array([10, 20, 30, 40]);
   const compressed = await gzipBytes(original);
   const { fetch, calls } = mockFetch(() => new Response(compressed));
   try {
     // 壊れた gzip（保存形として破損）を直接キャッシュへ仕込む。
-    const cache = await caches.open(cacheName);
+    const cache = await caches.open(CACHE_NAME);
     await cache.put(URL_A, new Response(new Uint8Array([9, 9, 9])));
 
-    const healed = await fetchBytes(URL_A, {
-      cacheName,
-      fetch,
-      decode: decodeGzip,
-    });
+    const healed = await fetchBytes(URL_A, { fetch, decode: decodeGzip });
     assertEquals(healed, original); // evict → network の正常 gzip を解凍して返す。
     assertEquals(calls.length, 1);
 
@@ -839,21 +792,19 @@ Deno.test("fetchBytes: キャッシュヒットの decode 失敗は evict して
       new Uint8Array(await cachedResponse.arrayBuffer()),
       compressed,
     );
-    await fetchBytes(URL_A, { cacheName, fetch, decode: decodeGzip });
+    await fetchBytes(URL_A, { fetch, decode: decodeGzip });
     assertEquals(calls.length, 1);
   } finally {
-    await caches.delete(cacheName);
+    await caches.delete(CACHE_NAME);
   }
 });
 
 Deno.test("fetchBytes: network 取得物の decode 失敗は throw し、キャッシュしない", async () => {
-  const cacheName = uniqueCacheName();
   const { fetch, calls } = mockFetch(() => new Response(BYTES_A));
   try {
     await assertRejects(
       () =>
         fetchBytes(URL_A, {
-          cacheName,
           fetch,
           decode: () => {
             throw new Error("decode 不能");
@@ -864,23 +815,341 @@ Deno.test("fetchBytes: network 取得物の decode 失敗は throw し、キャ�
     );
     assertEquals(calls.length, 1);
 
-    const cache = await caches.open(cacheName);
+    const cache = await caches.open(CACHE_NAME);
     assertEquals(await cache.match(URL_A), undefined); // decode 不能物は保存されない。
   } finally {
-    await caches.delete(cacheName);
+    await caches.delete(CACHE_NAME);
   }
 });
 
 Deno.test("fetchBytes: cache:false（素の fetch 経路）でも async decode が適用される", async () => {
-  const cacheName = uniqueCacheName();
   const { fetch } = mockFetch(() => new Response(BYTES_A));
   const bytes = await fetchBytes(URL_A, {
-    cacheName,
     cache: false,
     fetch,
     decode: (raw) => Promise.resolve(new Uint8Array([raw.length])),
   });
   assertEquals(bytes, new Uint8Array([5]));
+});
+
+// --- 配列 key（キャッシュキーと取得元 URL の分離。省略時は URL がそのままキー）---
+
+Deno.test("key: 格納も読出しもキー側で行い、取得元 URL が変わってもヒットする", async () => {
+  const KEY = ["models", "a"] as const;
+  const { fetch, calls } = mockFetch(() => new Response(BYTES_A));
+  try {
+    const first = await fetchBytes(URL_A, { key: KEY, fetch });
+    assertEquals(first, BYTES_A);
+    assertEquals(calls, [URL_A]); // network に出るのは取得元 URL のまま。
+
+    const cache = await caches.open(CACHE_NAME);
+    const cached = await cache.match(keyUrl("models", "a"));
+    assertExists(cached); // 直列化形式（ゴールデン）もここで凍結される。
+    assertEquals(new Uint8Array(await cached.arrayBuffer()), BYTES_A);
+    assertEquals(await cache.match(URL_A), undefined); // URL 側にはエントリを作らない。
+
+    // 取得元が別 URL（別 revision 相当）でも、同じ key ならヒットする＝これが分離の目的。
+    const second = await fetchBytes(URL_B, { key: KEY, fetch });
+    assertEquals(second, BYTES_A);
+    assertEquals(calls.length, 1);
+    assertEquals(await cache.match(URL_B), undefined);
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
+Deno.test("key: 破損したキー側エントリを evict して取り直す（self-heal もキー側）", async () => {
+  const KEY = ["models", "heal"] as const;
+  const { fetch, calls } = mockFetch(() => new Response(BYTES_A));
+  const validate = (bytes: Uint8Array) => {
+    if (bytes.length !== BYTES_A.length) throw new Error("破損");
+  };
+  try {
+    const cache = await caches.open(CACHE_NAME);
+    await cache.put(keyUrl("models", "heal"), new Response(new Uint8Array(3)));
+
+    const healed = await fetchBytes(URL_A, { key: KEY, validate, fetch });
+    assertEquals(healed, BYTES_A);
+    assertEquals(calls.length, 1); // evict → network 1 回。
+
+    // 取り直した正常物はキー側へ置き換わっている（再呼び出しで network 0 回）。
+    const cached = await cache.match(keyUrl("models", "heal"));
+    assertExists(cached);
+    assertEquals(new Uint8Array(await cached.arrayBuffer()), BYTES_A);
+    await fetchBytes(URL_A, { key: KEY, validate, fetch });
+    assertEquals(calls.length, 1);
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
+Deno.test("key: 同一 key・別 URL の並行呼び出しは合流し fetch は 1 回", async () => {
+  const KEY = ["models", "join"] as const;
+  const gate = Promise.withResolvers<void>();
+  const { fetch, calls } = mockFetch(async () => {
+    await gate.promise;
+    return new Response(BYTES_A);
+  });
+  try {
+    // 同一キーを名乗る = 内容同一の主張なので、取得元が違っても合流してよい（ADR 0006）。
+    const first = fetchBytes(URL_A, { key: KEY, fetch });
+    const second = fetchBytes(URL_B, { key: KEY, fetch });
+    gate.resolve();
+    const [a, b] = await Promise.all([first, second]);
+    assertEquals(a, BYTES_A);
+    assertEquals(b, BYTES_A);
+    assertEquals(calls, [URL_A]); // 先行呼び出しの取得元だけが network に出る。
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
+Deno.test("key: 直列化は単射（セグメント境界・要素型・非 ASCII が衝突しない）", async () => {
+  const { fetch, calls } = mockFetch(() => new Response(BYTES_A));
+  // 衝突しやすい形の組: `/` 入り文字列 vs 境界、"1"（文字列） vs 1（数値） vs true。
+  const keys: (string | number | boolean)[][] = [
+    ["a", "b/c"],
+    ["a/b", "c"],
+    ["a", "b", "c"],
+    ["1"],
+    [1],
+    [true],
+    ["日本語 キー%22"],
+  ];
+  try {
+    for (const key of keys) await fetchBytes(URL_A, { key, fetch });
+    assertEquals(calls.length, keys.length); // 全て別キー = 全て network に出る。
+
+    const cache = await caches.open(CACHE_NAME);
+    const stored = (await cache.keys()).map((request) => request.url);
+    assertEquals(new Set(stored).size, keys.length); // エントリも衝突していない。
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
+Deno.test("key: 不正な指定は network に出る前に fail loud", async () => {
+  const { fetch, calls } = mockFetch(() => new Response(BYTES_A));
+  // 空配列・オブジェクト要素・非有限数値・cache:false 併用はいずれも呼び出し側のバグ。
+  await assertRejects(
+    () => fetchBytes(URL_A, { key: [], fetch }),
+    Error,
+    "1 要素以上",
+  );
+  await assertRejects(
+    () =>
+      fetchBytes(URL_A, {
+        key: ["a", { x: 1 } as unknown as string],
+        fetch,
+      }),
+    Error,
+    "string | number | boolean",
+  );
+  await assertRejects(
+    () => fetchBytes(URL_A, { key: ["a", Number.NaN], fetch }),
+    Error,
+    "有限値",
+  );
+  await assertRejects(
+    () => fetchBytes(URL_A, { key: ["a"], cache: false, fetch }),
+    Error,
+    "cache: false と key",
+  );
+  assertEquals(calls.length, 0);
+});
+
+Deno.test("予約 origin（fetch-cache.invalid）は取得元 URL に使えない", async () => {
+  const { fetch, calls } = mockFetch(() => new Response(BYTES_A));
+  const reserved = "https://fetch-cache.invalid/v1/%22x%22";
+  await assertRejects(() => fetchBytes(reserved, { fetch }), Error, "予約");
+  await assertRejects(() => prefetchUrl(reserved, { fetch }), Error, "予約");
+  await assertRejects(() => evictUrl(reserved), Error, "予約");
+  assertEquals(calls.length, 0);
+});
+
+// --- sha256（一級の既知ハッシュ検証 + 記録ハッシュ。既定はローカル格納を信頼）---
+
+Deno.test("sha256: network 取得を検証し、記録ハッシュをエントリへ焼く", async () => {
+  const { fetch, calls } = mockFetch(() => new Response(BYTES_A));
+  try {
+    const bytes = await fetchBytes(URL_A, { sha256: BYTES_A_SHA256, fetch });
+    assertEquals(bytes, BYTES_A);
+
+    const cache = await caches.open(CACHE_NAME);
+    const cached = await cache.match(URL_A);
+    assertExists(cached);
+    assertEquals(cached.headers.get(SHA_HEADER), BYTES_A_SHA256);
+
+    // 2 回目は記録一致のヒット（network 0 回）。
+    await fetchBytes(URL_A, { sha256: BYTES_A_SHA256, fetch });
+    assertEquals(calls.length, 1);
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
+Deno.test("sha256: network 取得の不一致は throw し、キャッシュしない", async () => {
+  const wrong = "f".repeat(64);
+  const { fetch, calls } = mockFetch(() => new Response(BYTES_A));
+  try {
+    const error = await assertRejects(
+      () => fetchBytes(URL_A, { sha256: wrong, fetch }),
+      Error,
+    );
+    // 期待値と実測値の両方を出す（どちらが違うのか分からないと呼び出し側は調べようがない）。
+    assertStringIncludes(error.message, "SHA-256 不一致");
+    assertStringIncludes(error.message, BYTES_A_SHA256);
+    assertStringIncludes(error.message, wrong);
+    assertEquals(calls.length, 1);
+
+    const cache = await caches.open(CACHE_NAME);
+    assertEquals(await cache.match(URL_A), undefined);
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
+Deno.test("sha256: 記録一致のヒットは再ハッシュせず信じる（既定）— recheck で opt-out できる", async () => {
+  // 「信頼」の意味の凍結: 記録ヘッダだけ一致させた偽エントリ（中身は別物）を仕込む。
+  // 既定はハッシュを計算しないので偽の中身がそのまま返り（= 計算していない証明）、
+  // recheck: true は実ハッシュ突合で見破って self-heal する。
+  const corrupt = new Uint8Array([9, 9, 9]);
+  const { fetch, calls } = mockFetch(() => new Response(BYTES_A));
+  try {
+    const cache = await caches.open(CACHE_NAME);
+    await cache.put(
+      URL_A,
+      new Response(corrupt, { headers: { [SHA_HEADER]: BYTES_A_SHA256 } }),
+    );
+
+    const trusted = await fetchBytes(URL_A, {
+      sha256: BYTES_A_SHA256,
+      fetch,
+    });
+    assertEquals(trusted, corrupt); // 記録を信じる = 中身は検査しない（ビット腐敗は検出不能）。
+    assertEquals(calls.length, 0);
+
+    const rechecked = await fetchBytes(URL_A, {
+      sha256: BYTES_A_SHA256,
+      recheck: true,
+      fetch,
+    });
+    assertEquals(rechecked, BYTES_A); // 実ハッシュ不一致 → self-heal → 取り直し。
+    assertEquals(calls.length, 1);
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
+Deno.test("sha256: 記録が無いエントリは実ハッシュで突合する（一致なら network 0 回）", async () => {
+  const { fetch, calls } = mockFetch(() => new Response(BYTES_A));
+  try {
+    // 記録ヘッダ無しの既存エントリ（旧版・無検証 prefetch 相当）。
+    const cache = await caches.open(CACHE_NAME);
+    await cache.put(URL_A, new Response(BYTES_A));
+
+    const bytes = await fetchBytes(URL_A, { sha256: BYTES_A_SHA256, fetch });
+    assertEquals(bytes, BYTES_A);
+    assertEquals(calls.length, 0); // 実ハッシュ一致 → 採用（network に出ない）。
+
+    // 中身が期待と食い違うエントリは self-heal で取り直す。
+    await cache.put(URL_B, new Response(new Uint8Array([9, 9, 9])));
+    const healed = await fetchBytes(URL_B, { sha256: BYTES_A_SHA256, fetch });
+    assertEquals(healed, BYTES_A);
+    assertEquals(calls.length, 1);
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
+Deno.test("sha256: 記録 ≠ 期待は「内容が変わった」として同じキーを上書きする（安定キーのピンポン凍結)", async () => {
+  const KEY = ["models", "pingpong"] as const;
+  const { fetch, calls } = mockFetch((url) =>
+    new Response(url === URL_A ? BYTES_A : BYTES_B)
+  );
+  try {
+    // revision A を安定キーで取得。
+    await fetchBytes(URL_A, { key: KEY, sha256: BYTES_A_SHA256, fetch });
+    assertEquals(calls.length, 1);
+
+    // revision B へ切り替え: 記録(A) ≠ 期待(B) → self-heal で B を取得し同じキーへ上書き。
+    const b = await fetchBytes(URL_B, {
+      key: KEY,
+      sha256: BYTES_B_SHA256,
+      fetch,
+    });
+    assertEquals(b, BYTES_B);
+    assertEquals(calls.length, 2);
+    const cache = await caches.open(CACHE_NAME);
+    const cached = await cache.match(keyUrl("models", "pingpong"));
+    assertExists(cached);
+    assertEquals(cached.headers.get(SHA_HEADER), BYTES_B_SHA256);
+
+    // A へ戻すと再取得（= ピンポン）。内容を共存させたいならキーに sha256 を含めること
+    // （docs/limitations.md）。
+    const a = await fetchBytes(URL_A, {
+      key: KEY,
+      sha256: BYTES_A_SHA256,
+      fetch,
+    });
+    assertEquals(a, BYTES_A);
+    assertEquals(calls.length, 3);
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
+Deno.test("sha256: カスタム validate は記録一致のヒットでも常に走る（省くのは再ハッシュだけ）", async () => {
+  const { fetch, calls } = mockFetch(() => new Response(BYTES_A));
+  let validateCalls = 0;
+  const opts = {
+    sha256: BYTES_A_SHA256,
+    fetch,
+    validate: () => {
+      validateCalls++;
+    },
+  };
+  try {
+    await fetchBytes(URL_A, opts); // network: sha256 + validate。
+    await fetchBytes(URL_A, opts); // ヒット: 記録一致でも validate は走る。
+    assertEquals(calls.length, 1);
+    assertEquals(validateCalls, 2);
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
+Deno.test("sha256: 合流者は自分の期待値で検証する（不一致はその呼び出しだけ throw）", async () => {
+  const gate = Promise.withResolvers<void>();
+  const { fetch, calls } = mockFetch(async () => {
+    await gate.promise;
+    return new Response(BYTES_A);
+  });
+  try {
+    const leader = fetchBytes(URL_A, { sha256: BYTES_A_SHA256, fetch });
+    const joiner = fetchBytes(URL_A, { sha256: "f".repeat(64), fetch });
+    gate.resolve();
+    assertEquals(await leader, BYTES_A);
+    await assertRejects(() => joiner, Error, "SHA-256 不一致");
+    assertEquals(calls.length, 1);
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
+Deno.test("sha256 / recheck: 不正な指定は network に出る前に fail loud", async () => {
+  const { fetch, calls } = mockFetch(() => new Response(BYTES_A));
+  const error = await assertRejects(
+    () => fetchBytes(URL_A, { sha256: BYTES_A_SHA256.toUpperCase(), fetch }),
+    Error,
+  );
+  assertStringIncludes(error.message, "64 桁の小文字 hex");
+  await assertRejects(
+    () => fetchBytes(URL_A, { recheck: true, fetch }),
+    Error,
+    "sha256 とセット",
+  );
+  assertEquals(calls.length, 0);
 });
 
 // --- 受信バッファの事前確保（expectedBytes / content-length はヒント。検証には使わない）---
@@ -908,7 +1177,6 @@ const manualStream = (): {
 
 /** 送信側がバッファを使い回す応答を流し、受信結果を返す（事前確保のヒント源をテスト側が選ぶ）。 */
 const fetchWithReusedChunks = async (
-  cacheName: string,
   opts: { expectedBytes?: number; contentLength?: string },
 ): Promise<Uint8Array> => {
   const { response, controller } = manualStream();
@@ -922,7 +1190,6 @@ const fetchWithReusedChunks = async (
   const reused = new Uint8Array([1, 2, 3]);
   const firstChunk = Promise.withResolvers<void>();
   const promise = fetchBytes(URL_A, {
-    cacheName,
     fetch,
     expectedBytes: opts.expectedBytes,
     onProgress: () => firstChunk.resolve(),
@@ -940,44 +1207,38 @@ const isTightView = (bytes: Uint8Array): boolean =>
   bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength;
 
 Deno.test("fetchBytes: expectedBytes を渡すと受信バッファを事前確保しチャンクを即コピーする", async () => {
-  const cacheName = uniqueCacheName();
   try {
-    const bytes = await fetchWithReusedChunks(cacheName, { expectedBytes: 6 });
+    const bytes = await fetchWithReusedChunks({ expectedBytes: 6 });
     assertEquals(bytes, new Uint8Array([1, 2, 3, 4, 5, 6]));
     assertEquals(isTightView(bytes), true);
   } finally {
-    await caches.delete(cacheName);
+    await caches.delete(CACHE_NAME);
   }
 });
 
 Deno.test("fetchBytes: expectedBytes 省略時は content-length を確保ヒントに使う", async () => {
-  const cacheName = uniqueCacheName();
   try {
-    const bytes = await fetchWithReusedChunks(cacheName, {
-      contentLength: "6",
-    });
+    const bytes = await fetchWithReusedChunks({ contentLength: "6" });
     assertEquals(bytes, new Uint8Array([1, 2, 3, 4, 5, 6]));
   } finally {
-    await caches.delete(cacheName);
+    await caches.delete(CACHE_NAME);
   }
 });
 
 Deno.test("fetchBytes: content-length が無ければ従来どおり蓄積経路で読み切る", async () => {
-  const cacheName = uniqueCacheName();
   const { fetch } = mockFetch(() =>
     chunkedResponse([new Uint8Array([1, 2, 3]), new Uint8Array([4, 5])])
   );
   try {
-    const bytes = await fetchBytes(URL_A, { cacheName, fetch });
+    const bytes = await fetchBytes(URL_A, { fetch });
     assertEquals(bytes, new Uint8Array([1, 2, 3, 4, 5]));
     assertEquals(isTightView(bytes), true);
   } finally {
-    await caches.delete(cacheName);
+    await caches.delete(CACHE_NAME);
   }
 });
 
 Deno.test("fetchBytes: 申告を超えて届いたら蓄積経路へ落ちて全量を返す（ヒントは検証ではない）", async () => {
-  const cacheName = uniqueCacheName();
   // Content-Encoding 越しの content-length のように、宣言より多く届くケース。
   const { fetch } = mockFetch(() =>
     chunkedResponse([new Uint8Array([1, 2, 3]), new Uint8Array([4, 5, 6, 7])], {
@@ -985,96 +1246,143 @@ Deno.test("fetchBytes: 申告を超えて届いたら蓄積経路へ落ちて全
     })
   );
   try {
-    const bytes = await fetchBytes(URL_A, { cacheName, fetch });
+    const bytes = await fetchBytes(URL_A, { fetch });
     assertEquals(bytes, new Uint8Array([1, 2, 3, 4, 5, 6, 7]));
     assertEquals(isTightView(bytes), true);
   } finally {
-    await caches.delete(cacheName);
+    await caches.delete(CACHE_NAME);
   }
 });
 
 Deno.test("fetchBytes: 申告に足りない受信は実長へ詰め直して tight view で返す", async () => {
-  const cacheName = uniqueCacheName();
   const { fetch } = mockFetch(() =>
     chunkedResponse([new Uint8Array([1, 2, 3])])
   );
   try {
-    const bytes = await fetchBytes(URL_A, {
-      cacheName,
-      fetch,
-      expectedBytes: 10,
-    });
+    const bytes = await fetchBytes(URL_A, { fetch, expectedBytes: 10 });
     assertEquals(bytes, new Uint8Array([1, 2, 3]));
     assertEquals(isTightView(bytes), true);
   } finally {
-    await caches.delete(cacheName);
+    await caches.delete(CACHE_NAME);
   }
 });
 
 Deno.test("fetchBytes: expectedBytes は content-length より優先される", async () => {
-  const cacheName = uniqueCacheName();
   try {
     // content-length が誤り（3）でも expectedBytes（6）で確保できていれば内容は壊れない。
-    const bytes = await fetchWithReusedChunks(cacheName, {
+    const bytes = await fetchWithReusedChunks({
       expectedBytes: 6,
       contentLength: "3",
     });
     assertEquals(bytes, new Uint8Array([1, 2, 3, 4, 5, 6]));
   } finally {
-    await caches.delete(cacheName);
+    await caches.delete(CACHE_NAME);
   }
 });
 
-Deno.test("fetchBytes: 確保できないほど巨大な申告でも取得は落とさず蓄積経路で完走する", async () => {
-  const cacheName = uniqueCacheName();
+Deno.test("fetchBytes: 確保できないほど巨大な content-length でも取得は落とさず蓄積経路で完走する", async () => {
+  // サーバ申告は信頼しないので確保失敗は「ヒント無し」へ縮退する。明示 expectedBytes の
+  // 確保失敗だけが fail loud（ADR 0007 — 下の専用テスト）で、この非対称は by-design。
   const { fetch } = mockFetch(() =>
     chunkedResponse([new Uint8Array([1, 2, 3])], {
       "content-length": String(Number.MAX_SAFE_INTEGER),
     })
   );
   try {
-    const bytes = await fetchBytes(URL_A, { cacheName, fetch });
+    const bytes = await fetchBytes(URL_A, { fetch });
     assertEquals(bytes, new Uint8Array([1, 2, 3]));
   } finally {
-    await caches.delete(cacheName);
+    await caches.delete(CACHE_NAME);
   }
 });
 
 Deno.test("fetchBytes: 不正な expectedBytes（非整数・0 以下）は確保ヒントを捨てて蓄積経路で完走する", async () => {
-  // allocateHint の入口ガード（Number.isSafeInteger / size <= 0）。上の巨大申告テストは
-  // 確保そのものが RangeError になる別分岐で、こちらは確保を試みる前に弾かれる側。
-  // 「申告が外れても取得は落とさない」という by-design 契約（docs/limitations.md）を凍結する。
+  // 確保失敗（ADR 0007 の fail loud）とは別分岐: 形式不正は確保を試みる前に弾かれ、
+  // 「申告が外れても取得は落とさない」という by-design 契約（docs/limitations.md）のまま。
   for (const expectedBytes of [1.5, -1, 0]) {
-    const cacheName = uniqueCacheName();
     const { fetch } = mockFetch(() =>
       chunkedResponse([new Uint8Array([1, 2, 3]), new Uint8Array([4, 5])])
     );
     try {
-      const bytes = await fetchBytes(URL_A, {
-        cacheName,
-        fetch,
-        expectedBytes,
-      });
+      const bytes = await fetchBytes(URL_A, { fetch, expectedBytes });
       assertEquals(bytes, BYTES_A, `expectedBytes=${expectedBytes}`);
       assertEquals(isTightView(bytes), true, `expectedBytes=${expectedBytes}`);
     } finally {
-      await caches.delete(cacheName);
+      await caches.delete(CACHE_NAME);
     }
+  }
+});
+
+/**
+ * 読み取られるまで 1 チャンクも流さない応答（pull 駆動）。「受信を始める前に落ちたか」と
+ * 「body を解放したか」を観測するために使う。
+ */
+const lazyResponse = (
+  chunks: readonly Uint8Array<ArrayBuffer>[],
+): { response: Response; pulled: () => number; cancelled: () => boolean } => {
+  let pulled = 0;
+  let cancelled = false;
+  // highWaterMark 0 = 先読みしない（read() が来て初めて pull が走る）。既定の 1 だと
+  // 誰も読んでいなくても 1 チャンク先読みされ、「受信を始めたか」の観測にならない。
+  const stream = new ReadableStream<Uint8Array<ArrayBuffer>>({
+    pull(controller) {
+      if (pulled >= chunks.length) {
+        controller.close();
+        return;
+      }
+      controller.enqueue(chunks[pulled++]);
+    },
+    cancel() {
+      cancelled = true;
+    },
+  }, { highWaterMark: 0 });
+  return {
+    response: new Response(stream),
+    pulled: () => pulled,
+    cancelled: () => cancelled,
+  };
+};
+
+Deno.test("fetchBytes: 明示 expectedBytes の確保が落ちたら受信前に fail loud で止める", async () => {
+  // 蓄積経路へ縮退させると「全量 DL してから同じ理由で落ちる」= 帯域を丸ごと捨てるだけ
+  // （DECIDED: docs/decisions/0007）。
+  const lazy = lazyResponse([new Uint8Array([1, 2, 3])]);
+  const { fetch } = mockFetch(() => lazy.response);
+  try {
+    const error = await assertRejects(
+      () =>
+        fetchBytes(URL_A, {
+          fetch,
+          expectedBytes: Number.MAX_SAFE_INTEGER,
+        }),
+      Error,
+    );
+    assertStringIncludes(error.message, String(Number.MAX_SAFE_INTEGER));
+    assertStringIncludes(error.message, "ArrayBuffer");
+    assertStringIncludes(error.message, URL_A);
+    assertEquals(
+      lazy.pulled(),
+      0,
+      "受信を始めてしまっている（帯域を捨てている）",
+    );
+    assertEquals(lazy.cancelled(), true, "未消費 body を解放していない");
+    assertEquals(await listCachedUrls(), [], "落ちた取得をキャッシュしている");
+  } finally {
+    await caches.delete(CACHE_NAME);
   }
 });
 
 // --- prefetchUrl（streaming put・検証は読み出し側に一本化）---
 
 Deno.test("prefetchUrl: body を streaming で格納し、以後の fetchBytes は network に出ない", async () => {
-  const cacheName = uniqueCacheName();
   const { fetch, calls } = mockFetch(() =>
     chunkedResponse([new Uint8Array([1, 2, 3]), new Uint8Array([4, 5])])
   );
   try {
-    assertEquals(await prefetchUrl(URL_A, { cacheName, fetch }), true);
+    assertEquals(await prefetchUrl(URL_A, { fetch }), true);
     assertEquals(calls.length, 1);
 
-    const cache = await caches.open(cacheName);
+    const cache = await caches.open(CACHE_NAME);
     const cached = await cache.match(URL_A);
     assertExists(cached);
     assertEquals(
@@ -1082,29 +1390,50 @@ Deno.test("prefetchUrl: body を streaming で格納し、以後の fetchBytes �
       new Uint8Array([1, 2, 3, 4, 5]),
     );
 
-    const bytes = await fetchBytes(URL_A, { cacheName, fetch });
+    const bytes = await fetchBytes(URL_A, { fetch });
     assertEquals(bytes, new Uint8Array([1, 2, 3, 4, 5]));
     assertEquals(calls.length, 1); // ヒット。
   } finally {
-    await caches.delete(cacheName);
+    await caches.delete(CACHE_NAME);
   }
 });
 
 Deno.test("prefetchUrl: 既にエントリがあれば network に出ず false を返す", async () => {
-  const cacheName = uniqueCacheName();
   const { fetch, calls } = mockFetch(() => new Response(BYTES_A));
   try {
-    await fetchBytes(URL_A, { cacheName, fetch });
+    await fetchBytes(URL_A, { fetch });
     assertEquals(calls.length, 1);
-    assertEquals(await prefetchUrl(URL_A, { cacheName, fetch }), false);
+    assertEquals(await prefetchUrl(URL_A, { fetch }), false);
     assertEquals(calls.length, 1);
   } finally {
-    await caches.delete(cacheName);
+    await caches.delete(CACHE_NAME);
+  }
+});
+
+Deno.test("prefetchUrl: key 側へ格納し、既存エントリ検査も key で行う", async () => {
+  const KEY = ["warm", "a"] as const;
+  const { fetch, calls } = mockFetch(() =>
+    chunkedResponse([BYTES_A.slice(0, 2), BYTES_A.slice(2)])
+  );
+  try {
+    assertEquals(await prefetchUrl(URL_A, { key: KEY, fetch }), true);
+    assertEquals(calls, [URL_A]);
+
+    const cache = await caches.open(CACHE_NAME);
+    const cached = await cache.match(keyUrl("warm", "a"));
+    assertExists(cached);
+    assertEquals(new Uint8Array(await cached.arrayBuffer()), BYTES_A);
+    assertEquals(await cache.match(URL_A), undefined);
+
+    // 既存エントリ検査もキー側 = 取得元が別 URL でも network に出ない。
+    assertEquals(await prefetchUrl(URL_B, { key: KEY, fetch }), false);
+    assertEquals(calls.length, 1);
+  } finally {
+    await caches.delete(CACHE_NAME);
   }
 });
 
 Deno.test("prefetchUrl: 転送が途中で切れたら throw し、エントリは成立しない", async () => {
-  const cacheName = uniqueCacheName();
   const { fetch } = mockFetch(() =>
     new Response(
       new ReadableStream<Uint8Array<ArrayBuffer>>({
@@ -1117,27 +1446,25 @@ Deno.test("prefetchUrl: 転送が途中で切れたら throw し、エントリ�
   );
   try {
     const error = await assertRejects(
-      () => prefetchUrl(URL_A, { cacheName, fetch }),
+      () => prefetchUrl(URL_A, { fetch }),
       Error,
     );
     assertStringIncludes(error.message, "キャッシュ書込みに失敗");
     assertEquals((error.cause as Error).message, "転送断"); // 原因は握り潰さない。
 
-    const cache = await caches.open(cacheName);
+    const cache = await caches.open(CACHE_NAME);
     assertEquals(await cache.match(URL_A), undefined); // 中途半端なエントリは残らない。
   } finally {
-    await caches.delete(cacheName);
+    await caches.delete(CACHE_NAME);
   }
 });
 
 Deno.test("prefetchUrl: put 失敗（quota 等）は縮退せず throw する（手元にバイトが無い）", async () => {
-  const cacheName = uniqueCacheName();
   const { fetch } = mockFetch(() => new Response(BYTES_A));
   try {
     const error = await assertRejects(
       () =>
         prefetchUrl(URL_A, {
-          cacheName,
           fetch,
           caches: failingCacheStorage({
             put: () => Promise.reject(new Error("quota exceeded")),
@@ -1148,12 +1475,11 @@ Deno.test("prefetchUrl: put 失敗（quota 等）は縮退せず throw する（
     assertStringIncludes(error.message, "fetchBytes へフォールバック");
     assertEquals((error.cause as Error).message, "quota exceeded");
   } finally {
-    await caches.delete(cacheName);
+    await caches.delete(CACHE_NAME);
   }
 });
 
 Deno.test("prefetchUrl: caches.open 失敗も縮退せず throw する", async () => {
-  const cacheName = uniqueCacheName();
   const { fetch, calls } = mockFetch(() => new Response(BYTES_A));
   const brokenCaches: CacheStorage = {
     open: () => Promise.reject(new Error("open failed")),
@@ -1163,7 +1489,7 @@ Deno.test("prefetchUrl: caches.open 失敗も縮退せず throw する", async (
     match: (request, options) => caches.match(request, options),
   };
   await assertRejects(
-    () => prefetchUrl(URL_A, { cacheName, fetch, caches: brokenCaches }),
+    () => prefetchUrl(URL_A, { fetch, caches: brokenCaches }),
     Error,
     "open failed",
   );
@@ -1171,7 +1497,6 @@ Deno.test("prefetchUrl: caches.open 失敗も縮退せず throw する", async (
 });
 
 Deno.test("prefetchUrl: HTTP エラーは throw し、body を cancel してエントリも作らない", async () => {
-  const cacheName = uniqueCacheName();
   let response: Response | undefined;
   const { fetch } = mockFetch(() => {
     response = new Response("missing", {
@@ -1182,23 +1507,22 @@ Deno.test("prefetchUrl: HTTP エラーは throw し、body を cancel してエ�
   });
   try {
     const error = await assertRejects(
-      () => prefetchUrl(URL_A, { cacheName, fetch }),
+      () => prefetchUrl(URL_A, { fetch }),
       Error,
     );
     assertStringIncludes(error.message, "HTTP 404 Not Found");
     assertEquals(response?.bodyUsed, true);
-    const cache = await caches.open(cacheName);
+    const cache = await caches.open(CACHE_NAME);
     assertEquals(await cache.match(URL_A), undefined);
   } finally {
-    await caches.delete(cacheName);
+    await caches.delete(CACHE_NAME);
   }
 });
 
 Deno.test("prefetchUrl: 非 GET は fail loud（Cache API に格納できない）", async () => {
-  const cacheName = uniqueCacheName();
   const { fetch, calls } = mockFetch(() => new Response(BYTES_A));
   const error = await assertRejects(
-    () => prefetchUrl(URL_A, { cacheName, fetch, init: { method: "POST" } }),
+    () => prefetchUrl(URL_A, { fetch, init: { method: "POST" } }),
     Error,
   );
   assertStringIncludes(error.message, "GET 専用");
@@ -1206,7 +1530,6 @@ Deno.test("prefetchUrl: 非 GET は fail loud（Cache API に格納できない�
 });
 
 Deno.test("prefetchUrl: onProgress はチャンク毎に発火し content-length を total に持つ", async () => {
-  const cacheName = uniqueCacheName();
   const { fetch } = mockFetch(() =>
     chunkedResponse([new Uint8Array([1, 2, 3]), new Uint8Array([4, 5, 6, 7])], {
       "content-length": "7",
@@ -1215,26 +1538,24 @@ Deno.test("prefetchUrl: onProgress はチャンク毎に発火し content-length
   const events: { loaded: number; total?: number }[] = [];
   try {
     await prefetchUrl(URL_A, {
-      cacheName,
       fetch,
       onProgress: (progress) => events.push(progress),
     });
     assertEquals(events, [{ loaded: 3, total: 7 }, { loaded: 7, total: 7 }]);
   } finally {
-    await caches.delete(cacheName);
+    await caches.delete(CACHE_NAME);
   }
 });
 
 Deno.test("prefetchUrl: single-flight の対象外（並行の fetchBytes / prefetch と合流しない）", async () => {
-  const cacheName = uniqueCacheName();
   const gate = Promise.withResolvers<void>();
   const { fetch, calls } = mockFetch(async () => {
     await gate.promise;
     return new Response(BYTES_A);
   });
   try {
-    const prefetching = prefetchUrl(URL_A, { cacheName, fetch });
-    const fetching = fetchBytes(URL_A, { cacheName, fetch });
+    const prefetching = prefetchUrl(URL_A, { fetch });
+    const fetching = fetchBytes(URL_A, { fetch });
     gate.resolve();
     const [prefetched, bytes] = await Promise.all([prefetching, fetching]);
     assertEquals(prefetched, true);
@@ -1243,80 +1564,94 @@ Deno.test("prefetchUrl: single-flight の対象外（並行の fetchBytes / pref
     // last-writer-wins で整合性は壊れない）。
     assertEquals(calls.length, 2);
   } finally {
-    await caches.delete(cacheName);
+    await caches.delete(CACHE_NAME);
   }
 });
 
 Deno.test("prefetchUrl: body が null の応答も空エントリとして成立する", async () => {
-  const cacheName = uniqueCacheName();
   const { fetch, calls } = mockFetch(() => new Response(null));
   const events: { loaded: number; total?: number }[] = [];
   try {
     assertEquals(
       await prefetchUrl(URL_A, {
-        cacheName,
         fetch,
         onProgress: (progress) => events.push(progress),
       }),
       true,
     );
     assertEquals(events, [{ loaded: 0, total: undefined }]);
-    assertEquals(
-      await fetchBytes(URL_A, { cacheName, fetch }),
-      new Uint8Array(0),
-    );
+    assertEquals(await fetchBytes(URL_A, { fetch }), new Uint8Array(0));
     assertEquals(calls.length, 1);
   } finally {
-    await caches.delete(cacheName);
+    await caches.delete(CACHE_NAME);
   }
 });
 
 // --- prefetch の通過中 sha256 検証（opt-in。省略時は従来どおり無検証） ---
 
-Deno.test("prefetchUrl: sha256 一致で印付きエントリが成立し、以後のヒットは検証を省ける", async () => {
-  const cacheName = uniqueCacheName();
+Deno.test("prefetchUrl: sha256 一致で記録付きエントリが成立し、読み出しは記録との突合だけで済む", async () => {
   // チャンク分割して届いても分割位置に依らず同じダイジェストになることを込みで確かめる。
   const { fetch, calls } = mockFetch(() =>
     chunkedResponse([BYTES_A.slice(0, 2), BYTES_A.slice(2)])
   );
-  let validateCalls = 0;
   try {
     assertEquals(
-      await prefetchUrl(URL_A, { cacheName, fetch, sha256: BYTES_A_SHA256 }),
+      await prefetchUrl(URL_A, { fetch, sha256: BYTES_A_SHA256 }),
       true,
     );
-    const cache = await caches.open(cacheName);
+    const cache = await caches.open(CACHE_NAME);
     const cached = await cache.match(URL_A);
     assertExists(cached);
-    // 印は期待 sha256 そのもの（fetchBytes の verifiedMarker へそのまま渡せる）。
-    assertEquals(cached.headers.get("x-fetch-cache-verified"), BYTES_A_SHA256);
+    // 記録は期待 sha256 そのもの（fetchBytes の記録一致ヒットにそのまま繋がる）。
+    assertEquals(cached.headers.get(SHA_HEADER), BYTES_A_SHA256);
     assertEquals(new Uint8Array(await cached.arrayBuffer()), BYTES_A);
 
-    const bytes = await fetchBytes(URL_A, {
-      cacheName,
+    const bytes = await fetchBytes(URL_A, { fetch, sha256: BYTES_A_SHA256 });
+    assertEquals(bytes, BYTES_A);
+    assertEquals(calls.length, 1); // ヒット（network に出ない）。
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
+Deno.test("prefetchUrl: key + sha256 の記録はキー側に焼かれ、同じ key の読み出しに繋がる", async () => {
+  const KEY = ["warm", "sha"] as const;
+  const { fetch, calls } = mockFetch(() => new Response(BYTES_A));
+  let validateCalls = 0;
+  try {
+    await prefetchUrl(URL_A, { key: KEY, sha256: BYTES_A_SHA256, fetch });
+    const cached = await (await caches.open(CACHE_NAME)).match(
+      keyUrl("warm", "sha"),
+    );
+    assertExists(cached);
+    assertEquals(cached.headers.get(SHA_HEADER), BYTES_A_SHA256);
+
+    // 温めた側と同じ key + sha256 で読めばヒットし、記録一致で再ハッシュも走らない
+    // （カスタム validate は常に走る）。
+    const bytes = await fetchBytes(URL_B, {
+      key: KEY,
+      sha256: BYTES_A_SHA256,
       fetch,
-      verifiedMarker: BYTES_A_SHA256,
       validate: () => {
         validateCalls++;
       },
     });
     assertEquals(bytes, BYTES_A);
-    assertEquals(calls.length, 1); // ヒット（network に出ない）。
-    assertEquals(validateCalls, 0); // 印が一致するので再ハッシュしない。
+    assertEquals(calls.length, 1);
+    assertEquals(validateCalls, 1);
   } finally {
-    await caches.delete(cacheName);
+    await caches.delete(CACHE_NAME);
   }
 });
 
 Deno.test("prefetchUrl: sha256 不一致は put ごと reject させ、エントリを成立させない", async () => {
-  const cacheName = uniqueCacheName();
   const wrong = "f".repeat(64);
   const { fetch } = mockFetch(() =>
     chunkedResponse([BYTES_A.slice(0, 2), BYTES_A.slice(2)])
   );
   try {
     const error = await assertRejects(
-      () => prefetchUrl(URL_A, { cacheName, fetch, sha256: wrong }),
+      () => prefetchUrl(URL_A, { fetch, sha256: wrong }),
       Error,
     );
     // 期待値と実測値の両方を出す（どちらが違うのか分からないと呼び出し側は調べようがない）。
@@ -1324,19 +1659,22 @@ Deno.test("prefetchUrl: sha256 不一致は put ごと reject させ、エント
     assertStringIncludes(error.message, BYTES_A_SHA256);
     assertStringIncludes(error.message, wrong);
 
-    const cache = await caches.open(cacheName);
-    assertEquals(await cache.match(URL_A), undefined); // 印付きの不正エントリは残らない。
+    const cache = await caches.open(CACHE_NAME);
+    assertEquals(await cache.match(URL_A), undefined); // 記録付きの不正エントリは残らない。
   } finally {
-    await caches.delete(cacheName);
+    await caches.delete(CACHE_NAME);
   }
 });
 
-Deno.test("prefetchUrl: stream の error を握り潰す非準拠 Cache でも印付きの不正エントリは残さない", async () => {
+Deno.test("prefetchUrl: stream の error を握り潰す非準拠 Cache でも記録付きの不正エントリは残さない（保険 delete はキー側）", async () => {
   const wrong = "f".repeat(64);
+  const KEY = ["warm", "insurance"] as const;
   const entries = new Map<string, Response>();
   const deleted: string[] = [];
   // 準拠実装なら controller.error() は put の reject として現れるが、それを無視して
   // エントリを作ってしまう Cache 実装に備えた保険（put 後の delete → throw）の凍結。
+  // key 指定時は保険 delete も**キー側**に向くこと（取得元 URL ではなく）を併せて凍結する
+  // — 取り違えても準拠 Cache のテストは全て通ってしまうため、ここが唯一の検出点。
   // NOTE: put は**必ず body を消費してから** resolve すること。消費しないと TransformStream
   //       の flush（= 不一致の検出そのもの）が走らず、この分岐に入らない。
   const lenientCaches: CacheStorage = {
@@ -1366,23 +1704,28 @@ Deno.test("prefetchUrl: stream の error を握り潰す非準拠 Cache でも�
   );
 
   const error = await assertRejects(
-    () => prefetchUrl(URL_A, { fetch, sha256: wrong, caches: lenientCaches }),
+    () =>
+      prefetchUrl(URL_A, {
+        key: KEY,
+        fetch,
+        sha256: wrong,
+        caches: lenientCaches,
+      }),
     Error,
   );
   // put が resolve しても、落ちる理由は cache 書込み失敗ではなく取得内容の不正のまま。
   assertStringIncludes(error.message, "SHA-256 不一致");
   assertStringIncludes(error.message, BYTES_A_SHA256);
   assertEquals(error.message.includes("キャッシュ書込みに失敗"), false);
-  // 印は以後の検証を丸ごと省かせるので、残ると恒久的に効いてしまう。
-  assertEquals(deleted, [URL_A]);
-  assertEquals(entries.has(URL_A), false);
+  // 記録は以後の検証を省かせるので、残ると恒久的に効いてしまう。消す先はキー側。
+  assertEquals(deleted, [keyUrl("warm", "insurance")]);
+  assertEquals(entries.size, 0);
 });
 
-Deno.test("prefetchUrl: 通過中検証のチャンクは呼び出し側の書き換えから隔離される（印と中身が乖離しない）", async () => {
-  const cacheName = uniqueCacheName();
+Deno.test("prefetchUrl: 通過中検証のチャンクは呼び出し側の書き換えから隔離される（記録と中身が乖離しない）", async () => {
   // 呼び出し側が参照を握ったままのバッファを 1 チャンクだけ流し、onProgress（ハッシュ直後・
   // 格納前に同期で走る呼び出し側コード）で書き換える敵対的な輸送を再現する。隔離が無いと
-  // 「印はハッシュ時の内容・格納は書き換え後の内容」という乖離エントリが成立してしまう。
+  // 「記録はハッシュ時の内容・格納は書き換え後の内容」という乖離エントリが成立してしまう。
   const buffer = new Uint8Array(16).fill(0x11);
   const expected = await sha256HexOf(buffer.slice());
   const { fetch } = mockFetch(() =>
@@ -1398,75 +1741,66 @@ Deno.test("prefetchUrl: 通過中検証のチャンクは呼び出し側の書�
   try {
     assertEquals(
       await prefetchUrl(URL_A, {
-        cacheName,
         fetch,
         sha256: expected,
         onProgress: () => buffer.fill(0x22),
       }),
       true,
     );
-    const cache = await caches.open(cacheName);
+    const cache = await caches.open(CACHE_NAME);
     const cached = await cache.match(URL_A);
     assertExists(cached);
     const stored = new Uint8Array(await cached.arrayBuffer());
-    // 印が主張するハッシュと格納内容が必ず一致する（書き換え前の内容が格納される）。
-    assertEquals(
-      await sha256HexOf(stored),
-      cached.headers.get("x-fetch-cache-verified"),
-    );
+    // 記録が主張するハッシュと格納内容が必ず一致する（書き換え前の内容が格納される）。
+    assertEquals(await sha256HexOf(stored), cached.headers.get(SHA_HEADER));
     assertEquals(stored, new Uint8Array(16).fill(0x11));
   } finally {
-    await caches.delete(cacheName);
+    await caches.delete(CACHE_NAME);
   }
 });
 
 Deno.test("prefetchUrl: body が null の応答でも sha256 は検証される", async () => {
-  const cacheName = uniqueCacheName();
   const emptySha256 = await sha256HexOf(new Uint8Array(0));
   const { fetch } = mockFetch(() => new Response(null));
   try {
     assertEquals(
-      await prefetchUrl(URL_A, { cacheName, fetch, sha256: emptySha256 }),
+      await prefetchUrl(URL_A, { fetch, sha256: emptySha256 }),
       true,
     );
     await assertRejects(
       () =>
         prefetchUrl(URL_B, {
-          cacheName,
           fetch,
           sha256: BYTES_A_SHA256, // 空バイト列とは一致しない。
         }),
       Error,
       "SHA-256 不一致",
     );
-    const cache = await caches.open(cacheName);
+    const cache = await caches.open(CACHE_NAME);
     assertEquals(await cache.match(URL_B), undefined);
   } finally {
-    await caches.delete(cacheName);
+    await caches.delete(CACHE_NAME);
   }
 });
 
-Deno.test("prefetchUrl: sha256 未指定なら印は付かない（既定の無検証格納は不変）", async () => {
-  const cacheName = uniqueCacheName();
+Deno.test("prefetchUrl: sha256 未指定なら記録は付かない（既定の無検証格納は不変）", async () => {
   const { fetch } = mockFetch(() => new Response(BYTES_A));
   try {
-    await prefetchUrl(URL_A, { cacheName, fetch });
-    const cache = await caches.open(cacheName);
+    await prefetchUrl(URL_A, { fetch });
+    const cache = await caches.open(CACHE_NAME);
     const cached = await cache.match(URL_A);
     assertExists(cached);
-    assertEquals(cached.headers.get("x-fetch-cache-verified"), null);
+    assertEquals(cached.headers.get(SHA_HEADER), null);
   } finally {
-    await caches.delete(cacheName);
+    await caches.delete(CACHE_NAME);
   }
 });
 
 Deno.test("prefetchUrl: 形式不正の sha256 は network に出る前に fail loud", async () => {
-  const cacheName = uniqueCacheName();
   const { fetch, calls } = mockFetch(() => new Response(BYTES_A));
   const error = await assertRejects(
     () =>
       prefetchUrl(URL_A, {
-        cacheName,
         fetch,
         sha256: BYTES_A_SHA256.toUpperCase(), // 大文字 hex は必ず不一致になる申告ミス。
       }),
@@ -1476,103 +1810,6 @@ Deno.test("prefetchUrl: 形式不正の sha256 は network に出る前に fail 
   assertEquals(calls.length, 0); // 全量ダウンロードしてから落ちる、を避ける。
 });
 
-// --- 検証済みマーカー（opt-in。既定はヒット毎に validate）---
-
-Deno.test("verifiedMarker: 印が一致するキャッシュヒットでは validate を省く（decode は走る）", async () => {
-  const cacheName = uniqueCacheName();
-  const { fetch, calls } = mockFetch(() => new Response(BYTES_A));
-  let validateCalls = 0;
-  let decodeCalls = 0;
-  const opts = {
-    cacheName,
-    fetch,
-    verifiedMarker: "sha256:abc",
-    validate: () => {
-      validateCalls++;
-    },
-    decode: (raw: Uint8Array) => {
-      decodeCalls++;
-      return raw;
-    },
-  };
-  try {
-    assertEquals(await fetchBytes(URL_A, opts), BYTES_A); // network: 検証 1 回。
-    assertEquals(await fetchBytes(URL_A, opts), BYTES_A); // ヒット: 印一致で省略。
-    assertEquals(calls.length, 1);
-    assertEquals(validateCalls, 1);
-    assertEquals(decodeCalls, 2); // decode は利用形を作る変換なので毎回走る。
-  } finally {
-    await caches.delete(cacheName);
-  }
-});
-
-Deno.test("verifiedMarker: 印が違えば通常どおり validate が走る", async () => {
-  const cacheName = uniqueCacheName();
-  const { fetch } = mockFetch(() => new Response(BYTES_A));
-  let validateCalls = 0;
-  const validate = () => {
-    validateCalls++;
-  };
-  try {
-    await fetchBytes(URL_A, {
-      cacheName,
-      fetch,
-      validate,
-      verifiedMarker: "sha256:abc",
-    });
-    await fetchBytes(URL_A, {
-      cacheName,
-      fetch,
-      validate,
-      verifiedMarker: "sha256:zzz", // 別の期待値 = 印は信用できない。
-    });
-    assertEquals(validateCalls, 2);
-  } finally {
-    await caches.delete(cacheName);
-  }
-});
-
-Deno.test("verifiedMarker: opt-in しない呼び出しは印があってもヒット毎に validate する（既定不変）", async () => {
-  const cacheName = uniqueCacheName();
-  const { fetch } = mockFetch(() => new Response(BYTES_A));
-  let validateCalls = 0;
-  const validate = () => {
-    validateCalls++;
-  };
-  try {
-    await fetchBytes(URL_A, {
-      cacheName,
-      fetch,
-      validate,
-      verifiedMarker: "sha256:abc",
-    });
-    await fetchBytes(URL_A, { cacheName, fetch, validate }); // 印を見ない。
-    assertEquals(validateCalls, 2);
-  } finally {
-    await caches.delete(cacheName);
-  }
-});
-
-Deno.test("verifiedMarker: prefetchUrl が書いた未検証エントリには印が付かない（初回は必ず検証）", async () => {
-  const cacheName = uniqueCacheName();
-  const { fetch } = mockFetch(() => new Response(BYTES_A));
-  let validateCalls = 0;
-  try {
-    await prefetchUrl(URL_A, { cacheName, fetch });
-    await fetchBytes(URL_A, {
-      cacheName,
-      fetch,
-      verifiedMarker: "sha256:abc",
-      validate: () => {
-        validateCalls++;
-      },
-    });
-    assertEquals(validateCalls, 1); // 未検証バイトを印付きと誤認しない。
-  } finally {
-    await caches.delete(cacheName);
-  }
-});
-
 Deno.test("decodeGzip: gzip を解凍して元のバイト列を返し、不正入力は throw する", async () => {
   const original = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]);
   const compressed = await gzipBytes(original);
@@ -1580,36 +1817,38 @@ Deno.test("decodeGzip: gzip を解凍して元のバイト列を返し、不正�
   await assertRejects(() => decodeGzip(new Uint8Array([1, 2, 3])));
 });
 
+// --- 管理 API（evictUrl / clearCache / listCachedUrls / evict / listKeys）---
+
 Deno.test("evictUrl: エントリがあれば削除して true、無ければ false", async () => {
-  const cacheName = uniqueCacheName();
   const { fetch } = mockFetch(() => new Response(BYTES_A));
   try {
-    assertEquals(await evictUrl(URL_A, { cacheName }), false); // 未キャッシュ。
-    await fetchBytes(URL_A, { cacheName, fetch });
-    assertEquals(await evictUrl(URL_A, { cacheName }), true);
+    assertEquals(await evictUrl(URL_A), false); // 未キャッシュ。
+    await fetchBytes(URL_A, { fetch });
+    assertEquals(await evictUrl(URL_A), true);
 
-    const cache = await caches.open(cacheName);
+    const cache = await caches.open(CACHE_NAME);
     assertEquals(await cache.match(URL_A), undefined);
   } finally {
-    await caches.delete(cacheName);
+    await caches.delete(CACHE_NAME);
   }
 });
 
-Deno.test("evictUrl / listCachedUrls: 無い名前空間を作らない（読み取り系の永続化副作用の禁止）", async () => {
-  const cacheName = uniqueCacheName();
-  assertEquals(await evictUrl(URL_A, { cacheName }), false);
-  assertEquals(await caches.has(cacheName), false); // 旧実装は open で空名前空間が残った
-  // 名前空間が無ければ keys() 未実装ランタイム（Deno 2.8 以前）でも [] を返せる。
-  assertEquals(await listCachedUrls(cacheName), []);
-  assertEquals(await caches.has(cacheName), false);
+Deno.test("evictUrl / listCachedUrls / evict / listKeys: 無い名前空間を作らない（読み取り系の永続化副作用の禁止）", async () => {
+  await caches.delete(CACHE_NAME); // 前提: 名前空間が無い状態から始める。
+  assertEquals(await evictUrl(URL_A), false);
+  assertEquals(await caches.has(CACHE_NAME), false);
+  // 名前空間が無ければ keys() 未実装ランタイム（Deno 2.8 以前）でも [] / 0 を返せる。
+  assertEquals(await listCachedUrls(), []);
+  assertEquals(await listKeys(), []);
+  assertEquals(await evict(["x"]), 0);
+  assertEquals(await caches.has(CACHE_NAME), false);
 });
 
 Deno.test("clearCache: 名前空間ごと削除して true、既に無ければ false", async () => {
-  const cacheName = uniqueCacheName();
   const { fetch } = mockFetch(() => new Response(BYTES_A));
-  await fetchBytes(URL_A, { cacheName, fetch });
-  assertEquals(await clearCache(cacheName), true);
-  assertEquals(await clearCache(cacheName), false);
+  await fetchBytes(URL_A, { fetch });
+  assertEquals(await clearCache(), true);
+  assertEquals(await clearCache(), false);
 });
 
 Deno.test({
@@ -1617,31 +1856,114 @@ Deno.test({
     "listCachedUrls: keys() 未実装ランタイム（Deno 2.8 以前）では fail loud に throw する",
   ignore: runtimeHasCacheKeys,
   fn: async () => {
-    const cacheName = uniqueCacheName();
     const { fetch } = mockFetch(() => new Response(BYTES_A));
     try {
-      await fetchBytes(URL_A, { cacheName, fetch });
-      const error = await assertRejects(() => listCachedUrls(cacheName), Error);
+      await fetchBytes(URL_A, { fetch });
+      const error = await assertRejects(() => listCachedUrls(), Error);
       assertStringIncludes(error.message, "keys()");
     } finally {
-      await caches.delete(cacheName);
+      await caches.delete(CACHE_NAME);
     }
   },
 });
 
 Deno.test({
   name:
-    "listCachedUrls: キャッシュ済み URL の一覧を返す（keys() 実装ランタイムのみ）",
+    "listCachedUrls / listKeys: URL キーと配列キーを分けて一覧する（keys() 実装ランタイムのみ）",
   ignore: !runtimeHasCacheKeys,
   fn: async () => {
-    const cacheName = uniqueCacheName();
     const { fetch } = mockFetch(() => new Response(BYTES_A));
     try {
-      assertEquals(await listCachedUrls(cacheName), []);
-      await fetchBytes(URL_A, { cacheName, fetch });
-      assertEquals(await listCachedUrls(cacheName), [URL_A]);
+      assertEquals(await listCachedUrls(), []);
+      await fetchBytes(URL_A, { fetch });
+      await fetchBytes(URL_B, { key: ["app", "models", "a"], fetch });
+      // URL 一覧に合成 origin は混ざらず、キー一覧に URL キーは混ざらない。
+      assertEquals(await listCachedUrls(), [URL_A]);
+      assertEquals(await listKeys(), [["app", "models", "a"]]);
     } finally {
-      await caches.delete(cacheName);
+      await caches.delete(CACHE_NAME);
+    }
+  },
+});
+
+Deno.test({
+  name: "evict / listKeys: プレフィックスで部分木を操作できる",
+  ignore: !runtimeHasCacheKeys,
+  fn: async () => {
+    const { fetch } = mockFetch(() => new Response(BYTES_A));
+    const sortKeys = (keys: readonly (readonly unknown[])[]) =>
+      keys.map((key) => JSON.stringify(key)).sort();
+    try {
+      await fetchBytes(URL_A, { fetch }); // URL キー（プレフィックス操作の対象外）。
+      for (
+        const key of [
+          ["app", "models", "a"],
+          ["app", "models", "b"],
+          ["app", "config"],
+          ["other"],
+        ]
+      ) {
+        await fetchBytes(URL_B, { key, fetch });
+      }
+
+      assertEquals(
+        sortKeys(await listKeys(["app", "models"])),
+        sortKeys([["app", "models", "a"], ["app", "models", "b"]]),
+      );
+
+      // 部分木だけ消える（件数を返す）。もう一度消しても 0。
+      assertEquals(await evict(["app", "models"]), 2);
+      assertEquals(await evict(["app", "models"]), 0);
+      assertEquals(
+        sortKeys(await listKeys()),
+        sortKeys([["app", "config"], ["other"]]),
+      );
+
+      // 空プレフィックス = 配列キーの全エントリ。URL キーは残る。
+      assertEquals(await evict([]), 2);
+      assertEquals(await listKeys(), []);
+      assertEquals(await listCachedUrls(), [URL_A]);
+    } finally {
+      await caches.delete(CACHE_NAME);
+    }
+  },
+});
+
+Deno.test({
+  name:
+    "evict: プレフィックス一致はセグメント境界で判定される（['a'] は ['ab'] に一致しない）",
+  ignore: !runtimeHasCacheKeys,
+  fn: async () => {
+    const { fetch } = mockFetch(() => new Response(BYTES_A));
+    try {
+      for (const key of [["a"], ["ab"], ["a", "b"]]) {
+        await fetchBytes(URL_A, { key, fetch });
+      }
+      // ["a"] は自分自身と子孫 ["a","b"] に一致し、["ab"] には一致しない。
+      assertEquals(await evict(["a"]), 2);
+      assertEquals(await listKeys(), [["ab"]]);
+    } finally {
+      await caches.delete(CACHE_NAME);
+    }
+  },
+});
+
+Deno.test({
+  name:
+    "listKeys: 予約 origin 配下に復元できないエントリがあれば fail loud に throw する",
+  ignore: !runtimeHasCacheKeys,
+  fn: async () => {
+    try {
+      // この層の直列化を経ていない直書きエントリ（JSON として復元できないセグメント）。
+      const cache = await caches.open(CACHE_NAME);
+      await cache.put(
+        "https://fetch-cache.invalid/v1/notjson",
+        new Response(BYTES_A),
+      );
+      const error = await assertRejects(() => listKeys(), Error);
+      assertStringIncludes(error.message, "復元できない");
+    } finally {
+      await caches.delete(CACHE_NAME);
     }
   },
 });

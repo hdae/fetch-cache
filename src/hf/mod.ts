@@ -1,17 +1,21 @@
 /**
  * `@hdae/fetch-cache/hf` — HuggingFace Hub からのファイル取得（汎用 cache 層の上に実装）。
  *
- * 可変 ref（"main" 等）は必ず現在のコミット SHA へ解決してから取得する。SHA 固定 URL は
- * 不変＝キャッシュ可能なので、SHA が変わらない限り 2 回目以降は network なしで返る。
- * `expectedBytes` / `sha256` / カスタム `validate` は `fetchBytes` の validate フックへ
- * 合成され、キャッシュヒット側にも効く（破損キャッシュは self-heal）。ファイル毎の
- * `decode` で「保存形 ≠ 利用形」（gzip のまま保存・解凍して返す等）にも対応する。
+ * 可変 ref（"main" 等）は必ず現在のコミット SHA へ解決してから取得する。キャッシュキーは
+ * `spec.sha256` の有無で変わる: **あれば内容キー `["hf", kind, repo, path, sha256]`**（revision
+ * を含まないので、README 更新だけで revision が動いてもバイト不変のファイルはヒットのまま。
+ * revision を切り替えても内容毎にエントリが共存する）、無ければ従来どおり SHA 固定 resolve URL
+ * がキー（DECIDED: docs/decisions/0006 §4）。`expectedBytes` / カスタム `validate` は
+ * `fetchBytes` の validate フックへ合成され、`sha256` は cache 層の一級オプションへ渡る
+ * （キャッシュヒットは記録ハッシュとの突合だけで済み、再ハッシュは走らない — 疑う運用は
+ * `recheck`）。ファイル毎の `decode` で「保存形 ≠ 利用形」にも対応する。
  *
  * @module
  */
 
 import {
   type CacheErrorContext,
+  type CacheKey,
   type DecodeBytes,
   fetchBytes,
   type FetchProgress,
@@ -37,15 +41,32 @@ export type HfFileSpec = {
   /** バイト数検証（不一致 throw）。Hub 上の保存形 raw に対して。 */
   expectedBytes?: number;
   /**
-   * SHA-256 検証（**64 桁の小文字 hex** — 形式不正は network に出る前に throw。不一致も
+   * 期待 SHA-256（**64 桁の小文字 hex** — 形式不正は network に出る前に throw。不一致も
    * throw。crypto.subtle 必須 — 無ければ throw）。Hub 上の保存形 raw に対して照合する
    * （LFS メタデータの値がそのまま使える。`decode` 併用時も解凍前）。
+   *
+   * 指定すると既定キャッシュキーが内容キー `["hf", kind, repo, path, sha256]` になり、
+   * revision を跨いでバイト不変のファイルがヒットする（DECIDED: docs/decisions/0006 §4）。
+   * ヒット時の検証は保存時に焼いた記録ハッシュとの突合だけで済む（再ハッシュ無し。
+   * 疑う運用は `HfFetchOptions.recheck`）。
    */
   sha256?: string;
   /**
-   * カスタム検証。built-in（expectedBytes / sha256）の後に、同じく保存形 raw に対して走る。
-   * throw = 破損扱い（キャッシュヒット側は self-heal）。利用形側の検証は `decode` 内で
-   * throw する。
+   * キャッシュキーの上書き（既定は sha256 の有無で決まる — 上記）。`fetchHfFile` /
+   * `fetchHfFiles` / `prefetchHfFile` の全部で使われる（ファイル毎指定なので複数ファイル
+   * API とも整合する）。
+   *
+   * MUST: キーに内容識別（sha256 要素等）を含めない安定キー（例 `["hf", repo, path]`）で
+   * revision を切り替えると、`sha256` 併用時は同一エントリの上書き＝行き来で毎回再取得
+   * （ピンポン）、`sha256` 無しでは変更を検知できず最初の内容に固着（stale）する。有界
+   * ストレージと引き換えの性質であり、内容を共存させたいならキーに sha256 を含めること
+   * （DECIDED: docs/decisions/0006 §5、docs/limitations.md）。
+   */
+  key?: CacheKey;
+  /**
+   * カスタム検証。built-in（sha256 → expectedBytes）の後に、同じく保存形 raw に対して走る。
+   * throw = 破損扱い（キャッシュヒット側は self-heal）。キャッシュヒットでも**常に**走る
+   * （記録ハッシュが省くのは sha256 の再計算だけ）。利用形側の検証は `decode` 内で throw する。
    */
   validate?: ValidateBytes;
   /**
@@ -57,7 +78,6 @@ export type HfFileSpec = {
 };
 
 const DEFAULT_HUB_URL = "https://huggingface.co";
-const DEFAULT_CACHE_NAME = "fetch-cache-hf";
 
 // resolve URL は kind でパス接頭辞が、API は複数形セグメントが変わる。
 const RESOLVE_PREFIX: Record<HfRepoKind, string> = {
@@ -133,75 +153,36 @@ export const resolveHfRevision = async (
 };
 
 export type HfFetchOptions = {
-  /** 既定 "fetch-cache-hf"。 */
-  cacheName?: string;
   /** ファイル毎の進捗（path 付き）。 */
   onProgress?: (progress: FetchProgress & { path: string }) => void;
   /** cache I/O 失敗の通知（cache 層へそのまま渡す）。既定 console.warn。 */
   onCacheError?: (context: CacheErrorContext) => void;
   /**
    * fetch へそのまま渡す RequestInit（gated/private repo の Authorization 等）。revision
-   * 解決 API とファイル取得の両方へ渡る。キャッシュキーは URL のみ（docs/limitations.md）。
+   * 解決 API とファイル取得の両方へ渡る。キャッシュキーにヘッダは入らない
+   * （docs/limitations.md）。
    */
   init?: RequestInit;
   fetch?: typeof globalThis.fetch;
   /** CacheStorage の差し替え（cache 層へそのまま渡す）。既定 globalThis.caches。 */
   caches?: CacheStorage;
   /**
-   * **opt-in**: `sha256` を宣言したファイルについて、保存時に検証済みマーカーを焼き、
-   * 以後のキャッシュヒットで印が一致したら検証（expectedBytes / sha256 / カスタム validate）を
-   * まるごと省く。既定 false = 現行どおりヒット毎に全量ハッシュする。
-   *
-   * MUST: これは「ローカル格納を信頼する」選択である（cache 層 `verifiedMarker` の信頼境界を
-   * そのまま継承 — 格納後の改竄・ビット腐敗は検出できない）。数 GB のモデルで起動毎の
-   * 再ハッシュが重すぎる場合の逃げ道であり、既定にはしない（DECIDED: docs/decisions/0005）。
-   * NOTE: 印が付くのは「このオプション付きで network から取得して保存した」エントリだけ。
-   *       既存のキャッシュには印が無いので、次に取り直すまでは通常どおり検証が走る。
+   * true で `sha256` 宣言ファイルのキャッシュヒット時に実バイトを再ハッシュして突合する
+   * （cache 層 `recheck` へそのまま渡す。既定 false = 保存時に焼いた記録ハッシュとの
+   * 文字列比較だけで信じる — ローカル単一ユーザーの格納を信頼する判断。DECIDED:
+   * docs/decisions/0006 §2）。`sha256` の無いファイルには影響しない。
    */
-  trustCachedSha256?: boolean;
+  recheck?: boolean;
 };
 
 /**
- * buffer 全体を占める ArrayBuffer 背面の view か（= そのまま digest へ渡せるか）。
- * SharedArrayBuffer 背面はここで弾く（述語が主張する `Uint8Array<ArrayBuffer>` を嘘にしない）。
- */
-const isTightView = (bytes: Uint8Array): bytes is Uint8Array<ArrayBuffer> =>
-  bytes.buffer instanceof ArrayBuffer && bytes.byteOffset === 0 &&
-  bytes.byteLength === bytes.buffer.byteLength;
-
-/** バイト列をハッシュして小文字 hex を返す（sha256 検証用）。crypto.subtle が無ければ throw。 */
-const sha256Hex = async (bytes: Uint8Array): Promise<string> => {
-  if (typeof crypto === "undefined" || crypto.subtle === undefined) {
-    throw new Error(
-      "fetch-cache: crypto.subtle が利用できないため sha256 検証ができません",
-    );
-  }
-  const digest = await crypto.subtle.digest(
-    "SHA-256",
-    // MUST: 手前で余計なコピーを作らない — 数 GB 級ではコピー 1 回ぶんが効く。cache 層が
-    // 渡す bytes は tight な ArrayBuffer 背面なのでそのまま渡せる。部分ビュー・
-    // SharedArrayBuffer 背面（WebCrypto が拒否する）が来たときだけコピーで背面を保証する。
-    // NOTE: これでピークが 1N になるわけではない。WebCrypto は仕様上 digest の入力を内部で
-    //       コピーするため、ここでの削減は 3N → 2N。読み出し経路に残る 2N を消す手段は
-    //       再ハッシュ自体を省く `trustCachedSha256`（印）の方（DECIDED: docs/decisions/0005）。
-    isTightView(bytes) ? bytes : new Uint8Array(bytes),
-  );
-  return Array.from(
-    new Uint8Array(digest),
-    (byte) => byte.toString(16).padStart(2, "0"),
-  ).join("");
-};
-
-/**
- * HfFileSpec の検証（expectedBytes / sha256 / カスタム validate）を fetchBytes の validate
- * フックへ合成する。validate として渡すことでキャッシュヒット側にも効き、破損キャッシュは
- * self-heal される。built-in を先に走らせる（安価な長さ検査 → sha256 → カスタム）。
+ * HfFileSpec の検証（expectedBytes / カスタム validate）を fetchBytes の validate フックへ
+ * 合成する。validate として渡すことでキャッシュヒット側にも効き、破損キャッシュは self-heal
+ * される。`sha256` はここに含めない — cache 層の一級オプション（記録ハッシュ + 突合）へ渡す
+ * （DECIDED: docs/decisions/0006 §2）。
  */
 const buildValidate = (spec: HfFileSpec): ValidateBytes | undefined => {
-  if (
-    spec.expectedBytes === undefined && spec.sha256 === undefined &&
-    spec.validate === undefined
-  ) {
+  if (spec.expectedBytes === undefined && spec.validate === undefined) {
     return undefined;
   }
   return async (bytes) => {
@@ -212,16 +193,22 @@ const buildValidate = (spec: HfFileSpec): ValidateBytes | undefined => {
         `fetch-cache: ${spec.path} のバイト数不一致: ${bytes.length} != ${spec.expectedBytes}`,
       );
     }
-    if (spec.sha256 !== undefined) {
-      const actual = await sha256Hex(bytes);
-      if (actual !== spec.sha256) {
-        throw new Error(
-          `fetch-cache: ${spec.path} の SHA-256 不一致: ${actual} != ${spec.sha256}`,
-        );
-      }
-    }
     await spec.validate?.(bytes);
   };
+};
+
+/**
+ * 既定キャッシュキー。`spec.key` があればそれ。無ければ `sha256` があるときだけ内容キー
+ * `["hf", kind, repo, path, sha256]` — revision を含めないので revision bump / 切り替えの
+ * どちらでも再ダウンロードが起きず、`hubUrl` も含めないので同一内容ならミラーを跨いで
+ * エントリと合流を共有する。`sha256` が無ければ undefined = SHA 固定 resolve URL がキー
+ * （鮮度シグナルが無い以上、安定キーは stale 固着を作るため revision 入りに倒す。
+ * DECIDED: docs/decisions/0006 §4）。
+ */
+const defaultKey = (ref: HfRepoRef, spec: HfFileSpec): CacheKey | undefined => {
+  if (spec.key !== undefined) return spec.key;
+  if (spec.sha256 === undefined) return undefined;
+  return ["hf", ref.kind ?? "model", ref.repo, spec.path, spec.sha256];
 };
 
 /** 解決済み revision（不変 SHA）で 1 ファイルを取得する。fetchHfFile / fetchHfFiles の共有経路。 */
@@ -235,13 +222,14 @@ const fetchResolvedFile = (
   const onProgress = opts.onProgress;
   return fetchBytes(url, {
     cache: true,
-    cacheName: opts.cacheName ?? DEFAULT_CACHE_NAME,
+    key: defaultKey(ref, spec),
+    sha256: spec.sha256,
+    // recheck は sha256 とセットでのみ有効（cache 層は単独指定を throw で弾く）。
+    recheck: spec.sha256 === undefined ? undefined : opts.recheck,
     validate: buildValidate(spec),
     decode: spec.decode,
     // 既に持っているバイト数申告を受信バッファの確保ヒントとして流す（検証は validate 側）。
     expectedBytes: spec.expectedBytes,
-    // マーカーは sha256 を宣言したファイルにだけ意味がある（印 = その sha256 の検証済み）。
-    verifiedMarker: opts.trustCachedSha256 === true ? spec.sha256 : undefined,
     onProgress: onProgress === undefined
       ? undefined
       : (progress) => onProgress({ ...progress, path: spec.path }),
@@ -255,7 +243,7 @@ const fetchResolvedFile = (
 /**
  * ファイル指定を HfFileSpec へ正規化する（全入口の合流点）。形式不正の `sha256` はここで
  * fail loud に弾く — 必ず不一致になる申告なので、全量ダウンロードしてから落とすと呼び出し毎に
- * 帯域を捨てることになる（cache 層 `prefetchUrl` の同じガードと語彙を揃える）。
+ * 帯域を捨てることになる（cache 層の同じガードと語彙を揃え、path 付きで報告する）。
  */
 const toSpec = (file: string | HfFileSpec): HfFileSpec => {
   const spec = typeof file === "string" ? { path: file } : file;
@@ -269,7 +257,8 @@ const toSpec = (file: string | HfFileSpec): HfFileSpec => {
 
 /**
  * HuggingFace リポジトリからファイルを 1 つ取得する。可変 ref は現在の SHA へ解決してから
- * SHA 固定 URL で取得・キャッシュする（revision に SHA を渡せば解決リクエストは発生しない）。
+ * SHA 固定 URL で取得する（revision に SHA を渡せば解決リクエストは発生しない）。
+ * `spec.sha256` があればキャッシュキーは内容キー（revision 非依存 — モジュール doc 参照）。
  */
 export const fetchHfFile = async (
   ref: HfRepoRef,
@@ -285,8 +274,6 @@ export const fetchHfFile = async (
 
 /** `prefetchHfFile` のオプション（cache 層 `prefetchUrl` と同じく縮退しない＝fail loud）。 */
 export type HfPrefetchOptions = {
-  /** 既定 "fetch-cache-hf"（fetchHfFile / fetchHfFiles と同じ名前空間）。 */
-  cacheName?: string;
   /** ファイル毎の進捗（path 付き）。既にエントリがあるときは呼ばれない。 */
   onProgress?: (progress: FetchProgress & { path: string }) => void;
   /** fetch へそのまま渡す RequestInit。revision 解決とファイル取得の両方へ渡る。 */
@@ -302,30 +289,28 @@ export type HfPrefetchResult = {
   fetched: boolean;
   /** 温めた対象の解決済みコミット SHA（可変 ref を渡した場合の解決結果）。 */
   revision: string;
-  /** 温めた対象の SHA 固定 URL（= キャッシュキー）。 */
+  /** 温めた対象の SHA 固定 URL（取得元。`spec.sha256` 無しならキャッシュキーでもある）。 */
   url: string;
 };
 
 /**
  * HuggingFace のファイルを**ヒープに全量を載せずに**キャッシュへ温める（streaming prefetch）。
- * 可変 ref は `fetchHfFile` と同じ流儀で現在の SHA へ解決してから SHA 固定 URL で取得するので、
- * 温めたエントリはそのまま `fetchHfFile` のヒットになる。戻り値の `fetched` は「取得して
- * 格納した」なら true、「既にエントリがあって何もしなかった」なら false。
+ * 可変 ref は `fetchHfFile` と同じ流儀で現在の SHA へ解決してから SHA 固定 URL で取得し、
+ * キャッシュキーの既定も `fetchHfFile` と同じ式（`sha256` があれば内容キー、無ければ
+ * resolve URL）なので、**温めたエントリはそのまま `fetchHfFile` のヒットになる**。戻り値の
+ * `fetched` は「取得して格納した」なら true、「既にエントリがあって何もしなかった」なら false。
  *
  * 可変 ref（"main" 等）を渡しても、**どの SHA を温めたかが戻り値の `revision` で分かる**
  * （revision 解決は既存エントリで何もしない場合も必ず走るので、`revision` / `url` は常に
- * 返る）。以後 `fetchHfFile` の `revision` にその SHA を渡せばキャッシュキーが一致し、
- * 温めと読み出しの間に upstream が動いてもキャッシュミス（+ 孤児エントリ）にならない。
+ * 返る）。
  *
  * `spec.sha256` があれば cache 層の通過中検証（`prefetchUrl` の `sha256`）へ自動で流れ、
- * 一致したエントリにだけ検証済みマーカーが焼かれる。以後 `trustCachedSha256: true` で読めば
- * ヒット時の再ハッシュを省ける（数 GB のモデルで起動毎の全量ハッシュを避ける本命の使い方）。
- * NOTE: 焼かれる印が主張するのは sha256 の一致だけ。`expectedBytes` は sha256 一致が
- *       バイト同一を含意するので実質包含されるが、`spec.validate`（カスタム検証）は
- *       `trustCachedSha256` 有効時にヒットで省かれる（DECIDED: docs/decisions/0005）。
- * NOTE: prefetch が spec から見るのは `sha256` だけ。`expectedBytes`（`fetchHfFile` では
- *       検証 + 確保ヒント）も `spec.validate` も、渡しても prefetch では使われない
- *       （バイト列を手元に持たないため。docs/limitations.md）。
+ * 一致したエントリにだけ記録ハッシュが焼かれる。以後の `fetchHfFile` はヒット時に記録との
+ * 突合だけで済む（再ハッシュ無し — 数 GB のモデルで起動毎の全量ハッシュを避ける本命の
+ * 使い方。疑う運用は `HfFetchOptions.recheck`）。
+ * NOTE: prefetch が spec から見るのは `sha256` と `key` だけ。`expectedBytes`
+ *       （`fetchHfFile` では検証 + 確保ヒント）も `spec.validate` も、渡しても prefetch では
+ *       使われない（バイト列を手元に持たないため。docs/limitations.md）。
  *
  * **縮退しない（fail loud）**: `caches` 不在・HTTP エラー・転送中断・put 失敗・sha256 不一致は
  * すべて throw する（cache 層 `prefetchUrl` の契約をそのまま継承）。fallback は `fetchHfFile`。
@@ -348,7 +333,7 @@ export const prefetchHfFile = async (
   const url = hfResolveUrl({ ...ref, revision, path: spec.path });
   const onProgress = opts.onProgress;
   const fetched = await prefetchUrl(url, {
-    cacheName: opts.cacheName ?? DEFAULT_CACHE_NAME,
+    key: defaultKey(ref, spec),
     sha256: spec.sha256,
     onProgress: onProgress === undefined
       ? undefined
