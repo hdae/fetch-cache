@@ -199,14 +199,41 @@ const deserializeKey = (url: string): CacheKey | undefined => {
   }
 };
 
-/** 予約 origin を取得元 URL に使わせないガード（配列キーのエントリと衝突するため）。 */
-const assertNotReservedOrigin = (url: string): void => {
-  if (url.startsWith(KEY_ORIGIN)) {
+/**
+ * 入口の URL 正規化 + 予約 origin ガード。Cache API はキーの URL を自前で正規化する
+ * （scheme/host の小文字化・既定 port 除去・fragment 剥がし等）ため、storage /
+ * single-flight / 予約判定を**同じ正規化済み URL** で行わないと、表記違いで「同一
+ * エントリ・別フライト」の二重取得や、大文字表記による予約 origin ガードのすり抜け
+ * （配列キーのエントリを読み書きできてしまう）が生じる。予約判定は解析済み origin の
+ * 等価比較 — 生文字列の前方一致だと `fetch-cache.invalid.example` のような別 origin を
+ * 過剰拒否する。fragment はここで剥がす（Cache API も network も使わない）。
+ * 解釈できない URL（相対 URL を location の無いランタイムで渡した等）は fail loud。
+ */
+const normalizeUrl = (url: string | URL): string => {
+  let parsed: URL;
+  try {
+    // new URL は入力が URL オブジェクトでも新インスタンスを返す（呼び出し側を変異させない）。
+    parsed = new URL(
+      url,
+      (globalThis as { location?: { href: string } }).location?.href,
+    );
+  } catch (error) {
+    throw new Error(`fetch-cache: URL を解釈できません (${url})`, {
+      cause: error,
+    });
+  }
+  if (parsed.origin === KEY_ORIGIN) {
     throw new Error(
-      `fetch-cache: ${KEY_ORIGIN} はキー直列化の予約 origin です（URL には使えません） (${url})`,
+      `fetch-cache: ${KEY_ORIGIN} はキー直列化の予約 origin です（URL には使えません） (${parsed.href})`,
     );
   }
+  parsed.hash = "";
+  return parsed.href;
 };
+
+/** 予約 origin 配下のエントリ URL か（`listCachedUrls` の除外述語 — ガードと同じ origin 等価判定）。 */
+const isReservedUrl = (url: string): boolean =>
+  new URL(url).origin === KEY_ORIGIN;
 
 // `caches` が無いランタイム（Node.js 等）では undefined（素の fetch へフォールバック）。
 const globalCaches = (): CacheStorage | undefined =>
@@ -586,8 +613,7 @@ export const fetchBytesWithKey = async (
   key: CacheKey | undefined,
   opts: FetchBytesOptions = {},
 ): Promise<Uint8Array> => {
-  const requestUrl = typeof url === "string" ? url : url.href;
-  assertNotReservedOrigin(requestUrl);
+  const requestUrl = normalizeUrl(url);
 
   // Cache API は GET しか格納できない。`caches` の有無に依らず（Node.js でも）一貫して
   // fail loud にするため、ガードは「キャッシュを使う意図」（cache !== false）で判定する。
@@ -756,8 +782,7 @@ export const prefetchUrlWithKey = async (
   key: CacheKey | undefined,
   opts: PrefetchUrlOptions = {},
 ): Promise<boolean> => {
-  const requestUrl = typeof url === "string" ? url : url.href;
-  assertNotReservedOrigin(requestUrl);
+  const requestUrl = normalizeUrl(url);
 
   // Cache API は GET しか格納できない。prefetch は「キャッシュへ入れる」ことが目的なので
   // 非 GET に縮退の余地は無い（fetchBytes の cache:false に相当する逃げ道も持たない）。
@@ -913,8 +938,7 @@ export const decodeGzip = async (raw: Uint8Array): Promise<Uint8Array> => {
  * エントリがあったら true。`caches` が無いランタイム・名前空間ごと存在しない場合は常に false。
  */
 export const evictUrl = async (url: string | URL): Promise<boolean> => {
-  const requestUrl = typeof url === "string" ? url : url.href;
-  assertNotReservedOrigin(requestUrl);
+  const requestUrl = normalizeUrl(url);
   if (typeof caches === "undefined") return false;
   // caches.open は無い名前空間を永続作成してしまう（削除 API の副作用として不適切）。
   // 名前空間が無ければエントリも無い — 触らずに false を返す。
@@ -1028,5 +1052,5 @@ export const listCachedUrls = async (): Promise<string[]> => {
   const keys = await cache.keys();
   return keys
     .map((request) => request.url)
-    .filter((url) => !url.startsWith(KEY_ORIGIN));
+    .filter((url) => !isReservedUrl(url));
 };

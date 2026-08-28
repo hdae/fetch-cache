@@ -968,6 +968,91 @@ Deno.test("予約 origin（fetch-cache.invalid）は取得元 URL に使えな�
   assertEquals(calls.length, 0);
 });
 
+// --- URL 正規化（storage / single-flight / 予約判定を Cache API と同じ正規化で統一）---
+
+Deno.test("URL 正規化: 大文字 scheme/host・既定 port・fragment の表記違いは同一キーにヒットする", async () => {
+  const { fetch, calls } = mockFetch(() => new Response(BYTES_A));
+  try {
+    await fetchBytes(URL_A, { fetch });
+    // Cache API はキーを正規化して格納する。入口で正規化しないと match は当たるのに
+    // ガード・合流キーだけ表記のまま、という食い違いが生じる（レビュー CORE-001）。
+    const spelled = await fetchBytes("HTTPS://EXAMPLE.COM:443/assets/a.bin#f", {
+      fetch,
+    });
+    assertEquals(spelled, BYTES_A);
+    assertEquals(calls.length, 1); // 表記違いでもヒット（network 0 回）。
+    assertEquals(await evictUrl("https://example.com:443/assets/a.bin"), true);
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
+Deno.test("URL 正規化: 表記違いの並行呼び出しも 1 フライトに合流する（二重取得しない）", async () => {
+  const gate = Promise.withResolvers<void>();
+  const { fetch, calls } = mockFetch(async () => {
+    await gate.promise;
+    return new Response(BYTES_A);
+  });
+  try {
+    const first = fetchBytes(URL_A, { fetch });
+    const second = fetchBytes("https://EXAMPLE.com/assets/a.bin#frag", {
+      fetch,
+    });
+    gate.resolve();
+    const [a, b] = await Promise.all([first, second]);
+    assertEquals(a, BYTES_A);
+    assertEquals(b, BYTES_A);
+    assertEquals(calls.length, 1); // 合流キーも正規化済み URL（別フライトにならない）。
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
+Deno.test("予約 origin ガード: 大文字表記もすり抜けず、network に出る前に fail loud", async () => {
+  const { fetch, calls } = mockFetch(() => new Response(BYTES_A));
+  // 大文字表記は Cache API の正規化で予約 origin に到達する（生文字列前方一致では素通り）。
+  const uppercase = "HTTPS://FETCH-CACHE.INVALID/v1/%22x%22";
+  await assertRejects(() => fetchBytes(uppercase, { fetch }), Error, "予約");
+  await assertRejects(() => prefetchUrl(uppercase, { fetch }), Error, "予約");
+  await assertRejects(() => evictUrl(uppercase), Error, "予約");
+  assertEquals(calls.length, 0);
+});
+
+Deno.test({
+  name:
+    "予約 origin ガード: 似て非なる origin は過剰拒否せず、一覧からも巻き添え除外しない",
+  ignore: !runtimeHasCacheKeys,
+  fn: async () => {
+    const { fetch } = mockFetch(() => new Response(BYTES_A));
+    // 生文字列の前方一致だと "https://fetch-cache.invalid" の後にホストが続く別 origin を
+    // 巻き添えにする。origin の等価判定なら正当な URL として通る。
+    const lookalike = "https://fetch-cache.invalid.example.com/a.bin";
+    try {
+      assertEquals(await fetchBytes(lookalike, { fetch }), BYTES_A);
+      assertEquals(await listCachedUrls(), [lookalike]);
+      assertEquals(await evictUrl(lookalike), true);
+    } finally {
+      await caches.delete(CACHE_NAME);
+    }
+  },
+});
+
+Deno.test("解釈できない URL は fail loud（fetch へ丸投げしない）", async () => {
+  const { fetch, calls } = mockFetch(() => new Response(BYTES_A));
+  // location の無いランタイム（Deno）では相対 URL は解決できない = 呼び出し側のバグ。
+  await assertRejects(
+    () => fetchBytes("assets/a.bin", { fetch }),
+    Error,
+    "URL を解釈できません",
+  );
+  await assertRejects(
+    () => prefetchUrl("assets/a.bin", { fetch }),
+    Error,
+    "URL を解釈できません",
+  );
+  assertEquals(calls.length, 0);
+});
+
 // --- sha256（一級の既知ハッシュ検証 + 記録ハッシュ。既定はローカル格納を信頼）---
 
 Deno.test("sha256: network 取得を検証し、記録ハッシュをエントリへ焼く", async () => {
