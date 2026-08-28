@@ -81,6 +81,12 @@ export type FetchBytesOptions = {
   /**
    * true でキャッシュヒット時に実バイトを再ハッシュして期待値と突合する（既定 false =
    * ローカル格納を信頼）。`sha256` とセットでのみ意味を持つ（単独指定は throw）。
+   *
+   * NOTE: 記録が期待と**食い違う**ヒットは `recheck` の値に関わらず再ハッシュせず
+   *       evict → 取り直しになる（記録 ≠ 期待 = 内容が変わった、が正 — ADR 0006 §2）。
+   *       `recheck` が変えるのは「記録が一致したときに信じるか」だけ。single-flight の
+   *       合流者として走った場合、検証失敗は throw のみで evict はしない（self-heal は
+   *       leader / キャッシュヒット経路のみ — docs/limitations.md）。
    */
   recheck?: boolean;
   /**
@@ -782,7 +788,8 @@ export type PrefetchUrlOptions = {
    * （バイト列はヒープに溜めない）。省略時は従来どおり無検証で格納する。
    *
    * 一致したときだけエントリが成立し、同時に記録ハッシュ（この sha256）が焼かれるため、
-   * 以後 `fetchBytes` に同じ `key` と `sha256` を渡せばヒット時の再ハッシュも走らない。
+   * 以後 `fetchBytes` に同じ URL と `sha256` を渡せば（HF 層なら同じ spec が同じ内容キーに
+   * なるため同様に）ヒット時の再ハッシュも走らない。
    * 不一致なら stream を error にして `cache.put` ごと reject させる ＝
    * **記録付きの不正エントリは構造的に生まれない**（DECIDED: docs/decisions/0005 §5）。
    *

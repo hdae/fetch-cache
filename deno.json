@@ -1,6 +1,7 @@
 {
   "name": "@hdae/fetch-cache",
   "version": "0.5.0",
+  "description": "Zero-dependency, URL-keyed download cache for Deno and browsers (Web Cache API), with first-class sha256 integrity and a HuggingFace Hub layer.",
   "license": "MIT",
   "exports": {
     ".": "./src/mod.ts",

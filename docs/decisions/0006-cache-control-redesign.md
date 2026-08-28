@@ -145,7 +145,9 @@ README のキー粒度表に記載する。
   - `verifiedMarker` / `trustCachedSha256` 廃止 → `sha256` + `recheck`。**既定が「ヒット毎
     全量検証」から「記録ハッシュを信頼」へ反転**。旧ヘッダ `x-fetch-cache-verified` は読まない
     （記録なし扱い → 期待 sha256 があれば 1 回だけ再ハッシュされ、以後は…記録は足されない
-    ため毎ヒット計算になる。数 GB 級は取り直しか prefetch での温め直しを推奨）。
+    ため毎ヒット計算になる。数 GB 級は取り直しか prefetch での温め直しを推奨）
+    〔この括弧内は 0008 §2 で改定 — 一致した初回読み出しで記録を backfill するため
+    再ハッシュは 1 回のみ・取り直し不要〕。
   - HF 既定キーの変更により旧エントリはヒットしなくなる（キャッシュなので実害は再取得のみ）。
 - 純 TS sha256（src/sha256.ts）は引き続き streaming prefetch 専用。materialize 経路は native。
 - HF 層の `buildValidate` から sha256 部分が消え、cache 層の `sha256` へ委譲される

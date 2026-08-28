@@ -67,6 +67,12 @@
   ビット腐敗級のまれな事象のみ）。疑う運用は `recheck: true` で毎ヒット再ハッシュへ opt-out
   する。記録が省くのは sha256 の再計算だけで、カスタム `validate` と `decode` は記録一致の
   ヒットでも常に走る。
+- **`sha256` 指定 × 記録なしエントリのヒットは書き込みを伴う（backfill）**（DECIDED:
+  docs/decisions/0008 §2）。ヒット経路が同一バイト列 + 記録ヘッダで 1 回だけ再 put する
+  （Cache API はヘッダのみの更新ができないため N バイトの再書き込み）。この put は並行する
+  `evict` / `clearCache` / `prefetchUrl` と相互排他ではなく last-writer-wins — ハッシュ計算中
+  に走った削除が巻き戻って見えることがある（失われるのは削除・温め直しの「新しさ」のみで、
+  記録と内容の整合は常に保たれる）。
 - **decode 後（利用形）はキャッシュしない**: cache に入るのは常に保存形 raw で、`decode` は
   毎呼び出し実行される（storage 節約と引き換えの CPU コスト。トレードオフの選択は
   呼び出し側 — DECIDED: docs/decisions/0003）。また `validate` は decode 併用時も保存形
@@ -74,6 +80,13 @@
 
 ## HF 層
 
+- **`sha256` の無いファイルは `evict` / `listKeys` の射程外**（DECIDED:
+  docs/decisions/0006 §4・0008）。内容キーになるのは `sha256` 宣言ファイルだけで、無宣言
+  ファイルは SHA 固定 resolve URL がキー（URL キー空間）。repo 単位の掃除は
+  `evict(["hf", kind, repo])`（宣言分）+ `listCachedUrls` を resolve URL 前方一致で絞って
+  `evictUrl`（無宣言分）の 2 段になる。`HfFetchOptions.recheck` も宣言ファイル限定で、
+  無宣言ファイルには効かない（黙って素通し — 疑うなら
+  `evictUrl(hfResolveUrl({ ...ref, revision, path }))` で落として取り直す）。
 - **`fetchHfFiles` の部分キャッシュ**: 1 ファイルの失敗で全体が reject するが、成功済み
   ファイルのキャッシュ書込みは取り消されない（リトライは即ヒット。テストで凍結済み）。
 - **prefetch の複数ファイル版は無い**（DECIDED: docs/decisions/0005 §5）。`prefetchHfFile`

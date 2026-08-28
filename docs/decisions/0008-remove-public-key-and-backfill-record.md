@@ -78,9 +78,10 @@ ergonomics、同ディレクトリ `design-study/`）は次の点で収束した
 
 ## Consequences
 
-- breaking（0.5.0 移行メモに追記）: 0.4.0 の `cacheKey: string` 系にも 0006 実装の `key`
-  にも相当するものが無くなる。キー分離が必要だった用途は HF 層（内容キー自動）へ、それ以外は
-  URL キー + `sha256` で表現する。
+- breaking（0.5.0 移行メモに追記）: 未リリースの旧 0006 案 `cacheKey: string`（0.4.0 には
+  未搭載 — `archive/cachekey-string-draft`）にも 0006 実装の `key` にも相当するものが無くなる。
+  キー分離が必要だった用途は HF 層（内容キー自動）へ、それ以外は URL キー + `sha256` で
+  表現する。
 - 記録 backfill により「ヒット経路は読み取り専用」ではなくなる（記録なし × `sha256` 指定の
   組み合わせでのみ書く）。
 - `src/core.ts` の追加でエントリポイントが「公開ファサード（mod.ts）+ 内部実装（core.ts）」の
