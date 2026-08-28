@@ -1937,6 +1937,54 @@ Deno.test("prefetchUrl: body が null の応答でも sha256 は検証される"
   }
 });
 
+Deno.test("prefetchUrl: 既存エントリの記録が期待 sha256 と食い違えば削除して温め直す", async () => {
+  const { fetch, calls } = mockFetch(() => new Response(BYTES_A));
+  try {
+    // 陳腐化エントリ（中身も記録も別内容）。有無だけの検査だと恒久に温め直せない。
+    const cache = await caches.open(CACHE_NAME);
+    await cache.put(
+      URL_A,
+      new Response(BYTES_B, { headers: { [SHA_HEADER]: BYTES_B_SHA256 } }),
+    );
+
+    assertEquals(
+      await prefetchUrl(URL_A, { fetch, sha256: BYTES_A_SHA256 }),
+      true,
+    );
+    assertEquals(calls.length, 1); // network で温め直す。
+    const warmed = await cache.match(URL_A);
+    assertExists(warmed);
+    assertEquals(warmed.headers.get(SHA_HEADER), BYTES_A_SHA256);
+    assertEquals(new Uint8Array(await warmed.arrayBuffer()), BYTES_A);
+
+    // 記録が一致していれば従来どおり何もしない（false）。
+    assertEquals(
+      await prefetchUrl(URL_A, { fetch, sha256: BYTES_A_SHA256 }),
+      false,
+    );
+    assertEquals(calls.length, 1);
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
+Deno.test("prefetchUrl: 記録なしエントリへの sha256 付き prefetch は検証付きで温め直す", async () => {
+  const { fetch, calls } = mockFetch(() => new Response(BYTES_A));
+  try {
+    await prefetchUrl(URL_A, { fetch }); // 無検証 = 記録なしで温まる。
+    assertEquals(
+      await prefetchUrl(URL_A, { fetch, sha256: BYTES_A_SHA256 }),
+      true,
+    );
+    assertEquals(calls.length, 2); // 既存の実バイトは検証できないため取り直す。
+    const cached = await (await caches.open(CACHE_NAME)).match(URL_A);
+    assertExists(cached);
+    assertEquals(cached.headers.get(SHA_HEADER), BYTES_A_SHA256);
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
 Deno.test("prefetchUrl: sha256 未指定なら記録は付かない（既定の無検証格納は不変）", async () => {
   const { fetch } = mockFetch(() => new Response(BYTES_A));
   try {

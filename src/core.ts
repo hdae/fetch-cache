@@ -752,8 +752,10 @@ export type PrefetchUrlOptions = {
    * 不一致なら stream を error にして `cache.put` ごと reject させる ＝
    * **記録付きの不正エントリは構造的に生まれない**（DECIDED: docs/decisions/0005 §5）。
    *
-   * NOTE: 既存エントリがあるときは network に出ないので検証も走らない（戻り値 false）。
-   *       既存の内容を検証したいなら `fetchBytes`（self-heal 付き）を使うこと。
+   * NOTE: 既存エントリの扱いは記録ハッシュとの突合で決まる — 記録が一致すれば network に
+   *       出ない（戻り値 false）。記録が無い / 食い違うエントリは削除して検証付きで温め直す
+   *       （実バイトそのものは検証しない。既存の内容を検証したいなら `fetchBytes` の
+   *       `recheck` を使うこと。DECIDED: docs/decisions/0008）。
    */
   sha256?: string;
   /**
@@ -773,7 +775,7 @@ export type PrefetchUrlOptions = {
  * URL の内容を**ヒープに全量を載せずに**キャッシュへ格納する（streaming prefetch）。
  * network 応答の body をそのまま `cache.put` へ流すため、数 GB 級でも JS ヒープの使用は
  * チャンク数個ぶんで済む。戻り値は「network から取得して格納した」なら true、
- * 「既にエントリがあって何もしなかった」なら false。
+ * 「既に（`sha256` 指定時は記録の一致する）エントリがあって何もしなかった」なら false。
  *
  * **検証は `sha256` を渡したときだけ**: 渡せば通過中に逐次ハッシュして突合し、一致した
  * ものだけがエントリとして成立する（同時に記録ハッシュが焼かれ、以後の `fetchBytes` は
@@ -845,12 +847,23 @@ export const prefetchUrlWithKey = async (
   }
   const cache = await cacheStorage.open(DEFAULT_CACHE_NAME);
 
-  // 既存エントリがあれば network に出ない（検証はしない — 読み出し側の self-heal に委ねる）。
+  // 既存エントリ検査。`sha256` があるときは記録ハッシュと突合し、一致（= 温め済み）なら
+  // network に出ない。記録が無い / 食い違うエントリは陳腐化・未検証として削除し温め直す
+  // （有無だけの検査だと、読み出し側 self-heal が成立しない 2GiB 超 × 内容切替で手動 evict
+  // が必須になる — DECIDED: docs/decisions/0008）。`sha256` が無ければ従来どおり有無だけ
+  // （実バイトの検証はしない — 読み出し側に委ねる）。
   // match が返す Response の body は消費しないので、接続/ファイルハンドルを解放しておく。
   const existing = await cache.match(storageKey);
   if (existing !== undefined) {
     await existing.body?.cancel().catch(() => {});
-    return false;
+    if (
+      expectedSha256 === undefined ||
+      existing.headers.get(SHA_HEADER) === expectedSha256
+    ) {
+      return false;
+    }
+    // prefetch は縮退しない契約（fail loud）— delete の失敗はそのまま throw でよい。
+    await cache.delete(storageKey);
   }
 
   const fetchImpl = opts.fetch ?? globalThis.fetch;
