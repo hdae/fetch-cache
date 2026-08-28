@@ -39,6 +39,7 @@ export {
   prefetchUrl,
 } from "./core.ts";
 export type {
+  CacheAdminOptions,
   CacheErrorContext,
   CacheKey,
   DecodeBytes,

@@ -2150,6 +2150,78 @@ Deno.test({
   },
 });
 
+/**
+ * global caches とエントリを一切共有しない in-memory CacheStorage。管理 API の `caches` DI が
+ * 本当に DI 先へ向いているかの判別用（global へ委譲するラッパでは区別できない）。keys() を
+ * 自前実装するので keys() 未実装ランタイムでも動く。
+ */
+const memoryCacheStorage = (): CacheStorage => {
+  const urlOf = (request: RequestInfo | URL): string =>
+    typeof request === "string"
+      ? request
+      : request instanceof Request
+      ? request.url
+      : request.href;
+  const namespaces = new Map<
+    string,
+    Map<string, { bytes: Uint8Array; headers: Headers }>
+  >();
+  const openCache = (name: string): Cache => {
+    const entries = namespaces.get(name) ??
+      new Map<string, { bytes: Uint8Array; headers: Headers }>();
+    namespaces.set(name, entries);
+    const wrapper = {
+      match: (request: RequestInfo | URL) => {
+        const entry = entries.get(urlOf(request));
+        return Promise.resolve(
+          entry === undefined
+            ? undefined
+            : new Response(entry.bytes.slice(), { headers: entry.headers }),
+        );
+      },
+      put: async (request: RequestInfo | URL, response: Response) => {
+        const bytes = new Uint8Array(await response.arrayBuffer());
+        entries.set(urlOf(request), { bytes, headers: response.headers });
+      },
+      delete: (request: RequestInfo | URL) =>
+        Promise.resolve(entries.delete(urlOf(request))),
+      keys: () =>
+        Promise.resolve([...entries.keys()].map((url) => new Request(url))),
+    };
+    return wrapper as Cache;
+  };
+  return {
+    open: (name) => Promise.resolve(openCache(name)),
+    has: (name) => Promise.resolve(namespaces.has(name)),
+    delete: (name) => Promise.resolve(namespaces.delete(name)),
+    keys: () => Promise.resolve([...namespaces.keys()]),
+    match: () => Promise.resolve(undefined),
+  };
+};
+
+Deno.test("管理 API: caches DI — DI したストレージのエントリを列挙・削除でき、global には触れない", async () => {
+  const memory = memoryCacheStorage();
+  const { fetch } = mockFetch(() => new Response(BYTES_A));
+  try {
+    await fetchBytes(URL_A, { fetch, caches: memory });
+    await fetchBytesWithKey(URL_B, ["app", "m"], { fetch, caches: memory });
+
+    // DI 側に入っており、global の名前空間は作られない。
+    assertEquals(await listCachedUrls({ caches: memory }), [URL_A]);
+    assertEquals(await listKeys([], { caches: memory }), [["app", "m"]]);
+    assertEquals(await caches.has(CACHE_NAME), false);
+
+    // 削除系も DI 側に向く。
+    assertEquals(await evict(["app"], { caches: memory }), 1);
+    assertEquals(await evictUrl(URL_A, { caches: memory }), true);
+    assertEquals(await listCachedUrls({ caches: memory }), []);
+    assertEquals(await clearCache({ caches: memory }), true);
+    assertEquals(await clearCache({ caches: memory }), false);
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
 Deno.test({
   name:
     "listKeys: 予約 origin 配下に復元できないエントリがあれば fail loud に throw する",

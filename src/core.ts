@@ -979,16 +979,30 @@ export const decodeGzip = async (raw: Uint8Array): Promise<Uint8Array> => {
 };
 
 /**
+ * 管理 API（`evict` / `listKeys` / `evictUrl` / `listCachedUrls` / `clearCache`）共通の
+ * オプション。`caches` は fetchBytes / prefetchUrl と同じ差し替え点 — DI した CacheStorage
+ * に入れたエントリは、同じ CacheStorage を渡さないと列挙も削除もできない。
+ */
+export type CacheAdminOptions = {
+  /** CacheStorage の差し替え（テストの隔離・故障注入用）。既定 globalThis.caches。 */
+  caches?: CacheStorage;
+};
+
+/**
  * 指定 URL のキャッシュエントリを削除する（URL キーのエントリ用 — 配列キーは `evict`）。
  * エントリがあったら true。`caches` が無いランタイム・名前空間ごと存在しない場合は常に false。
  */
-export const evictUrl = async (url: string | URL): Promise<boolean> => {
+export const evictUrl = async (
+  url: string | URL,
+  opts: CacheAdminOptions = {},
+): Promise<boolean> => {
   const requestUrl = normalizeUrl(url);
-  if (typeof caches === "undefined") return false;
-  // caches.open は無い名前空間を永続作成してしまう（削除 API の副作用として不適切）。
+  const cacheStorage = opts.caches ?? globalCaches();
+  if (cacheStorage === undefined) return false;
+  // open は無い名前空間を永続作成してしまう（削除 API の副作用として不適切）。
   // 名前空間が無ければエントリも無い — 触らずに false を返す。
-  if (!(await caches.has(DEFAULT_CACHE_NAME))) return false;
-  const cache = await caches.open(DEFAULT_CACHE_NAME);
+  if (!(await cacheStorage.has(DEFAULT_CACHE_NAME))) return false;
+  const cache = await cacheStorage.open(DEFAULT_CACHE_NAME);
   return await cache.delete(requestUrl);
 };
 
@@ -997,9 +1011,12 @@ export const evictUrl = async (url: string | URL): Promise<boolean> => {
  * `caches` が無いランタイムでは常に false。部分的に消したいときは `evict`（配列キーの
  * プレフィックス）か `evictUrl` を使う。
  */
-export const clearCache = async (): Promise<boolean> => {
-  if (typeof caches === "undefined") return false;
-  return await caches.delete(DEFAULT_CACHE_NAME);
+export const clearCache = async (
+  opts: CacheAdminOptions = {},
+): Promise<boolean> => {
+  const cacheStorage = opts.caches ?? globalCaches();
+  if (cacheStorage === undefined) return false;
+  return await cacheStorage.delete(DEFAULT_CACHE_NAME);
 };
 
 // Cache.keys() の有無はランタイム依存（Deno 2.8 以前は未実装・2.9 で実装、ブラウザは実装済み）。
@@ -1041,11 +1058,15 @@ const matchesPrefix = (url: string, serialized: string): boolean =>
  * （Deno 2.8 以前）では fail loud に throw する（実在エントリを見逃して「消えた」と
  * 誤認させないため）。
  */
-export const evict = async (prefix: CacheKey): Promise<number> => {
+export const evict = async (
+  prefix: CacheKey,
+  opts: CacheAdminOptions = {},
+): Promise<number> => {
   const serialized = serializePrefix(prefix);
-  if (typeof caches === "undefined") return 0;
-  if (!(await caches.has(DEFAULT_CACHE_NAME))) return 0;
-  const cache = requireKeys(await caches.open(DEFAULT_CACHE_NAME));
+  const cacheStorage = opts.caches ?? globalCaches();
+  if (cacheStorage === undefined) return 0;
+  if (!(await cacheStorage.has(DEFAULT_CACHE_NAME))) return 0;
+  const cache = requireKeys(await cacheStorage.open(DEFAULT_CACHE_NAME));
   let count = 0;
   for (const request of await cache.keys()) {
     if (matchesPrefix(request.url, serialized) && await cache.delete(request)) {
@@ -1060,11 +1081,15 @@ export const evict = async (prefix: CacheKey): Promise<number> => {
  * URL キーのエントリは含まない（そちらは `listCachedUrls`）。`caches` が無い・名前空間ごと
  * 存在しない場合は []。`Cache.keys()` 未実装のランタイムでは fail loud に throw する。
  */
-export const listKeys = async (prefix: CacheKey = []): Promise<CacheKey[]> => {
+export const listKeys = async (
+  prefix: CacheKey = [],
+  opts: CacheAdminOptions = {},
+): Promise<CacheKey[]> => {
   const serialized = serializePrefix(prefix);
-  if (typeof caches === "undefined") return [];
-  if (!(await caches.has(DEFAULT_CACHE_NAME))) return [];
-  const cache = requireKeys(await caches.open(DEFAULT_CACHE_NAME));
+  const cacheStorage = opts.caches ?? globalCaches();
+  if (cacheStorage === undefined) return [];
+  if (!(await cacheStorage.has(DEFAULT_CACHE_NAME))) return [];
+  const cache = requireKeys(await cacheStorage.open(DEFAULT_CACHE_NAME));
   const keys: CacheKey[] = [];
   for (const request of await cache.keys()) {
     if (!matchesPrefix(request.url, serialized)) continue;
@@ -1090,10 +1115,13 @@ export const listKeys = async (prefix: CacheKey = []): Promise<CacheKey[]> => {
  *       （fail loud）。実在するエントリを [] と偽ると、この一覧に基づく掃除・表示が静かに
  *       壊れるため、欠落は隠さない。
  */
-export const listCachedUrls = async (): Promise<string[]> => {
-  if (typeof caches === "undefined") return [];
-  if (!(await caches.has(DEFAULT_CACHE_NAME))) return [];
-  const cache = requireKeys(await caches.open(DEFAULT_CACHE_NAME));
+export const listCachedUrls = async (
+  opts: CacheAdminOptions = {},
+): Promise<string[]> => {
+  const cacheStorage = opts.caches ?? globalCaches();
+  if (cacheStorage === undefined) return [];
+  if (!(await cacheStorage.has(DEFAULT_CACHE_NAME))) return [];
+  const cache = requireKeys(await cacheStorage.open(DEFAULT_CACHE_NAME));
   const keys = await cache.keys();
   return keys
     .map((request) => request.url)
