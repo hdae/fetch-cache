@@ -1876,6 +1876,45 @@ Deno.test("prefetchUrl: stream の error を握り潰す非準拠 Cache でも�
   assertEquals(entries.size, 0);
 });
 
+Deno.test("prefetchUrl: 保険 delete まで失敗したら黙殺せず両方の失敗を束ねて throw する", async () => {
+  const wrong = "f".repeat(64);
+  // 二重故障の注入: stream error を無視して put が成功し（非準拠）、さらに delete も落ちる。
+  // 黙殺すると「記録付きの不正エントリが残ったまま成功裏に throw」になり、以後の既定
+  // 読み出しが記録を信じ続ける（fail loudly 違反 — レビュー CX-02）。
+  const brokenCaches: CacheStorage = {
+    open: () => {
+      const wrapper = {
+        match: (_request: RequestInfo | URL) => Promise.resolve(undefined),
+        put: async (_request: RequestInfo | URL, response: Response) => {
+          // body を消費して resolve（消費しないと flush = 不一致検出が走らない）。
+          await response.arrayBuffer().catch(() => {});
+        },
+        delete: (_request: RequestInfo | URL) =>
+          Promise.reject(new Error("delete failed")),
+        keys: () => Promise.resolve([] as Request[]),
+      };
+      return Promise.resolve(wrapper);
+    },
+    has: () => Promise.resolve(false),
+    delete: () => Promise.resolve(false),
+    keys: () => Promise.resolve([]),
+    match: () => Promise.resolve(undefined),
+  };
+  const { fetch } = mockFetch(() =>
+    chunkedResponse([BYTES_A.slice(0, 2), BYTES_A.slice(2)])
+  );
+
+  const error = await assertRejects(
+    () => prefetchUrl(URL_A, { fetch, sha256: wrong, caches: brokenCaches }),
+    AggregateError,
+  );
+  assertStringIncludes(error.message, "SHA-256 不一致");
+  assertStringIncludes(error.message, "削除にも失敗");
+  assertEquals(error.errors.length, 2);
+  assertStringIncludes((error.errors[0] as Error).message, "SHA-256 不一致");
+  assertEquals((error.errors[1] as Error).message, "delete failed");
+});
+
 Deno.test("prefetchUrl: 通過中検証のチャンクは呼び出し側の書き換えから隔離される（記録と中身が乖離しない）", async () => {
   // 呼び出し側が参照を握ったままのバッファを 1 チャンクだけ流し、onProgress（ハッシュ直後・
   // 格納前に同期で走る呼び出し側コード）で書き換える敵対的な輸送を再現する。隔離が無いと

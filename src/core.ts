@@ -955,7 +955,16 @@ export const prefetchUrlWithKey = async (
   if (integrityError !== undefined) {
     // 保険: stream の error を無視してエントリを作る Cache 実装があっても、記録付きの不正
     // エントリだけは残さない（記録は以後の検証を省かせるので、残ると恒久的に効いてしまう）。
-    await cache.delete(storageKey).catch(() => {});
+    try {
+      await cache.delete(storageKey);
+    } catch (deleteError) {
+      // 保険まで失敗 = 記録付きの不正エントリが残っている可能性がある。黙殺すると以後の
+      // 既定読み出しが記録を信じ続けるため、両方の失敗を束ねて fail loud に出す。
+      throw new AggregateError(
+        [integrityError, deleteError],
+        `fetch-cache: prefetch の SHA-256 不一致に加え、不正エントリの削除にも失敗しました（エントリが残っていれば記録が信頼され続けます — evict してください） (${requestUrl})`,
+      );
+    }
     throw integrityError;
   }
   return true;
