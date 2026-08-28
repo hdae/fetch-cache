@@ -1127,7 +1127,7 @@ Deno.test("sha256: 記録一致のヒットは再ハッシュせず信じる（�
   }
 });
 
-Deno.test("sha256: 記録が無いエントリは実ハッシュで突合する（一致なら network 0 回）", async () => {
+Deno.test("sha256: 記録が無いエントリは実ハッシュで突合し、一致したら記録を焼き直す（backfill）", async () => {
   const { fetch, calls } = mockFetch(() => new Response(BYTES_A));
   try {
     // 記録ヘッダ無しの既存エントリ（旧版・無検証 prefetch 相当）。
@@ -1138,11 +1138,83 @@ Deno.test("sha256: 記録が無いエントリは実ハッシュで突合する�
     assertEquals(bytes, BYTES_A);
     assertEquals(calls.length, 0); // 実ハッシュ一致 → 採用（network に出ない）。
 
+    // 一致した記録なしエントリには記録が焼き直される（backfill — 放置すると毎ヒット全量
+    // ハッシュが恒久化する。DECIDED: docs/decisions/0008）。
+    const backfilled = await cache.match(URL_A);
+    assertExists(backfilled);
+    assertEquals(backfilled.headers.get(SHA_HEADER), BYTES_A_SHA256);
+    assertEquals(new Uint8Array(await backfilled.arrayBuffer()), BYTES_A);
+
     // 中身が期待と食い違うエントリは self-heal で取り直す。
     await cache.put(URL_B, new Response(new Uint8Array([9, 9, 9])));
     const healed = await fetchBytes(URL_B, { sha256: BYTES_A_SHA256, fetch });
     assertEquals(healed, BYTES_A);
     assertEquals(calls.length, 1);
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
+Deno.test("sha256: 無検証 prefetch → sha256 付き読み出しで記録が補完され、ヒットのまま", async () => {
+  // 「prefetch は sha256 無し・読み出しは sha256 あり」の組み合わせが記録なしエントリを
+  // 恒久化させないことの外形凍結（設計検討で見つかった病理の再発防止）。
+  const { fetch, calls } = mockFetch(() => new Response(BYTES_A));
+  try {
+    await prefetchUrl(URL_A, { fetch }); // 記録なしで温まる。
+    const bytes = await fetchBytes(URL_A, { sha256: BYTES_A_SHA256, fetch });
+    assertEquals(bytes, BYTES_A);
+    assertEquals(calls.length, 1); // prefetch の 1 回だけ（読み出しはヒット）。
+
+    const cached = await (await caches.open(CACHE_NAME)).match(URL_A);
+    assertExists(cached);
+    assertEquals(cached.headers.get(SHA_HEADER), BYTES_A_SHA256);
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
+Deno.test("sha256: backfill の put 失敗は結果を壊さず通知して続行する（縮退）", async () => {
+  const { fetch, calls } = mockFetch(() => new Response(BYTES_A));
+  const notified: CacheErrorContext[] = [];
+  try {
+    const cache = await caches.open(CACHE_NAME);
+    await cache.put(URL_A, new Response(BYTES_A)); // 記録なし。
+
+    const bytes = await fetchBytes(URL_A, {
+      sha256: BYTES_A_SHA256,
+      fetch,
+      caches: failingCacheStorage({
+        put: () => Promise.reject(new Error("quota exceeded")),
+      }),
+      onCacheError: (context) => notified.push(context),
+    });
+    assertEquals(bytes, BYTES_A);
+    assertEquals(calls.length, 0); // ヒットのまま（backfill 失敗で取り直しはしない）。
+    assertEquals(notified.map((context) => context.op), ["put"]);
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
+Deno.test("sha256: 記録 ≠ 期待は実バイトが期待と一致していても evict して取り直す（判定は記録のみ）", async () => {
+  // 実バイトも食い違うエントリだと「記録を無視して再ハッシュ→self-heal」でも同じ結果に
+  // なり、判定方式を凍結できない。実バイト一致・記録だけ別値のエントリが唯一の判別点。
+  const { fetch, calls } = mockFetch(() => new Response(BYTES_A));
+  try {
+    const cache = await caches.open(CACHE_NAME);
+    await cache.put(
+      URL_A,
+      new Response(BYTES_A, { headers: { [SHA_HEADER]: BYTES_B_SHA256 } }),
+    );
+
+    const bytes = await fetchBytes(URL_A, { sha256: BYTES_A_SHA256, fetch });
+    assertEquals(bytes, BYTES_A);
+    assertEquals(calls.length, 1); // 記録の文字列比較だけで network へ（再ハッシュ判定しない）。
+
+    // 取り直しで記録は正しい値へ置き換わっている。
+    const healed = await cache.match(URL_A);
+    assertExists(healed);
+    assertEquals(healed.headers.get(SHA_HEADER), BYTES_A_SHA256);
   } finally {
     await caches.delete(CACHE_NAME);
   }

@@ -59,10 +59,11 @@ export type FetchBytesOptions = {
    * - **network 取得時**: 取得バイト列を native digest で検証（不一致は throw・キャッシュ
    *   しない）し、通過したエントリに**記録ハッシュ**（`x-fetch-cache-sha256` ヘッダ）を焼く。
    * - **キャッシュヒット時**: 記録ハッシュと期待値の**文字列比較だけ**で鮮度を判定する
-   *   （ハッシュ計算ゼロ）。不一致 = 内容が変わったものとして evict → 取得元から取り直して
-   *   同じキーへ上書き（self-heal）。記録が無いエントリ（旧版・無検証 prefetch 由来）は
-   *   実ハッシュを計算して突合する（一致しても記録は書き足さない — N バイトの再 put を要する
-   *   ため。DECIDED: docs/decisions/0005 と同じ判断）。
+   *   （ハッシュ計算ゼロ・不一致ならバイト列を読みもしない）。不一致 = 内容が変わったものと
+   *   して evict → 取得元から取り直して同じキーへ上書き（self-heal）。記録が無いエントリ
+   *   （旧版・無検証 prefetch 由来）は実ハッシュを計算して突合し、一致したら記録を焼き直す
+   *   （backfill — 1 回きりの再 put で以後のヒットを文字列比較だけにする。DECIDED:
+   *   docs/decisions/0008）。
    *
    * MUST: 記録一致のヒットを信じるのは「ローカル単一ユーザーの格納を信頼する」判断である
    * （ADR 0002 の認証スタンスと同型。格納後の故障は大半が miss として現れ、誤ったバイトの
@@ -503,27 +504,58 @@ const acquireAndDecode = async (
   if (cache !== undefined) {
     let cachedBytes: Uint8Array<ArrayBuffer> | undefined;
     let recorded: string | null = null;
+    let staleRecord = false;
     try {
       const cached = await cache.match(storageKey);
       if (cached !== undefined) {
         recorded = cached.headers.get(SHA_HEADER);
-        cachedBytes = new Uint8Array(await cached.arrayBuffer());
+        if (
+          opts.sha256 !== undefined && recorded !== null &&
+          recorded !== opts.sha256
+        ) {
+          // 記録 ≠ 期待 = 「内容が変わった」。判定は文字列比較のみで、バイト列は読まない
+          // （数 GB の materialize + 再ハッシュを避ける — ADR 0006 §2 / 0008）。実バイトが
+          // たまたま期待と一致していても記録を信じて取り直す（真実源からの再取得が正）。
+          staleRecord = true;
+          await cached.body?.cancel().catch(() => {});
+        } else {
+          cachedBytes = new Uint8Array(await cached.arrayBuffer());
+        }
       }
     } catch (error) {
       // 読出し失敗は miss と同じ扱いで network へ縮退する。
       onCacheError({ op: "match", url: requestUrl, error });
     }
-    if (cachedBytes !== undefined) {
+    if (staleRecord) {
+      // self-heal の evict。失敗でも再取得は続行できる（残ったエントリは次回また試みる）。
+      try {
+        await cache.delete(storageKey);
+      } catch (error) {
+        onCacheError({ op: "delete", url: requestUrl, error });
+      }
+    } else if (cachedBytes !== undefined) {
       try {
         // 鮮度判定: 記録ハッシュが期待値と一致すれば計算ゼロで信じる（既定 = ローカル格納を
-        // 信頼。`recheck` 指定時と、記録が無い/食い違うエントリは実ハッシュで突合する —
-        // 不一致は「内容が変わった/壊れた」として下の catch = self-heal へ）。
+        // 信頼。`recheck` 指定時と、記録が無いエントリは実ハッシュで突合する — 不一致は
+        // 「壊れた」として下の catch = self-heal へ）。
         const trusted = opts.sha256 !== undefined &&
           recorded === opts.sha256 && opts.recheck !== true;
-        return {
-          raw: cachedBytes,
-          decoded: await checkAndDecode(cachedBytes, opts, trusted),
-        };
+        const decoded = await checkAndDecode(cachedBytes, opts, trusted);
+        if (opts.sha256 !== undefined && recorded === null) {
+          // 記録なしエントリ（無検証 prefetch 由来・旧版）の実ハッシュが一致した — 記録を
+          // 焼き直す（backfill）。1 回きりの再 put で以後のヒットが文字列比較だけになる
+          // （放置すると毎ヒット全量ハッシュが恒久化する）。put 失敗は他の cache I/O と
+          // 同じく縮退 + 通知で、返す結果は変わらない（DECIDED: docs/decisions/0008）。
+          try {
+            await cache.put(
+              storageKey,
+              storableResponse(cachedBytes, opts.sha256),
+            );
+          } catch (error) {
+            onCacheError({ op: "put", url: requestUrl, error });
+          }
+        }
+        return { raw: cachedBytes, decoded };
       } catch {
         // 陳腐化/破損キャッシュ（sha256 不一致・validate 拒否・decode 不能）。真実源から
         // 取り直すため evict してフォールスルー（self-heal）。
