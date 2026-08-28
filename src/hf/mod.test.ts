@@ -931,6 +931,43 @@ Deno.test("prefetchHfFile: 形式不正の sha256 は network に出る前に fa
   assertEquals(calls.length, 0);
 });
 
+Deno.test("fetchHfFile / prefetchHfFile: 形式不正の sha256 は可変 ref の解決 API にも出ない", async () => {
+  // 固定 SHA だと解決が元々走らず順序の欠陥を検出できない — 可変 ref が唯一の判別点。
+  const { fetch, calls } = mockFetch(() => Response.json({ sha: SHA }));
+  await assertRejects(
+    () =>
+      fetchHfFile({ repo: REPO }, { path: "a.bin", sha256: "xyz" }, { fetch }),
+    Error,
+    "64 桁の小文字 hex",
+  );
+  await assertRejects(
+    () =>
+      prefetchHfFile({ repo: REPO }, { path: "a.bin", sha256: "xyz" }, {
+        fetch,
+      }),
+    Error,
+    "64 桁の小文字 hex",
+  );
+  assertEquals(calls.length, 0); // spec 検査が解決より先（fail loud は network 0 回で）。
+});
+
+Deno.test("fetchHfFiles: 1 つでも形式不正の spec があれば解決にも兄弟ファイル取得にも出ない", async () => {
+  const { fetch, calls } = mockFetch((url) =>
+    url.includes("/api/") ? Response.json({ sha: SHA }) : new Response(BYTES)
+  );
+  await assertRejects(
+    () =>
+      fetchHfFiles(
+        { repo: REPO },
+        { good: "a.bin", bad: { path: "b.bin", sha256: "not-hex" } },
+        { fetch },
+      ),
+    Error,
+    "64 桁の小文字 hex",
+  );
+  assertEquals(calls.length, 0); // 正常な兄弟ファイル（good）の取得も始まらない。
+});
+
 Deno.test("prefetchHfFile: onProgress には path が付き、init は解決と取得の両方へ渡る", async () => {
   const { fetch, calls, inits } = mockFetch((url) =>
     url.includes("/api/")

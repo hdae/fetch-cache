@@ -234,6 +234,8 @@ const fetchResolvedFile = (
  * fail loud に弾く — 必ず不一致になる申告なので、全量ダウンロードしてから落とすと呼び出し毎に
  * 帯域を捨てることになる（cache 層の同じガードと語彙を揃え、path 付きで報告する）。
  */
+// MUST: 各入口で revision 解決（network）より前に呼ぶ — 後に回すと形式不正でも解決 API
+// 1 発（複数ファイルでは兄弟ファイルの取得開始まで）が漏れる。
 const toSpec = (file: string | HfFileSpec): HfFileSpec => {
   const spec = typeof file === "string" ? { path: file } : file;
   if (spec.sha256 !== undefined && !/^[0-9a-f]{64}$/.test(spec.sha256)) {
@@ -254,11 +256,12 @@ export const fetchHfFile = async (
   file: string | HfFileSpec,
   opts: HfFetchOptions = {},
 ): Promise<Uint8Array> => {
+  const spec = toSpec(file);
   const revision = await resolveHfRevision(ref, {
     fetch: opts.fetch,
     init: opts.init,
   });
-  return await fetchResolvedFile(ref, revision, toSpec(file), opts);
+  return await fetchResolvedFile(ref, revision, spec, opts);
 };
 
 /** `prefetchHfFile` のオプション（cache 層 `prefetchUrl` と同じく縮退しない＝fail loud）。 */
@@ -314,11 +317,11 @@ export const prefetchHfFile = async (
   file: string | HfFileSpec,
   opts: HfPrefetchOptions = {},
 ): Promise<HfPrefetchResult> => {
+  const spec = toSpec(file);
   const revision = await resolveHfRevision(ref, {
     fetch: opts.fetch,
     init: opts.init,
   });
-  const spec = toSpec(file);
   const url = hfResolveUrl({ ...ref, revision, path: spec.path });
   const onProgress = opts.onProgress;
   const fetched = await prefetchUrlWithKey(url, contentKey(ref, spec), {
@@ -342,17 +345,19 @@ export const fetchHfFiles = async <Names extends string>(
   files: Record<Names, string | HfFileSpec>,
   opts: HfFetchOptions = {},
 ): Promise<Record<Names, Uint8Array>> => {
+  // Object.keys は string[] に落ちるため Names[] へ戻す（キーは files の実キーそのもの）。
+  const names = Object.keys(files) as Names[];
+  // 全 spec を先に同期検査 — 1 つでも形式不正なら解決 API にも兄弟ファイルの取得にも出ない。
+  const specs = names.map((name) => toSpec(files[name]));
   const revision = await resolveHfRevision(ref, {
     fetch: opts.fetch,
     init: opts.init,
   });
-  // Object.keys は string[] に落ちるため Names[] へ戻す（キーは files の実キーそのもの）。
-  const names = Object.keys(files) as Names[];
   const entries = await Promise.all(
-    names.map(async (name) =>
+    names.map(async (name, index) =>
       [
         name,
-        await fetchResolvedFile(ref, revision, toSpec(files[name]), opts),
+        await fetchResolvedFile(ref, revision, specs[index], opts),
       ] as const
     ),
   );
