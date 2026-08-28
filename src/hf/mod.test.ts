@@ -312,6 +312,54 @@ Deno.test("fetchHfFile: revision 切り替えで内容が違えば別エント�
   }
 });
 
+Deno.test("fetchHfFile: hubUrl はキーに含まれない（ミラー跨ぎで同一内容がヒットする）", async () => {
+  const { fetch, calls } = mockFetch(() => new Response(BYTES));
+  const spec = { path: "model.onnx", sha256: BYTES_SHA256 };
+  try {
+    await fetchHfFile(
+      { repo: REPO, revision: SHA, hubUrl: "https://mirror.example" },
+      spec,
+      { fetch },
+    );
+    assertEquals(calls, [
+      `https://mirror.example/${REPO}/resolve/${SHA}/model.onnx`,
+    ]);
+
+    // 本家 hub からの読み出しでも同一の内容キー = ヒット（content-addressed の意図どおり
+    // ミラーを跨いで共有する — ADR 0006 §4）。
+    assertEquals(
+      await fetchHfFile({ repo: REPO, revision: SHA }, spec, { fetch }),
+      BYTES,
+    );
+    assertEquals(calls.length, 1);
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
+Deno.test("fetchHfFile: kind はキーに含まれる（model と dataset は同一 repo/path/sha256 でも別エントリ）", async () => {
+  const { fetch, calls } = mockFetch(() => new Response(BYTES));
+  const spec = { path: "model.onnx", sha256: BYTES_SHA256 };
+  try {
+    await fetchHfFile({ repo: REPO, revision: SHA, kind: "dataset" }, spec, {
+      fetch,
+    });
+    const cache = await caches.open(CACHE_NAME);
+    assertExists(
+      await cache.match(
+        keyUrl("hf", "dataset", REPO, "model.onnx", BYTES_SHA256),
+      ),
+    );
+
+    // kind 違いは衝突しない = 別エントリとして network に出る（contentKeyUrl ヘルパは
+    // "model" 固定なので、kind を落とす実装退行はこの対で検出する）。
+    await fetchHfFile({ repo: REPO, revision: SHA }, spec, { fetch });
+    assertEquals(calls.length, 2);
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
 Deno.test("fetchHfFile: 破損キャッシュは sha256 で検知され再取得される（self-heal）", async () => {
   const { fetch, calls } = mockFetch(() => new Response(BYTES));
   try {
@@ -424,7 +472,16 @@ Deno.test("fetchHfFiles: 1 ファイルの失敗で全体が reject し、成功
   // キャッシュ状態を決定的にする（Promise.all は成功分の put を取り消さない）。
   const awaitACached = async (): Promise<void> => {
     const cache = await caches.open(CACHE_NAME);
+    // MUST: 同期待ちポーリングには deadline を置く — 固定名前空間は全テストで共有される
+    // ため、並列実行で他ファイルの caches.delete が割り込むと期限なしループは「赤」では
+    // なく無限ハングになる（ADR 0008。正常時の実測待ちは 1 ループ程度なので 2 秒で十分）。
+    const deadline = performance.now() + 2000;
     while ((await cache.match(urlA)) === undefined) {
+      if (performance.now() > deadline) {
+        throw new Error(
+          "a.bin が期限内にキャッシュされない（逐次実行の前提が崩れている — --parallel 実行の疑い）",
+        );
+      }
       await new Promise((resolve) => setTimeout(resolve, 1));
     }
   };

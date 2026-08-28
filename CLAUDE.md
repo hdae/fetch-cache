@@ -22,6 +22,8 @@ Deno / ブラウザ両対応の「URL ベースの Cache API 付きダウンロ�
 ## Commands
 
 - `deno task check` — fmt (check) + lint + `deno check` + test。Clear before moving on.
+  MUST NOT: `deno test --parallel` — 全テストが固定名前空間 "fetch-cache" を共有するため、
+  ファイル間の割り込みで赤ではなく無限ハングになる（ADR 0008。逐次実行が前提）。
 - `deno task bump <patch|minor|major|pre*>` — deno.json + src/mod.ts の VERSION を 1 コミット
   で同期（pre\* = premajor / preminor / prepatch / prerelease）。
 
@@ -36,7 +38,9 @@ Deno / ブラウザ両対応の「URL ベースの Cache API 付きダウンロ�
 - **依存ゼロ MUST（Web 標準のみ）**: fetch / caches / crypto.subtle / TextEncoder 等。
   実行時依存を追加しない（`@std/assert` はテスト専用）。
 - **ネットワークに出るテスト禁止**: fetch は必ず DI（`opts.fetch`）で偽装する。Cache API は
-  実物を使い、テスト毎にユニークな cacheName + 後始末 `caches.delete`。
+  実物の固定名前空間 "fetch-cache" を使い、テスト毎に finally で `caches.delete`（ADR 0006
+  §3 で cacheName 撤去済み — 旧規約「テスト毎ユニーク cacheName」は廃止）。同期待ちの
+  ポーリングには必ず deadline を置く（期限なしだと並列誤実行時に赤ではなくハングする）。
 - **Fail loudly.** 破損・不正データを黙って握りつぶさない。正規の縮退経路は 2 つだけ:
   キャッシュ破損は evict → 真実源から取り直す self-heal、cache I/O 失敗は network へ
   縮退 + `onCacheError` 通知（DECIDED: docs/decisions/0001）。

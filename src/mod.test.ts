@@ -1291,6 +1291,28 @@ Deno.test("sha256: 記録 ≠ 期待は「内容が変わった」として同�
   }
 });
 
+Deno.test("sha256: 旧ヘッダ x-fetch-cache-verified は記録として読まない（0.5.0 破壊的移行）", async () => {
+  // 旧印は「validate 全体の通過」の意味だったため、sha256 の記録として解釈すると未検証
+  // バイトを恒久的に信頼してしまう（ADR 0006 Consequences）。旧ヘッダ付き・中身別物の
+  // エントリは「記録なし」扱い → 実ハッシュ不一致 → self-heal で取り直されるのが正。
+  const { fetch, calls } = mockFetch(() => new Response(BYTES_A));
+  try {
+    const cache = await caches.open(CACHE_NAME);
+    await cache.put(
+      URL_A,
+      new Response(new Uint8Array([9, 9, 9]), {
+        headers: { "x-fetch-cache-verified": BYTES_A_SHA256 },
+      }),
+    );
+
+    const healed = await fetchBytes(URL_A, { sha256: BYTES_A_SHA256, fetch });
+    assertEquals(healed, BYTES_A);
+    assertEquals(calls.length, 1); // 旧ヘッダを信じず network から取り直す。
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
 Deno.test("sha256: カスタム validate は記録一致のヒットでも常に走る（省くのは再ハッシュだけ）", async () => {
   const { fetch, calls } = mockFetch(() => new Response(BYTES_A));
   let validateCalls = 0;
@@ -1367,9 +1389,18 @@ const manualStream = (): {
   };
 };
 
-/** 送信側がバッファを使い回す応答を流し、受信結果を返す（事前確保のヒント源をテスト側が選ぶ）。 */
+/**
+ * 送信側がバッファを使い回す応答を流し、受信結果を返す（事前確保のヒント源をテスト側が選ぶ）。
+ * `rewriteAfterLastChunk` は 2 チャンク目の読み取り後にもう一度書き換えてから close する —
+ * 蓄積経路（参照を保持して最後に連結）ではこの書き換えが結果へ漏れるため、確保ヒントが
+ * 実際にどちらだったかを結果バイト列だけで判別できる。
+ */
 const fetchWithReusedChunks = async (
-  opts: { expectedBytes?: number; contentLength?: string },
+  opts: {
+    expectedBytes?: number;
+    contentLength?: string;
+    rewriteAfterLastChunk?: boolean;
+  },
 ): Promise<Uint8Array> => {
   const { response, controller } = manualStream();
   const { fetch } = mockFetch(() =>
@@ -1381,15 +1412,25 @@ const fetchWithReusedChunks = async (
   );
   const reused = new Uint8Array([1, 2, 3]);
   const firstChunk = Promise.withResolvers<void>();
+  const secondChunk = Promise.withResolvers<void>();
+  let progressCount = 0;
   const promise = fetchBytes(URL_A, {
     fetch,
     expectedBytes: opts.expectedBytes,
-    onProgress: () => firstChunk.resolve(),
+    onProgress: () => {
+      progressCount++;
+      if (progressCount === 1) firstChunk.resolve();
+      if (progressCount === 2) secondChunk.resolve();
+    },
   });
   controller().enqueue(reused);
   await firstChunk.promise; // 1 チャンク目が読み取られた（事前確保ならコピー済み）。
   reused.set([4, 5, 6]); // 同じインスタンスを書き換えて再送。
   controller().enqueue(reused);
+  if (opts.rewriteAfterLastChunk === true) {
+    await secondChunk.promise; // 2 チャンク目も読み取られた後に書き換える。
+    reused.set([7, 8, 9]);
+  }
   controller().close();
   return await promise;
 };
@@ -1459,14 +1500,26 @@ Deno.test("fetchBytes: 申告に足りない受信は実長へ詰め直して ti
   }
 });
 
-Deno.test("fetchBytes: expectedBytes は content-length より優先される", async () => {
+Deno.test("fetchBytes: expectedBytes は content-length より優先される（判別可能な手順で凍結）", async () => {
   try {
-    // content-length が誤り（3）でも expectedBytes（6）で確保できていれば内容は壊れない。
-    const bytes = await fetchWithReusedChunks({
+    // 対照: content-length(3) だけだと 2 チャンク目で確保が溢れて蓄積経路（参照保持）へ
+    // 落ち、読み取り後の書き換えが結果へ漏れる — この対照があるので本テストは「どちらの
+    // ヒントで確保されたか」を実際に判別している（結果一致だけの旧形はトートロジーだった）。
+    const overflow = await fetchWithReusedChunks({
+      contentLength: "3",
+      rewriteAfterLastChunk: true,
+    });
+    assertEquals(overflow, new Uint8Array([1, 2, 3, 7, 8, 9]));
+    // 対照のエントリを消す（残すと次の呼び出しがヒットして onProgress が発火しない）。
+    await caches.delete(CACHE_NAME);
+
+    // expectedBytes(6) が優先されれば両チャンクとも読み取り時に即コピーされ、書き換えは漏れない。
+    const preferred = await fetchWithReusedChunks({
       expectedBytes: 6,
       contentLength: "3",
+      rewriteAfterLastChunk: true,
     });
-    assertEquals(bytes, new Uint8Array([1, 2, 3, 4, 5, 6]));
+    assertEquals(preferred, new Uint8Array([1, 2, 3, 4, 5, 6]));
   } finally {
     await caches.delete(CACHE_NAME);
   }
