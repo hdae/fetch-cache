@@ -408,6 +408,42 @@ Deno.test("single-flight: 途中合流者には直近の進捗が合流時に 1 
   }
 });
 
+Deno.test("single-flight: 進捗通知中に合流した呼び出しは同じ進捗を二重に受けない", async () => {
+  // leader のリスナー（= 通知の反復中に走る呼び出し側コード）から合流すると、合流時の
+  // 即時リプレイに加えて live な Set の反復にも拾われて同一進捗が 2 回届く事故の凍結。
+  let controller!: ReadableStreamDefaultController<Uint8Array<ArrayBuffer>>;
+  const stream = new ReadableStream<Uint8Array<ArrayBuffer>>({
+    start(c) {
+      controller = c;
+    },
+  });
+  const { fetch } = mockFetch(() => new Response(stream));
+  const joinerProgress: number[] = [];
+  let joiner: Promise<Uint8Array> | undefined;
+  try {
+    const leader = fetchBytes(URL_A, {
+      fetch,
+      onProgress: () => {
+        // 最初の通知の最中に合流者を作る（合流の同期区間でリプレイが走る）。
+        joiner ??= fetchBytes(URL_A, {
+          fetch,
+          onProgress: (p) => joinerProgress.push(p.loaded),
+        });
+      },
+    });
+    controller.enqueue(new Uint8Array([1, 2]));
+    // leader の onProgress は同期で走り、合流者はリプレイ [2] だけを受けているはず。
+    // （二重通知なら [2, 2] になる。）
+    controller.enqueue(new Uint8Array([3, 4, 5]));
+    controller.close();
+    await leader;
+    await joiner;
+    assertEquals(joinerProgress, [2, 5]);
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
 Deno.test("single-flight: onProgress リスナーの throw は取得を巻き添えにしない（隔離+警告）", async () => {
   const gate = Promise.withResolvers<void>();
   const { fetch } = mockFetch(async () => {

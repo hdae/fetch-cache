@@ -740,10 +740,12 @@ export const fetchBytesWithKey = async (
     listeners.add(isolateProgress(opts.onProgress, requestUrl));
   }
   const state: { last?: FetchProgress } = {};
-  // リスナーは登録時点で全て隔離済み（isolateProgress）。
+  // リスナーは登録時点で全て隔離済み（isolateProgress）。反復は snapshot に対して行う —
+  // リスナー（呼び出し側コード）の中で同一キーの fetchBytes が合流すると live な Set には
+  // 反復中に追加され、合流時の即時リプレイと合わせて同じ進捗が二重通知されるため。
   const emit = (progress: FetchProgress): void => {
     state.last = progress;
-    for (const listener of listeners) listener(progress);
+    for (const listener of [...listeners]) listener(progress);
   };
   const promise = acquireAndDecode(requestUrl, storageKey, opts, emit).finally(
     () => {
