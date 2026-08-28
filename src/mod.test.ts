@@ -2065,7 +2065,7 @@ Deno.test("prefetchUrl: body が null の応答でも sha256 は検証される"
   }
 });
 
-Deno.test("prefetchUrl: 既存エントリの記録が期待 sha256 と食い違えば削除して温め直す", async () => {
+Deno.test("prefetchUrl: 既存エントリの記録が期待 sha256 と食い違えば温め直して置換する", async () => {
   const { fetch, calls } = mockFetch(() => new Response(BYTES_A));
   try {
     // 陳腐化エントリ（中身も記録も別内容）。有無だけの検査だと恒久に温め直せない。
@@ -2108,6 +2108,37 @@ Deno.test("prefetchUrl: 記録なしエントリへの sha256 付き prefetch �
     const cached = await (await caches.open(CACHE_NAME)).match(URL_A);
     assertExists(cached);
     assertEquals(cached.headers.get(SHA_HEADER), BYTES_A_SHA256);
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
+Deno.test("prefetchUrl: 温め直しの取得が失敗しても既存エントリは失われない", async () => {
+  // 「先に delete → 取り直し」だと、delete 後の fetch / put 失敗で温め済みの数 GB だけを
+  // 失う失敗窓ができる（レビュー B1）。put は同一キーを置換するので削除は不要 — 失敗時は
+  // 旧エントリがそのまま残ることを凍結する。
+  const { fetch } = mockFetch(() =>
+    new Response("down", { status: 503, statusText: "Service Unavailable" })
+  );
+  try {
+    const cache = await caches.open(CACHE_NAME);
+    // 記録が食い違う既存エントリ（記録なしでも同じ経路）。
+    await cache.put(
+      URL_A,
+      new Response(BYTES_B, { headers: { [SHA_HEADER]: BYTES_B_SHA256 } }),
+    );
+
+    await assertRejects(
+      () => prefetchUrl(URL_A, { fetch, sha256: BYTES_A_SHA256 }),
+      Error,
+      "HTTP 503",
+    );
+
+    // 既存エントリは無傷（内容も記録も温め直し前のまま）。
+    const survived = await cache.match(URL_A);
+    assertExists(survived);
+    assertEquals(survived.headers.get(SHA_HEADER), BYTES_B_SHA256);
+    assertEquals(new Uint8Array(await survived.arrayBuffer()), BYTES_B);
   } finally {
     await caches.delete(CACHE_NAME);
   }

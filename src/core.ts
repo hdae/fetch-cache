@@ -781,8 +781,9 @@ export type PrefetchUrlOptions = {
    * **記録付きの不正エントリは構造的に生まれない**（DECIDED: docs/decisions/0005 §5）。
    *
    * NOTE: 既存エントリの扱いは記録ハッシュとの突合で決まる — 記録が一致すれば network に
-   *       出ない（戻り値 false）。記録が無い / 食い違うエントリは削除して検証付きで温め直す
-   *       （実バイトそのものは検証しない。既存の内容を検証したいなら `fetchBytes` の
+   *       出ない（戻り値 false）。記録が無い / 食い違うエントリは検証付きで温め直して
+   *       **置換**する（温め直しの取得・検証が失敗した場合、既存エントリはそのまま残る。
+   *       実バイトそのものは検証しない — 既存の内容を検証したいなら `fetchBytes` の
    *       `recheck` を使うこと。DECIDED: docs/decisions/0008）。
    */
   sha256?: string;
@@ -876,10 +877,14 @@ export const prefetchUrlWithKey = async (
   const cache = await cacheStorage.open(DEFAULT_CACHE_NAME);
 
   // 既存エントリ検査。`sha256` があるときは記録ハッシュと突合し、一致（= 温め済み）なら
-  // network に出ない。記録が無い / 食い違うエントリは陳腐化・未検証として削除し温め直す
+  // network に出ない。記録が無い / 食い違うエントリは陳腐化・未検証として検証付きで温め直す
   // （有無だけの検査だと、読み出し側 self-heal が成立しない 2GiB 超 × 内容切替で手動 evict
   // が必須になる — DECIDED: docs/decisions/0008）。`sha256` が無ければ従来どおり有無だけ
   // （実バイトの検証はしない — 読み出し側に委ねる）。
+  // MUST NOT: ここで既存エントリを先に delete しない — cache.put は同一キーを置換するので
+  // 削除は不要で、先に消すと以後の fetch / put の失敗で温め済み資産（数 GB）だけを失う
+  // 「失敗窓」になる。温め直しに失敗しても既存エントリは残す（旧内容は次の読み出しの
+  // self-heal が面倒を見る）。
   // match が返す Response の body は消費しないので、接続/ファイルハンドルを解放しておく。
   const existing = await cache.match(storageKey);
   if (existing !== undefined) {
@@ -890,8 +895,6 @@ export const prefetchUrlWithKey = async (
     ) {
       return false;
     }
-    // prefetch は縮退しない契約（fail loud）— delete の失敗はそのまま throw でよい。
-    await cache.delete(storageKey);
   }
 
   const fetchImpl = opts.fetch ?? globalThis.fetch;

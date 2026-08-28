@@ -58,7 +58,8 @@ ergonomics、同ディレクトリ `design-study/`）は次の点で収束した
 - **採用（正当性）**: 予約 origin ガードと single-flight キーの URL 正規化統一（大文字表記の
   ガードすり抜け・表記違い二重フライトの根治）/ 記録不一致ヒットの short-circuit
   （materialize + 再ハッシュせず即 self-heal — 0006 §2 の文字列比較のみ判定を実装に反映）/
-  prefetch の既存エントリ検査に記録突合を追加（記録 ≠ 期待なら削除して温め直し）/
+  prefetch の既存エントリ検査に記録突合を追加（記録 ≠ 期待なら検証付きで温め直して置換 —
+  先行 delete はしない: put が同一キーを置換するので不要で、失敗時に既存資産を失う窓になる）/
   HF 全入口で spec 検査（`toSpec`）を revision 解決より前へ / prefetch 保険 delete の
   失敗黙殺をやめる / `deserializeKey` の復元値型検査 / 進捗リスナー通知の snapshot 反復。
 - **採用（非破壊追加）**: 管理 API 5 本（`evict` / `listKeys` / `evictUrl` /

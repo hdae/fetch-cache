@@ -53,9 +53,9 @@
 - **prefetch の既存エントリ検査は記録ハッシュ突合のみ（実バイトは検証しない）**（DECIDED:
   docs/decisions/0005 §5・0008）。`sha256` 指定時、既存エントリは記録ハッシュとの文字列
   比較で判定する — 一致なら network に出ない（`prefetchUrl` は false、`prefetchHfFile` は
-  `fetched: false`）、記録なし / 不一致なら削除して検証付きで温め直す。**記録が一致しても
-  実バイトそのものは照合しない**（温める API であって検査する API ではない）。既存の内容を
-  疑うなら `fetchBytes` の `recheck` を使う。
+  `fetched: false`）、記録なし / 不一致なら検証付きで温め直して置換する（温め直しが失敗した
+  場合は既存エントリが残る）。**記録が一致しても実バイトそのものは照合しない**（温める API
+  であって検査する API ではない）。既存の内容を疑うなら `fetchBytes` の `recheck` を使う。
 - **`prefetchUrl` は single-flight の対象外**（DECIDED: docs/decisions/0005）。合流契約
   （ADR 0004）は leader の保存形 raw を共有することが本体で、streaming の leader は raw を
   持たない。同一 URL の並行 prefetch はそれぞれ network に出る（内容同一の
