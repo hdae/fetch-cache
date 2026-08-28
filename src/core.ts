@@ -45,7 +45,7 @@ export type DecodeBytes = (raw: Uint8Array) => Uint8Array | Promise<Uint8Array>;
 /**
  * キャッシュキー。直列化（単射・可逆）はライブラリが所有し、キーの**生成**もライブラリ側
  * （HF 層の内容キー `["hf", kind, repo, path, sha256]` 等）に限る — 呼び出し側がキーを
- * 指定する公開オプションは 0.5.0 で撤去した（DECIDED: docs/decisions/0008）。公開 API では
+ * 指定する公開オプションは意図的に持たない（DECIDED: docs/decisions/0008）。公開 API では
  * `evict` / `listKeys` のプレフィックス操作（先頭要素が名前空間の役）にだけ現れる。
  *
  * **同一キーを名乗ること = 内容が同一だという生成側の主張**であり、その正しさをこの層は
