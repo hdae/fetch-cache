@@ -2,38 +2,45 @@
 
 A zero-dependency, URL-keyed download cache for Deno and browsers, built on the
 Web Cache API. Fetch large assets (models, dictionaries, …) once and serve them
-from Cache Storage afterwards — with validation hooks and self-healing for
-corrupted cache entries. A thin HuggingFace Hub layer (`./hf`) is included.
+from Cache Storage afterwards — with sha256 integrity baked into the entries,
+validation hooks, and self-healing for corrupted cache entries. A thin
+HuggingFace Hub layer (`./hf`) is included.
 
 ## Features
 
 - **Zero dependencies**: Web standard APIs only — fetch / caches / crypto.subtle
 - **URL as the key**: just call `fetchBytes(url)` to cache and reuse; switch to
   a plain fetch with `cache: false`
+- **First-class `sha256`**: network responses are verified before they are
+  cached, and the hash is **recorded on the entry** — later cache hits are
+  decided by a string comparison against the record (zero hashing), a mismatch
+  means "content changed" and self-heals, and `recheck: true` re-hashes the
+  bytes when you don't want to trust local storage
 - **Validation & self-heal**: the `validate` hook runs on network responses
   _and_ cache reads; invalid downloads are never cached, and corrupted cache
   entries are evicted and re-fetched from the source of truth (fail loud)
-- **Progress callback**: streaming reads fire `onProgress` per chunk (`total`
-  is present only when the response has content-length)
 - **Decode hook (stored form ≠ usage form)**: keep the cache in the fetched
   form (e.g. gzip) while callers receive the decoded bytes; a failing `decode`
   self-heals exactly like `validate`, and a zero-dependency `decodeGzip`
   helper is included
-- **Single-flight**: concurrent `fetchBytes` calls for the same (cacheName,
-  URL) join one in-flight download (cached GETs only — `cache: false` opts
-  out); joiners share the stored raw bytes and apply their own `validate` /
+- **Single-flight**: concurrent `fetchBytes` calls for the same cache key join
+  one in-flight download (cached GETs only — `cache: false` opts out); joiners
+  share the stored raw bytes and apply their own `sha256` / `validate` /
   `decode`, and `onProgress` fans out to every joined caller
 - **Memory-conscious downloads**: the receive buffer is preallocated when the
   size is known (`expectedBytes`, or content-length as a fallback) and stored
-  without an extra full-size copy, keeping the heap at one copy of the asset
-  instead of two; `prefetchUrl` streams a response straight into the cache and
-  never materializes it at all — optionally verifying a `sha256` **in flight**,
-  so a corrupted download never becomes a cache entry
+  without an extra full-size copy; `prefetchUrl` streams a response straight
+  into the cache and never materializes it at all — optionally verifying a
+  `sha256` **in flight**, so a corrupted download never becomes a cache entry
 - **HuggingFace layer**: resolves mutable refs (`"main"` etc.) to the current
-  commit SHA, then fetches and caches via immutable SHA-pinned URLs; parallel
-  multi-file downloads with `expectedBytes` / `sha256` integrity checks
+  commit SHA, then fetches via immutable SHA-pinned URLs; files with a known
+  `sha256` are cached under a **content key** (`["hf", kind, repo, path,
+  sha256]`), so a revision bump that leaves the bytes unchanged is still a
+  cache hit, and switching revisions keeps both contents side by side
+- **Prefix management**: HF entries can be listed and evicted by key prefix —
+  `evict(["hf", "model", "owner/name"])` frees a whole repo
 - **fetch-compatible options**: pass a standard `RequestInit` via `init` (auth
-  headers for gated repos, `AbortSignal`, …) or swap out `fetch` itself
+  headers for gated repos, `AbortSignal`, …) or swap out `fetch` / `caches`
   (testing, custom transport)
 - **Quota-safe**: cache I/O failures (quota exceeded, broken storage) never
   lose a successful download — they degrade to a plain fetch and notify via
@@ -61,6 +68,36 @@ const bytes = await fetchBytes(url);
 const fresh = await fetchBytes(url, { cache: false });
 ```
 
+### Integrity with `sha256` (recorded hash)
+
+```typescript
+// The downloaded bytes are hashed and compared before anything is cached; the
+// hash is then recorded on the entry (an entry that failed verification never
+// comes into existence).
+const bytes = await fetchBytes(url, { sha256: "1a2b…" }); // 64 lowercase hex digits
+```
+
+On a later call with the same `sha256`, the cache hit is decided by comparing
+the **recorded** hash with the expected one — a string comparison, no hashing,
+and on a mismatch the bytes are not even read. A mismatch means "the content
+this URL should have has changed": the entry is evicted and re-fetched from the
+source (self-heal). An entry that has no record yet (stored by an unverified
+prefetch, or by an older version) is hashed once on its first verified read;
+if it matches, the record is backfilled so later hits are string comparisons
+again.
+
+Trusting the record is a deliberate decision to **trust local storage** (bit
+rot or tampering after the store is not detectable). When you don't:
+
+```typescript
+// Re-hash the actual bytes on this hit and compare against the expectation.
+const bytes = await fetchBytes(url, { sha256: "1a2b…", recheck: true });
+```
+
+`recheck: true` is also the "force re-verify" switch: a corrupted entry fails
+the re-hash and self-heals (evict + refetch), so you never need to evict by
+hand just to be sure.
+
 ### Progress & validation (self-heal)
 
 ```typescript
@@ -72,9 +109,11 @@ const bytes = await fetchBytes("https://example.com/assets/model.onnx", {
 });
 ```
 
-`validate` also applies to cache reads: an entry that fails validation is
-evicted and re-fetched from the network (self-heal). If a freshly fetched
-response fails validation, the error is thrown as-is and nothing is cached.
+`validate` also applies to cache reads — even ones whose recorded hash matched
+(the record only skips re-hashing): an entry that fails validation is evicted
+and re-fetched from the network (self-heal). If a freshly fetched response
+fails validation, the error is thrown as-is and nothing is cached. `validate`
+must not mutate the bytes it receives (they are what gets cached).
 
 ### Decode (store compressed, return decompressed)
 
@@ -117,41 +156,34 @@ import { fetchBytes, prefetchUrl } from "@hdae/fetch-cache";
 
 // Warm the cache without ever holding the file in the JS heap: the network
 // response body is piped straight into Cache Storage.
-// true  = downloaded and stored, false = an entry was already there.
+// true  = downloaded and stored, false = a matching entry was already there.
 await prefetchUrl(url, {
+  sha256: "1a2b…", // hashed chunk by chunk as it streams into the cache
   onProgress: ({ loaded, total }) => console.log(loaded, total),
 });
 
-// Materialize it later, one file at a time — this is where validation happens.
-const bytes = await fetchBytes(url, { validate, expectedBytes: 1234 });
+// Materialize it later — the recorded hash makes this hit a string comparison,
+// so a multi-GB file is never re-hashed on startup.
+const bytes = await fetchBytes(url, { sha256: "1a2b…" });
 ```
 
-Pass a `sha256` to verify **in flight**, without ever buffering the file:
-
-```typescript
-// Hashed chunk by chunk as it streams into the cache. On a mismatch the put is
-// rejected, so the entry never comes into existence; on a match the entry is
-// stored with a verified marker baked in, which the read path can trust.
-await prefetchUrl(url, { sha256: "1a2b…" }); // 64 lowercase hex digits
-
-const bytes = await fetchBytes(url, {
-  validate: verifySha256,
-  verifiedMarker: "1a2b…", // marker matches -> no re-hashing on this hit
-});
-```
+With a `sha256`, the streamed bytes are verified **in flight**: on a mismatch
+the cache put is rejected, so the entry never comes into existence, and on a
+match the recorded hash is baked in. The existing-entry check uses the same
+record: an entry whose record matches is left alone (no network), one with a
+missing or different record is deleted and re-warmed with verification.
 
 Without `sha256`, `prefetchUrl` cannot validate (it never sees the bytes), so
-verification is concentrated in the read path: `fetchBytes` validates, and a bad
-entry is evicted and re-fetched (self-heal). That means unverified bytes may sit
-in the cache until the first read — do pass a `validate` when you read them
-back. Either way, an entry that is already there is never re-checked:
-prefetching returns `false` without touching the network.
+verification is concentrated in the read path: `fetchBytes` validates, and a
+bad entry is evicted and re-fetched (self-heal). Unverified bytes may sit in
+the cache until the first read — do pass a `sha256` or `validate` when you
+read them back.
 
 Unlike `fetchBytes`, `prefetchUrl` never degrades: a missing `caches`, an HTTP
-error, an interrupted transfer, a failing put (quota) or a `sha256` mismatch all
-throw, because storing is its only job and it has no bytes to hand back. Fall
-back to `fetchBytes` when it throws. It is also not part of single-flight — see
-[docs/limitations.md](docs/limitations.md) and
+error, an interrupted transfer, a failing put (quota) or a `sha256` mismatch
+all throw, because storing is its only job and it has no bytes to hand back.
+Fall back to `fetchBytes` when it throws. It is also not part of single-flight
+— see [docs/limitations.md](docs/limitations.md) and
 [ADR 0005](docs/decisions/0005-streaming-prefetch-and-verified-marker.md).
 
 `expectedBytes` on `fetchBytes` is an allocation hint only (never a check): the
@@ -159,26 +191,13 @@ receive buffer is allocated once up front instead of concatenating chunks at
 the end, which halves the peak heap for large files. A wrong hint costs
 nothing — the download simply falls back to the chunked path.
 
-### Skipping re-validation on cache hits (opt-in)
-
-```typescript
-// Bakes the marker into the cached entry after validation succeeds, and skips
-// `validate` on later hits whose marker matches. Default (no marker): every
-// cache hit is validated, exactly as before.
-const bytes = await fetchBytes(url, {
-  validate: async (bytes) => {/* e.g. sha256 check */},
-  verifiedMarker: "1a2b…", // any string; the sha256 hex is the typical choice
-});
-```
-
-This trades verification for start-up time on huge assets, and it is a decision
-to **trust local storage**: the marker only claims "these bytes passed
-`validate` when they were stored", so tampering or bit rot after the fact is
-not detectable (the marker would be rewritten with them). Entries stored before
-you opted in and single-flight joiners carry no marker and are validated
-normally; `prefetchUrl` writes one only when it verified a `sha256` in flight,
-and that marker claims the hash match alone (any extra checks your `validate`
-performs are skipped on those hits).
+One exception: if the allocation itself fails for a size **you** passed
+explicitly, `fetchBytes` cancels the body and throws before reading a single
+byte, instead of degrading. The chunked path ends with a concatenation buffer of
+the very same length, so degrading would only download the whole file and then
+fail for the same reason (Chromium caps a single ArrayBuffer at 2,145,386,496
+bytes). A failing allocation for a server-declared content-length still degrades
+— see [ADR 0007](docs/decisions/0007-explicit-expected-bytes-fail-loud.md).
 
 ### Auth & abort
 
@@ -200,16 +219,31 @@ be cached — pass `cache: false` for other methods. See
 ### Cache management
 
 ```typescript
-import { clearCache, evictUrl, listCachedUrls } from "@hdae/fetch-cache";
+import {
+  clearCache,
+  evict,
+  evictUrl,
+  listCachedUrls,
+  listKeys,
+} from "@hdae/fetch-cache";
 
-await evictUrl("https://example.com/assets/model.onnx"); // delete one entry (true if it existed)
-await clearCache(); // delete the whole namespace (default "fetch-cache")
-await listCachedUrls(); // list cached URLs
+// URL-keyed entries (everything fetched without a sha256-keyed HF spec):
+await evictUrl("https://example.com/assets/model.onnx"); // true if it existed
+await listCachedUrls();
+
+// Array-keyed entries (the HF layer's content keys) are managed by prefix:
+await listKeys(["hf"]); // e.g. [["hf", "model", "owner/name", "model.onnx", "1a2b…"]]
+await evict(["hf", "model", "owner/name"]); // free one repo; returns the count
+
+// Everything at once:
+await clearCache();
 ```
 
-Every function accepts a custom namespace: `fetchBytes(url, { cacheName })`,
-`evictUrl(url, { cacheName })`, `clearCache(cacheName)`,
-`listCachedUrls(cacheName)`.
+Cache keys are generated by the library — URL by default, or the HF layer's
+content key `["hf", kind, repo, path, sha256]`. There is no option to supply
+your own key (removed in 0.5.0 — see
+[ADR 0008](docs/decisions/0008-remove-public-key-and-backfill-record.md)), so
+the prefix vocabulary above is stable and documented.
 
 ### HuggingFace layer (`./hf`)
 
@@ -217,9 +251,9 @@ Every function accepts a custom namespace: `fetchBytes(url, { cacheName })`,
 import { fetchHfFile, fetchHfFiles } from "@hdae/fetch-cache/hf";
 
 // Mutable refs ("main") are resolved to the current commit SHA first, then
-// fetched and cached via the SHA-pinned URL — no network on later calls as
-// long as the SHA is unchanged. Passing a SHA as `revision` skips the
-// resolution request entirely.
+// fetched via the SHA-pinned URL. With a sha256 (from the hub's LFS metadata),
+// the cache key is the content key — a README-only revision bump is still a
+// cache hit, and the hit itself is a string comparison (no re-hashing).
 const model = await fetchHfFile(
   { repo: "owner/name" }, // kind: "model" (default) | "dataset" | "space"
   { path: "model.onnx", sha256: "…", expectedBytes: 1234 },
@@ -238,11 +272,20 @@ const files = await fetchHfFiles(
 files.dict; // Uint8Array
 ```
 
-`expectedBytes` / `sha256` are implemented as the generic layer's `validate`
-hook, so they also protect cache reads (corrupted entries self-heal).
+How the cache key is chosen (per file):
 
-Each file spec also takes a custom `validate` (extra checks on the raw bytes,
-after the built-in ones) and a `decode` (stored form → usage form, per file):
+- **`sha256` given** → content key `["hf", kind, repo, path, sha256]`. The
+  revision is _not_ part of the key: bump the revision without changing the
+  bytes and you keep the hit; switch to a revision with different bytes and
+  the two contents coexist as separate entries (no ping-pong). `hubUrl` is not
+  part of the key either, so the same content is shared across mirrors.
+- **no `sha256`** → the SHA-pinned resolve URL is the key. There is no
+  freshness signal to detect changes with, so the key stays revision-specific
+  (one entry per revision; old ones are cleaned up by prefix or `evictUrl`).
+
+`expectedBytes` (exact length check) and a custom per-file `validate` run on
+top of the generic layer's hooks, so they also protect cache reads. A per-file
+`decode` maps the stored form to the usage form:
 
 ```typescript
 import { decodeGzip } from "@hdae/fetch-cache";
@@ -262,47 +305,49 @@ For multi-GB models, warm the cache first with `prefetchHfFile` — nothing is
 ever held in the JS heap, and a declared `sha256` is verified in flight:
 
 ```typescript
-import { prefetchHfFile, resolveHfRevision } from "@hdae/fetch-cache/hf";
+import {
+  fetchHfFiles,
+  prefetchHfFile,
+  resolveHfRevision,
+} from "@hdae/fetch-cache/hf";
 
 const ref = { repo: "owner/name" };
 // Resolve the revision once, then prefetch against the immutable SHA (no
 // repeated resolution requests, no chance of files drifting across revisions).
 const revision = await resolveHfRevision(ref);
-const spec = { path: "model.safetensors", sha256: "1a2b…" };
+for (const spec of MODEL_FILES) { // [{ path, sha256, expectedBytes }, …]
+  await prefetchHfFile({ ...ref, revision }, spec, {
+    onProgress: ({ path, loaded, total }) => console.log(path, loaded, total),
+  });
+}
 
-// { fetched, revision, url }: fetched is true when it downloaded and stored,
-// false when an entry was already there. A mismatching hash rejects the put,
-// so the entry never comes into existence.
-const warmed = await prefetchHfFile({ ...ref, revision }, spec, {
-  onProgress: ({ path, loaded, total }) => console.log(path, loaded, total),
-});
-
-// `warmed.revision` is the SHA that was actually warmed (it is resolved even
-// when you pass a mutable ref like "main"), and `warmed.url` is the cache key.
-// Pass that SHA back in and the read is guaranteed to hit the entry you warmed,
-// even if the branch moved in between; the marker skips the full re-hash.
-const model = await fetchHfFile({ ...ref, revision: warmed.revision }, spec, {
-  trustCachedSha256: true,
+// Reading the same specs hits the warmed entries; the recorded hashes make
+// every hit a string comparison (a multi-GB model is never re-hashed).
+const parts = await fetchHfFiles({ ...ref, revision }, {
+  model: MODEL_FILES[0],
+  vocab: MODEL_FILES[1],
 });
 ```
 
 There is no multi-file prefetch on purpose: downloading several multi-GB files
-in parallel only splits the same bandwidth, so the loop (and its concurrency) is
-left to you.
+in parallel only splits the same bandwidth, so the loop (and its concurrency)
+is left to you.
 
 A few things worth knowing:
 
-- `trustCachedSha256: true` (opt-in) bakes the declared `sha256` into the
-  cached entry and skips re-hashing on later hits whose marker matches — the
-  `verifiedMarker` trust boundary above applies. Default: every cache hit is
-  hashed in full. Entries warmed by `prefetchHfFile` carry the same marker; note
-  that it certifies the hash only, so a custom `validate` on that file is
-  skipped on those hits.
-- The HF layer uses its own default cache namespace `"fetch-cache-hf"`
-  (the generic layer uses `"fetch-cache"`), so `clearCache()` does not touch
-  HF downloads — use `clearCache("fetch-cache-hf")`.
+- `prefetchHfFile` returns `{ fetched, revision, url }`: `fetched` is true when
+  it downloaded and stored, false when a matching entry was already there.
+  `revision` is the SHA that was actually warmed even if you passed a mutable
+  ref — for specs **without** a `sha256` the key is revision-specific, so pass
+  that SHA back into later reads or the entry is orphaned when the branch
+  moves (with a `sha256` the content key makes this moot).
+- Suspicious about a cached file? `{ recheck: true }` re-hashes declared files
+  on hit and self-heals on a mismatch — no manual eviction needed.
+- Free a repo with `evict(["hf", "model", "owner/name"])`, one file with
+  `evict(["hf", "model", "owner/name", "model.onnx"])` (all contents of it),
+  and inspect what is stored with `listKeys(["hf"])`.
 - `hubUrl` (default `"https://huggingface.co"`) can be overridden to point at
-  a mirror.
+  a mirror; contents with the same `sha256` are shared across hubs.
 - Gated / private repos: pass an Authorization header via `init` — it reaches
   both the revision-resolution call and the file download.
 - If any file fails, `fetchHfFiles` rejects as a whole, but files that already
@@ -313,6 +358,29 @@ A few things worth knowing:
 > `{"sha": …}`, which is observed HuggingFace API behavior, not a documented
 > guarantee (it throws if the response has no `sha`).
 
+## Migrating from 0.4.0
+
+0.5.0 is a breaking release
+([ADR 0006](docs/decisions/0006-cache-control-redesign.md),
+[ADR 0008](docs/decisions/0008-remove-public-key-and-backfill-record.md)):
+
+- **`cacheName` is gone.** The namespace is a fixed internal `"fetch-cache"`;
+  partitioning is done by key prefix. The HF layer's old namespace
+  `"fetch-cache-hf"` is no longer referenced — reclaim the space once with
+  `caches.delete("fetch-cache-hf")`.
+- **`verifiedMarker` / `trustCachedSha256` are gone**, absorbed by the
+  first-class `sha256` + recorded hash. The default is **reversed**: 0.4.0
+  validated every hit unless you opted in; 0.5.0 trusts a matching record
+  unless you pass `recheck: true`. The old `x-fetch-cache-verified` header is
+  not read (treated as "no record"): such entries are re-hashed once on their
+  first verified read and the record is backfilled.
+- **HF default keys changed** to the content key above — entries cached by
+  0.4.0 simply miss and are re-downloaded (it is a cache; no data is lost).
+- **There is no way to supply your own cache key** (0.4.0's `cacheKey` never
+  shipped; 0.5.0 also removed the `key` option that existed during
+  development). If you were partitioning by `cacheName`, use `evictUrl` /
+  `evict` prefixes instead.
+
 ## Runtime support
 
 | Runtime  | Cache                                                           |
@@ -322,14 +390,15 @@ A few things worth knowing:
 | Node.js  | no `caches` — caching skipped, plain fetch (behavior unchanged) |
 
 Caching is an optimization, not a correctness requirement. On runtimes without
-`caches`, `fetchBytes` falls back to a plain fetch (`validate` still applies),
-`evictUrl` / `clearCache` return false, and `listCachedUrls` returns `[]`.
+`caches`, `fetchBytes` falls back to a plain fetch (`sha256` / `validate`
+still apply per call), `evictUrl` / `evict` / `clearCache` return
+false / 0, and `listCachedUrls` / `listKeys` return `[]`.
 
 > [!NOTE]
-> Deno implements `Cache.keys()` since 2.9, so `listCachedUrls` works there.
-> On Deno 2.8 and earlier it throws instead (failing loud rather than passing
-> off existing entries as an empty list). `fetchBytes` caching, `evictUrl`,
-> and `clearCache` work on every Deno version.
+> Deno implements `Cache.keys()` since 2.9, so `listCachedUrls` / `listKeys` /
+> `evict` work there. On Deno 2.8 and earlier they throw instead (failing loud
+> rather than passing off existing entries as an empty list). `fetchBytes`
+> caching, `evictUrl`, and `clearCache` work on every Deno version.
 
 In browsers, keep in mind that Cache Storage is subject to the browser's
 storage eviction policy (consider `navigator.storage.persist()` for large
