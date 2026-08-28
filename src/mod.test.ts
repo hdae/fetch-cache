@@ -16,6 +16,9 @@ import {
   listKeys,
   prefetchUrl,
 } from "./mod.ts";
+// 配列キーの注入導管は内部モジュール専用（公開 `key` オプションは 0.5.0 で撤去 —
+// DECIDED: docs/decisions/0008）。直列化層・プレフィックス管理の契約はここ経由で凍結する。
+import { fetchBytesWithKey, prefetchUrlWithKey } from "./core.ts";
 import {
   chunkedResponse,
   mockFetch,
@@ -464,7 +467,7 @@ Deno.test("single-flight: 同一 URL でも key の有無でキーが違えば�
   });
   try {
     const urlKeyed = fetchBytes(URL_A, { fetch });
-    const arrayKeyed = fetchBytes(URL_A, { fetch, key: ["k1"] });
+    const arrayKeyed = fetchBytesWithKey(URL_A, ["k1"], { fetch });
     gate.resolve();
     await Promise.all([urlKeyed, arrayKeyed]);
     assertEquals(calls.length, 2);
@@ -832,13 +835,14 @@ Deno.test("fetchBytes: cache:false（素の fetch 経路）でも async decode �
   assertEquals(bytes, new Uint8Array([5]));
 });
 
-// --- 配列 key（キャッシュキーと取得元 URL の分離。省略時は URL がそのままキー）---
+// --- 配列 key（キャッシュキーと取得元 URL の分離。HF 層専用の内部導管 —
+//     公開 `key` オプションは 0.5.0 で撤去。DECIDED: docs/decisions/0008）---
 
 Deno.test("key: 格納も読出しもキー側で行い、取得元 URL が変わってもヒットする", async () => {
   const KEY = ["models", "a"] as const;
   const { fetch, calls } = mockFetch(() => new Response(BYTES_A));
   try {
-    const first = await fetchBytes(URL_A, { key: KEY, fetch });
+    const first = await fetchBytesWithKey(URL_A, KEY, { fetch });
     assertEquals(first, BYTES_A);
     assertEquals(calls, [URL_A]); // network に出るのは取得元 URL のまま。
 
@@ -849,7 +853,7 @@ Deno.test("key: 格納も読出しもキー側で行い、取得元 URL が変�
     assertEquals(await cache.match(URL_A), undefined); // URL 側にはエントリを作らない。
 
     // 取得元が別 URL（別 revision 相当）でも、同じ key ならヒットする＝これが分離の目的。
-    const second = await fetchBytes(URL_B, { key: KEY, fetch });
+    const second = await fetchBytesWithKey(URL_B, KEY, { fetch });
     assertEquals(second, BYTES_A);
     assertEquals(calls.length, 1);
     assertEquals(await cache.match(URL_B), undefined);
@@ -868,7 +872,7 @@ Deno.test("key: 破損したキー側エントリを evict して取り直す（
     const cache = await caches.open(CACHE_NAME);
     await cache.put(keyUrl("models", "heal"), new Response(new Uint8Array(3)));
 
-    const healed = await fetchBytes(URL_A, { key: KEY, validate, fetch });
+    const healed = await fetchBytesWithKey(URL_A, KEY, { validate, fetch });
     assertEquals(healed, BYTES_A);
     assertEquals(calls.length, 1); // evict → network 1 回。
 
@@ -876,7 +880,7 @@ Deno.test("key: 破損したキー側エントリを evict して取り直す（
     const cached = await cache.match(keyUrl("models", "heal"));
     assertExists(cached);
     assertEquals(new Uint8Array(await cached.arrayBuffer()), BYTES_A);
-    await fetchBytes(URL_A, { key: KEY, validate, fetch });
+    await fetchBytesWithKey(URL_A, KEY, { validate, fetch });
     assertEquals(calls.length, 1);
   } finally {
     await caches.delete(CACHE_NAME);
@@ -892,8 +896,8 @@ Deno.test("key: 同一 key・別 URL の並行呼び出しは合流し fetch は
   });
   try {
     // 同一キーを名乗る = 内容同一の主張なので、取得元が違っても合流してよい（ADR 0006）。
-    const first = fetchBytes(URL_A, { key: KEY, fetch });
-    const second = fetchBytes(URL_B, { key: KEY, fetch });
+    const first = fetchBytesWithKey(URL_A, KEY, { fetch });
+    const second = fetchBytesWithKey(URL_B, KEY, { fetch });
     gate.resolve();
     const [a, b] = await Promise.all([first, second]);
     assertEquals(a, BYTES_A);
@@ -917,7 +921,7 @@ Deno.test("key: 直列化は単射（セグメント境界・要素型・非 ASC
     ["日本語 キー%22"],
   ];
   try {
-    for (const key of keys) await fetchBytes(URL_A, { key, fetch });
+    for (const key of keys) await fetchBytesWithKey(URL_A, key, { fetch });
     assertEquals(calls.length, keys.length); // 全て別キー = 全て network に出る。
 
     const cache = await caches.open(CACHE_NAME);
@@ -932,26 +936,23 @@ Deno.test("key: 不正な指定は network に出る前に fail loud", async () 
   const { fetch, calls } = mockFetch(() => new Response(BYTES_A));
   // 空配列・オブジェクト要素・非有限数値・cache:false 併用はいずれも呼び出し側のバグ。
   await assertRejects(
-    () => fetchBytes(URL_A, { key: [], fetch }),
+    () => fetchBytesWithKey(URL_A, [], { fetch }),
     Error,
     "1 要素以上",
   );
   await assertRejects(
     () =>
-      fetchBytes(URL_A, {
-        key: ["a", { x: 1 } as unknown as string],
-        fetch,
-      }),
+      fetchBytesWithKey(URL_A, ["a", { x: 1 } as unknown as string], { fetch }),
     Error,
     "string | number | boolean",
   );
   await assertRejects(
-    () => fetchBytes(URL_A, { key: ["a", Number.NaN], fetch }),
+    () => fetchBytesWithKey(URL_A, ["a", Number.NaN], { fetch }),
     Error,
     "有限値",
   );
   await assertRejects(
-    () => fetchBytes(URL_A, { key: ["a"], cache: false, fetch }),
+    () => fetchBytesWithKey(URL_A, ["a"], { cache: false, fetch }),
     Error,
     "cache: false と key",
   );
@@ -1069,12 +1070,11 @@ Deno.test("sha256: 記録 ≠ 期待は「内容が変わった」として同�
   );
   try {
     // revision A を安定キーで取得。
-    await fetchBytes(URL_A, { key: KEY, sha256: BYTES_A_SHA256, fetch });
+    await fetchBytesWithKey(URL_A, KEY, { sha256: BYTES_A_SHA256, fetch });
     assertEquals(calls.length, 1);
 
     // revision B へ切り替え: 記録(A) ≠ 期待(B) → self-heal で B を取得し同じキーへ上書き。
-    const b = await fetchBytes(URL_B, {
-      key: KEY,
+    const b = await fetchBytesWithKey(URL_B, KEY, {
       sha256: BYTES_B_SHA256,
       fetch,
     });
@@ -1086,9 +1086,8 @@ Deno.test("sha256: 記録 ≠ 期待は「内容が変わった」として同�
     assertEquals(cached.headers.get(SHA_HEADER), BYTES_B_SHA256);
 
     // A へ戻すと再取得（= ピンポン）。内容を共存させたいならキーに sha256 を含めること
-    // （docs/limitations.md）。
-    const a = await fetchBytes(URL_A, {
-      key: KEY,
+    // （HF 層の内容キーはそうしている）。
+    const a = await fetchBytesWithKey(URL_A, KEY, {
       sha256: BYTES_A_SHA256,
       fetch,
     });
@@ -1416,7 +1415,7 @@ Deno.test("prefetchUrl: key 側へ格納し、既存エントリ検査も key �
     chunkedResponse([BYTES_A.slice(0, 2), BYTES_A.slice(2)])
   );
   try {
-    assertEquals(await prefetchUrl(URL_A, { key: KEY, fetch }), true);
+    assertEquals(await prefetchUrlWithKey(URL_A, KEY, { fetch }), true);
     assertEquals(calls, [URL_A]);
 
     const cache = await caches.open(CACHE_NAME);
@@ -1426,7 +1425,7 @@ Deno.test("prefetchUrl: key 側へ格納し、既存エントリ検査も key �
     assertEquals(await cache.match(URL_A), undefined);
 
     // 既存エントリ検査もキー側 = 取得元が別 URL でも network に出ない。
-    assertEquals(await prefetchUrl(URL_B, { key: KEY, fetch }), false);
+    assertEquals(await prefetchUrlWithKey(URL_B, KEY, { fetch }), false);
     assertEquals(calls.length, 1);
   } finally {
     await caches.delete(CACHE_NAME);
@@ -1619,7 +1618,7 @@ Deno.test("prefetchUrl: key + sha256 の記録はキー側に焼かれ、同じ 
   const { fetch, calls } = mockFetch(() => new Response(BYTES_A));
   let validateCalls = 0;
   try {
-    await prefetchUrl(URL_A, { key: KEY, sha256: BYTES_A_SHA256, fetch });
+    await prefetchUrlWithKey(URL_A, KEY, { sha256: BYTES_A_SHA256, fetch });
     const cached = await (await caches.open(CACHE_NAME)).match(
       keyUrl("warm", "sha"),
     );
@@ -1628,8 +1627,7 @@ Deno.test("prefetchUrl: key + sha256 の記録はキー側に焼かれ、同じ 
 
     // 温めた側と同じ key + sha256 で読めばヒットし、記録一致で再ハッシュも走らない
     // （カスタム validate は常に走る）。
-    const bytes = await fetchBytes(URL_B, {
-      key: KEY,
+    const bytes = await fetchBytesWithKey(URL_B, KEY, {
       sha256: BYTES_A_SHA256,
       fetch,
       validate: () => {
@@ -1705,8 +1703,7 @@ Deno.test("prefetchUrl: stream の error を握り潰す非準拠 Cache でも�
 
   const error = await assertRejects(
     () =>
-      prefetchUrl(URL_A, {
-        key: KEY,
+      prefetchUrlWithKey(URL_A, KEY, {
         fetch,
         sha256: wrong,
         caches: lenientCaches,
@@ -1876,7 +1873,7 @@ Deno.test({
     try {
       assertEquals(await listCachedUrls(), []);
       await fetchBytes(URL_A, { fetch });
-      await fetchBytes(URL_B, { key: ["app", "models", "a"], fetch });
+      await fetchBytesWithKey(URL_B, ["app", "models", "a"], { fetch });
       // URL 一覧に合成 origin は混ざらず、キー一覧に URL キーは混ざらない。
       assertEquals(await listCachedUrls(), [URL_A]);
       assertEquals(await listKeys(), [["app", "models", "a"]]);
@@ -1903,7 +1900,7 @@ Deno.test({
           ["other"],
         ]
       ) {
-        await fetchBytes(URL_B, { key, fetch });
+        await fetchBytesWithKey(URL_B, key, { fetch });
       }
 
       assertEquals(
@@ -1937,7 +1934,7 @@ Deno.test({
     const { fetch } = mockFetch(() => new Response(BYTES_A));
     try {
       for (const key of [["a"], ["ab"], ["a", "b"]]) {
-        await fetchBytes(URL_A, { key, fetch });
+        await fetchBytesWithKey(URL_A, key, { fetch });
       }
       // ["a"] は自分自身と子孫 ["a","b"] に一致し、["ab"] には一致しない。
       assertEquals(await evict(["a"]), 2);

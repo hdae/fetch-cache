@@ -312,29 +312,6 @@ Deno.test("fetchHfFile: revision 切り替えで内容が違えば別エント�
   }
 });
 
-Deno.test("fetchHfFile: spec.key で既定キーを上書きできる", async () => {
-  const { fetch } = mockFetch(() => new Response(BYTES));
-  try {
-    await fetchHfFile(
-      { repo: REPO, revision: SHA },
-      {
-        path: "model.onnx",
-        sha256: BYTES_SHA256,
-        key: ["my-app", "model.onnx"], // 安定キー（有界ストレージと引き換えのピンポンは cache 層で凍結済み）。
-      },
-      { fetch },
-    );
-    const cache = await caches.open(CACHE_NAME);
-    assertExists(await cache.match(keyUrl("my-app", "model.onnx")));
-    assertEquals(
-      await cache.match(contentKeyUrl("model.onnx", BYTES_SHA256)),
-      undefined,
-    );
-  } finally {
-    await caches.delete(CACHE_NAME);
-  }
-});
-
 Deno.test("fetchHfFile: 破損キャッシュは sha256 で検知され再取得される（self-heal）", async () => {
   const { fetch, calls } = mockFetch(() => new Response(BYTES));
   try {
@@ -913,28 +890,6 @@ Deno.test("prefetchHfFile: 既にエントリがあれば network に出ず fals
       },
     );
     assertEquals(calls.length, 1);
-  } finally {
-    await caches.delete(CACHE_NAME);
-  }
-});
-
-Deno.test("prefetchHfFile: spec.key で温め先を上書きできる（読み出しも同じ key で噛み合う）", async () => {
-  const { fetch, calls } = mockFetch(() => new Response(BYTES));
-  const spec = {
-    path: "model.onnx",
-    sha256: BYTES_SHA256,
-    key: ["my-app", "model"],
-  };
-  try {
-    await prefetchHfFile({ repo: REPO, revision: SHA }, spec, { fetch });
-    const cache = await caches.open(CACHE_NAME);
-    assertExists(await cache.match(keyUrl("my-app", "model")));
-
-    assertEquals(
-      await fetchHfFile({ repo: REPO, revision: SHA }, spec, { fetch }),
-      BYTES,
-    );
-    assertEquals(calls.length, 1); // 同じ key なのでヒット。
   } finally {
     await caches.delete(CACHE_NAME);
   }

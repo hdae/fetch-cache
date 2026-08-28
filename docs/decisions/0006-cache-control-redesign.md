@@ -2,6 +2,10 @@
 
 - 日付: 2026-08-25
 - 状態: 採用（2026-08-25 オーナー承認。0.5.0 として実装）
+- NOTE: リリース前に [0008](0008-remove-public-key-and-backfill-record.md) が一部を改定:
+  §1 の公開 `key` と §4 の `HfFileSpec.key` は撤去（§5 の粒度ポリシーは表現不能化で解消）、
+  §2 の「記録の書き足しはしない」は backfill 採用へ反転、Consequences のテスト隔離は
+  「ファイル間も逐次（--parallel 禁止）」へ訂正。
 - 関連: [0002](0002-request-init-passthrough.md)（キー = URL の出発点）/
   [0004](0004-single-flight-raw-sharing.md)（合流キー）/
   [0005](0005-streaming-prefetch-and-verified-marker.md)（印・streaming prefetch）/

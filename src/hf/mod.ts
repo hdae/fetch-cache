@@ -13,15 +13,17 @@
  * @module
  */
 
+// 配列キーの注入導管（fetchBytesWithKey / prefetchUrlWithKey）は内部モジュールにだけある
+// — 公開 `key` オプションは 0.5.0 で撤去（DECIDED: docs/decisions/0008）。
 import {
   type CacheErrorContext,
   type CacheKey,
   type DecodeBytes,
-  fetchBytes,
+  fetchBytesWithKey,
   type FetchProgress,
-  prefetchUrl,
+  prefetchUrlWithKey,
   type ValidateBytes,
-} from "../mod.ts";
+} from "../core.ts";
 
 export type HfRepoKind = "model" | "dataset" | "space";
 
@@ -45,24 +47,12 @@ export type HfFileSpec = {
    * throw。crypto.subtle 必須 — 無ければ throw）。Hub 上の保存形 raw に対して照合する
    * （LFS メタデータの値がそのまま使える。`decode` 併用時も解凍前）。
    *
-   * 指定すると既定キャッシュキーが内容キー `["hf", kind, repo, path, sha256]` になり、
+   * 指定するとキャッシュキーが内容キー `["hf", kind, repo, path, sha256]` になり、
    * revision を跨いでバイト不変のファイルがヒットする（DECIDED: docs/decisions/0006 §4）。
    * ヒット時の検証は保存時に焼いた記録ハッシュとの突合だけで済む（再ハッシュ無し。
    * 疑う運用は `HfFetchOptions.recheck`）。
    */
   sha256?: string;
-  /**
-   * キャッシュキーの上書き（既定は sha256 の有無で決まる — 上記）。`fetchHfFile` /
-   * `fetchHfFiles` / `prefetchHfFile` の全部で使われる（ファイル毎指定なので複数ファイル
-   * API とも整合する）。
-   *
-   * MUST: キーに内容識別（sha256 要素等）を含めない安定キー（例 `["hf", repo, path]`）で
-   * revision を切り替えると、`sha256` 併用時は同一エントリの上書き＝行き来で毎回再取得
-   * （ピンポン）、`sha256` 無しでは変更を検知できず最初の内容に固着（stale）する。有界
-   * ストレージと引き換えの性質であり、内容を共存させたいならキーに sha256 を含めること
-   * （DECIDED: docs/decisions/0006 §5、docs/limitations.md）。
-   */
-  key?: CacheKey;
   /**
    * カスタム検証。built-in（sha256 → expectedBytes）の後に、同じく保存形 raw に対して走る。
    * throw = 破損扱い（キャッシュヒット側は self-heal）。キャッシュヒットでも**常に**走る
@@ -198,15 +188,15 @@ const buildValidate = (spec: HfFileSpec): ValidateBytes | undefined => {
 };
 
 /**
- * 既定キャッシュキー。`spec.key` があればそれ。無ければ `sha256` があるときだけ内容キー
- * `["hf", kind, repo, path, sha256]` — revision を含めないので revision bump / 切り替えの
- * どちらでも再ダウンロードが起きず、`hubUrl` も含めないので同一内容ならミラーを跨いで
- * エントリと合流を共有する。`sha256` が無ければ undefined = SHA 固定 resolve URL がキー
- * （鮮度シグナルが無い以上、安定キーは stale 固着を作るため revision 入りに倒す。
- * DECIDED: docs/decisions/0006 §4）。
+ * キャッシュキー。`sha256` があるときだけ内容キー `["hf", kind, repo, path, sha256]` —
+ * revision を含めないので revision bump / 切り替えのどちらでも再ダウンロードが起きず、
+ * `hubUrl` も含めないので同一内容ならミラーを跨いでエントリと合流を共有する。`sha256` が
+ * 無ければ undefined = SHA 固定 resolve URL がキー（鮮度シグナルが無い以上、安定キーは
+ * stale 固着を作るため revision 入りに倒す。DECIDED: docs/decisions/0006 §4）。
+ * 呼び出し側による上書き（`HfFileSpec.key`）は 0.5.0 で撤去した（DECIDED: 0008）—
+ * エントリの掃除はこのキー式を前提に `evict(["hf", kind, repo])` 等のプレフィックスで行う。
  */
-const defaultKey = (ref: HfRepoRef, spec: HfFileSpec): CacheKey | undefined => {
-  if (spec.key !== undefined) return spec.key;
+const contentKey = (ref: HfRepoRef, spec: HfFileSpec): CacheKey | undefined => {
   if (spec.sha256 === undefined) return undefined;
   return ["hf", ref.kind ?? "model", ref.repo, spec.path, spec.sha256];
 };
@@ -220,9 +210,8 @@ const fetchResolvedFile = (
 ): Promise<Uint8Array> => {
   const url = hfResolveUrl({ ...ref, revision, path: spec.path });
   const onProgress = opts.onProgress;
-  return fetchBytes(url, {
+  return fetchBytesWithKey(url, contentKey(ref, spec), {
     cache: true,
-    key: defaultKey(ref, spec),
     sha256: spec.sha256,
     // recheck は sha256 とセットでのみ有効（cache 層は単独指定を throw で弾く）。
     recheck: spec.sha256 === undefined ? undefined : opts.recheck,
@@ -296,7 +285,7 @@ export type HfPrefetchResult = {
 /**
  * HuggingFace のファイルを**ヒープに全量を載せずに**キャッシュへ温める（streaming prefetch）。
  * 可変 ref は `fetchHfFile` と同じ流儀で現在の SHA へ解決してから SHA 固定 URL で取得し、
- * キャッシュキーの既定も `fetchHfFile` と同じ式（`sha256` があれば内容キー、無ければ
+ * キャッシュキーも `fetchHfFile` と同じ式（`sha256` があれば内容キー、無ければ
  * resolve URL）なので、**温めたエントリはそのまま `fetchHfFile` のヒットになる**。戻り値の
  * `fetched` は「取得して格納した」なら true、「既にエントリがあって何もしなかった」なら false。
  *
@@ -308,7 +297,7 @@ export type HfPrefetchResult = {
  * 一致したエントリにだけ記録ハッシュが焼かれる。以後の `fetchHfFile` はヒット時に記録との
  * 突合だけで済む（再ハッシュ無し — 数 GB のモデルで起動毎の全量ハッシュを避ける本命の
  * 使い方。疑う運用は `HfFetchOptions.recheck`）。
- * NOTE: prefetch が spec から見るのは `sha256` と `key` だけ。`expectedBytes`
+ * NOTE: prefetch が spec から見るのは `sha256` だけ。`expectedBytes`
  *       （`fetchHfFile` では検証 + 確保ヒント）も `spec.validate` も、渡しても prefetch では
  *       使われない（バイト列を手元に持たないため。docs/limitations.md）。
  *
@@ -332,8 +321,7 @@ export const prefetchHfFile = async (
   const spec = toSpec(file);
   const url = hfResolveUrl({ ...ref, revision, path: spec.path });
   const onProgress = opts.onProgress;
-  const fetched = await prefetchUrl(url, {
-    key: defaultKey(ref, spec),
+  const fetched = await prefetchUrlWithKey(url, contentKey(ref, spec), {
     sha256: spec.sha256,
     onProgress: onProgress === undefined
       ? undefined
