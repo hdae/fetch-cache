@@ -219,7 +219,10 @@ const deserializeKey = (url: string): CacheKey | undefined => {
       return undefined;
     }
   }
-  return elements;
+  // 正規形検査: 復元 → 再直列化が元の URL と一致しないもの（`1e0` 等、値は同じでも表現が
+  // 非正規な JSON）はこの層の直列化を経ていない。受理すると `evict(復元キー)` では消せない
+  // 「幽霊キー」を `listKeys` が正常値として返してしまう。
+  return serializeKey(elements) === url ? elements : undefined;
 };
 
 /**
@@ -235,11 +238,14 @@ const deserializeKey = (url: string): CacheKey | undefined => {
 const normalizeUrl = (url: string | URL): string => {
   let parsed: URL;
   try {
+    // 相対 URL の基底は文書の base URL（<base href> 反映）を優先する — 文書コンテキストの
+    // fetch() の解決規則と揃えるため。document の無いランタイム（Worker）は location へ、
+    // どちらも無いランタイム（Deno / Node.js）は基底なし = 下の catch で fail loud。
     // new URL は入力が URL オブジェクトでも新インスタンスを返す（呼び出し側を変異させない）。
-    parsed = new URL(
-      url,
-      (globalThis as { location?: { href: string } }).location?.href,
-    );
+    const base =
+      (globalThis as { document?: { baseURI?: string } }).document?.baseURI ??
+        (globalThis as { location?: { href: string } }).location?.href;
+    parsed = new URL(url, base);
   } catch (error) {
     throw new Error(`fetch-cache: URL を解釈できません (${url})`, {
       cause: error,

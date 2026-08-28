@@ -25,6 +25,10 @@ import {
   type ValidateBytes,
 } from "../core.ts";
 
+// `./hf` の公開シグネチャに現れる cache 層の型を再公開する（`./hf` 単独利用者が `.`
+// エントリを併せて import しなくて済むように。`.` エントリの同名型と同一物）。
+export type { CacheErrorContext, DecodeBytes, FetchProgress, ValidateBytes };
+
 export type HfRepoKind = "model" | "dataset" | "space";
 
 export type HfRepoRef = {
@@ -34,7 +38,7 @@ export type HfRepoRef = {
   kind?: HfRepoKind;
   /** ブランチ / タグ / コミット SHA。既定 "main"。 */
   revision?: string;
-  /** 既定 "https://huggingface.co"（ミラー用に差し替え可能）。 */
+  /** 既定 "https://huggingface.co"（ミラー用に差し替え可能）。末尾の `/` は吸収される。 */
   hubUrl?: string;
 };
 
@@ -69,6 +73,11 @@ export type HfFileSpec = {
 
 const DEFAULT_HUB_URL = "https://huggingface.co";
 
+// hubUrl の末尾スラッシュは吸収する。生連結だと `https://mirror.example/` という自然な指定が
+// `//owner/...` の二重スラッシュ URL になり、404 や（sha256 無しの）別キー重複保存を生む。
+const hubBase = (hubUrl: string | undefined): string =>
+  (hubUrl ?? DEFAULT_HUB_URL).replace(/\/+$/, "");
+
 // resolve URL は kind でパス接頭辞が、API は複数形セグメントが変わる。
 const RESOLVE_PREFIX: Record<HfRepoKind, string> = {
   model: "",
@@ -100,7 +109,7 @@ const encodePath = (path: string): string =>
  * `/` は構造要素なのでエンコードしない。
  */
 export const hfResolveUrl = (ref: HfRepoRef & { path: string }): string => {
-  const hubUrl = ref.hubUrl ?? DEFAULT_HUB_URL;
+  const hubUrl = hubBase(ref.hubUrl);
   const kind = ref.kind ?? "model";
   const revision = ref.revision ?? "main";
   return `${hubUrl}/${RESOLVE_PREFIX[kind]}${ref.repo}/resolve/${
@@ -121,7 +130,7 @@ export const resolveHfRevision = async (
 ): Promise<string> => {
   const revision = ref.revision ?? "main";
   if (isCommitSha(revision)) return revision;
-  const hubUrl = ref.hubUrl ?? DEFAULT_HUB_URL;
+  const hubUrl = hubBase(ref.hubUrl);
   const kind = ref.kind ?? "model";
   const url = `${hubUrl}/api/${API_SEGMENT[kind]}/${ref.repo}/revision/${
     encodeURIComponent(revision)

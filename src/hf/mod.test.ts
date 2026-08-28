@@ -84,6 +84,22 @@ Deno.test("hfResolveUrl: revision は丸ごと・path はセグメント毎に p
   );
 });
 
+Deno.test("hfResolveUrl / resolveHfRevision: hubUrl の末尾スラッシュは吸収される", async () => {
+  // 生連結だと `https://mirror.example/` の自然な指定が `//owner/...` になり、404 や
+  // （sha256 無しの）別 URL キー重複保存を生む。
+  assertEquals(
+    hfResolveUrl({ repo: REPO, hubUrl: "https://mirror.example/", path: "x" }),
+    "https://mirror.example/owner/name/resolve/main/x",
+  );
+  const { fetch, calls } = mockFetch(() => Response.json({ sha: SHA }));
+  await resolveHfRevision({ repo: REPO, hubUrl: "https://mirror.example//" }, {
+    fetch,
+  });
+  assertEquals(calls, [
+    "https://mirror.example/api/models/owner/name/revision/main",
+  ]);
+});
+
 Deno.test("isCommitSha: 40桁小文字 hex のみ true", () => {
   assertEquals(isCommitSha(SHA), true);
   assertEquals(isCommitSha("main"), false);

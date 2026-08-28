@@ -2407,11 +2407,14 @@ Deno.test({
   ignore: !runtimeHasCacheKeys,
   fn: async () => {
     // serializeKey は string | number(有限) | boolean しか受けない。復元側が型検査しないと
-    // 外部直書きの異常エントリが CacheKey を騙って listKeys から漏れ出す。
+    // 外部直書きの異常エントリが CacheKey を騙って listKeys から漏れ出す。"1e0" は型としては
+    // 有限数値 1 だが再直列化が "1" になる非正規表現 — 受理すると evict([1]) で消せない
+    // 幽霊キーになるため、round-trip 検査で弾く。
     for (
       const segment of [
         "null",
         "1e400",
+        "1e0",
         encodeURIComponent(JSON.stringify([1])),
       ]
     ) {
