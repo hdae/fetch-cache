@@ -2280,3 +2280,36 @@ Deno.test({
     }
   },
 });
+
+Deno.test({
+  name:
+    "listKeys: JSON として解析できても型範囲外の要素（null / 1e400 / 配列）は復元不能として fail loud",
+  ignore: !runtimeHasCacheKeys,
+  fn: async () => {
+    // serializeKey は string | number(有限) | boolean しか受けない。復元側が型検査しないと
+    // 外部直書きの異常エントリが CacheKey を騙って listKeys から漏れ出す。
+    for (
+      const segment of [
+        "null",
+        "1e400",
+        encodeURIComponent(JSON.stringify([1])),
+      ]
+    ) {
+      try {
+        const cache = await caches.open(CACHE_NAME);
+        await cache.put(
+          `https://fetch-cache.invalid/v1/${segment}`,
+          new Response(BYTES_A),
+        );
+        const error = await assertRejects(() => listKeys(), Error, undefined);
+        assertStringIncludes(
+          error.message,
+          "復元できない",
+          `segment=${segment}`,
+        );
+      } finally {
+        await caches.delete(CACHE_NAME);
+      }
+    }
+  },
+});

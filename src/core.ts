@@ -187,17 +187,32 @@ const serializeKey = (key: CacheKey): string => {
     key.map((element) => encodeURIComponent(JSON.stringify(element))).join("/");
 };
 
-/** 予約 origin URL → 配列キーへの復元。この層の直列化を経ていない URL は undefined。 */
+/**
+ * 予約 origin URL → 配列キーへの復元。この層の直列化を経ていない URL は undefined。
+ * JSON として解析できても要素型が `serializeKey` の受け入れ範囲外（null・配列・
+ * オブジェクト・`1e400` 由来の Infinity 等）なら同じく undefined — 型キャストで通すと
+ * `listKeys` の fail loud 契約（外部直書きの検出）が骨抜きになる。
+ */
 const deserializeKey = (url: string): CacheKey | undefined => {
   if (!url.startsWith(KEY_PREFIX)) return undefined;
-  try {
-    return url.slice(KEY_PREFIX.length).split("/").map((segment) =>
-      JSON.parse(decodeURIComponent(segment)) as string | number | boolean
-    );
-  } catch {
-    // 復元不能 = この層の直列化を経ていない（外部直書き等）。判定は呼び出し側に委ねる。
-    return undefined;
+  const elements: (string | number | boolean)[] = [];
+  for (const segment of url.slice(KEY_PREFIX.length).split("/")) {
+    let value: unknown;
+    try {
+      value = JSON.parse(decodeURIComponent(segment));
+    } catch {
+      // 復元不能 = この層の直列化を経ていない（外部直書き等）。判定は呼び出し側に委ねる。
+      return undefined;
+    }
+    if (typeof value === "string" || typeof value === "boolean") {
+      elements.push(value);
+    } else if (typeof value === "number" && Number.isFinite(value)) {
+      elements.push(value);
+    } else {
+      return undefined;
+    }
   }
+  return elements;
 };
 
 /**
