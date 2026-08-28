@@ -289,7 +289,11 @@ export type HfPrefetchResult = {
  * HuggingFace のファイルを**ヒープに全量を載せずに**キャッシュへ温める（streaming prefetch）。
  * 可変 ref は `fetchHfFile` と同じ流儀で現在の SHA へ解決してから SHA 固定 URL で取得し、
  * キャッシュキーも `fetchHfFile` と同じ式（`sha256` があれば内容キー、無ければ
- * resolve URL）なので、**温めたエントリはそのまま `fetchHfFile` のヒットになる**。戻り値の
+ * resolve URL）なので、**温めたエントリはそのまま `fetchHfFile` のヒットになる** — ただし
+ * `sha256` の無い spec ではキーが revision（解決済み SHA）入りの URL のため、温めてから
+ * 読むまでの間に upstream の revision が動くと丸ごとミスし、旧エントリは孤児になる。可変
+ * ref で温めるときは戻り値の `revision` を以後の読み出しへ渡し回すこと（`sha256` があれば
+ * 内容キー = revision 非依存なので渡し回しは不要）。戻り値の
  * `fetched` は「取得して格納した」なら true、「既にエントリがあって何もしなかった」なら false。
  *
  * 可変 ref（"main" 等）を渡しても、**どの SHA を温めたかが戻り値の `revision` で分かる**

@@ -26,7 +26,14 @@ export type CacheErrorContext = {
   error: unknown;
 };
 
-/** 保存形（raw）バイト列の検証。throw = 破損。 */
+/**
+ * 保存形（raw）バイト列の検証。throw = 破損。
+ *
+ * MUST NOT: 受け取った `bytes` を破壊的に変更しない — network 経路では sha256 計算後・
+ * cache.put 前に同じ配列が渡るため、変更すると「記録ハッシュは正しいのに中身が違う」
+ * エントリが正規経路から作れてしまう。数 GB を扱う層なのでコピー隔離はせず契約で守る
+ * （`decode` の raw 非破壊 MUST と同じ流儀）。
+ */
 export type ValidateBytes = (bytes: Uint8Array) => void | Promise<void>;
 
 /**
@@ -631,7 +638,11 @@ const acquireAndDecode = async (
  * 行く」意図を尊重して合流しない）。同一の内容キーを名乗る別 URL の呼び出しも合流する（同一
  * キー = 内容同一という生成側の主張をそのまま採る — DECIDED: docs/decisions/0006）。合流者には
  * 保存形 raw が共有され、`sha256` / `validate` / `decode` は各呼び出しが自分のオプションで
- * 適用する（合流者は記録ハッシュを見ない = 常に自分の検証を走らせる安全側）。取得失敗は
+ * 適用する（合流者は記録ハッシュを見ない = 常に自分の検証を走らせる安全側）。合流者側の
+ * 検証失敗はその呼び出しの throw に留まり **evict はしない** — self-heal が走るのは
+ * キャッシュヒット経路（leader）だけで、合流者が evict すると leader が今格納した正常
+ * エントリを消し得る（検証条件の違う並行呼び出しを混ぜる運用では注意。
+ * docs/limitations.md）。取得失敗は
  * 合流した全呼び出しへ伝播し、フライト終了後の呼び出しは新規に取得する（失敗は記憶しない）。
  * `onProgress` は合流者へも fan-out され、合流時に直近の進捗が 1 回即時通知される。
  * NOTE: 合流者の `fetch` / `caches` / `init` / `onCacheError` / `expectedBytes` は使われない
