@@ -1072,6 +1072,77 @@ Deno.test("fetchHfFiles: 1 つでも形式不正の spec があれば解決に�
   assertEquals(calls.length, 0); // 正常な兄弟ファイル（good）の取得も始まらない。
 });
 
+Deno.test("fetchHfFile / fetchHfFiles: into の容量を超える expectedBytes は可変 ref の解決 API にも出ない", async () => {
+  // 固定 SHA だと解決が元々走らず順序の欠陥を検出できない — 可変 ref が唯一の判別点。
+  const { fetch, calls } = mockFetch((url) =>
+    url.includes("/api/") ? Response.json({ sha: SHA }) : new Response(BYTES)
+  );
+  const into = new Uint8Array(new ArrayBuffer(2)).fill(0xff);
+  const error = await assertRejects(
+    () =>
+      fetchHfFile(
+        { repo: REPO },
+        { path: "model.onnx", expectedBytes: BYTES.length, into },
+        { fetch },
+      ),
+    Error,
+  );
+  assertStringIncludes(error.message, "into の容量 2 バイト");
+  assertStringIncludes(error.message, `expectedBytes ${BYTES.length} バイト`);
+  assertStringIncludes(error.message, "model.onnx");
+
+  await assertRejects(
+    () =>
+      fetchHfFiles(
+        { repo: REPO },
+        {
+          good: "a.bin",
+          bad: { path: "b.bin", expectedBytes: BYTES.length, into },
+        },
+        { fetch },
+      ),
+    Error,
+    "into の容量 2 バイト",
+  );
+  // 解決 API にも、正常な兄弟ファイル（good）の取得にも出ない。
+  assertEquals(calls.length, 0);
+  assertEquals(
+    into,
+    new Uint8Array(new ArrayBuffer(2)).fill(0xff),
+    "落ちた申告で器を書き換えている",
+  );
+});
+
+Deno.test("prefetchHfFile: spec.into は見ない（器は無傷のまま温まる）", async () => {
+  // prefetch はバイト列を手元に持たない（streaming put）ので into は使えない。型としては
+  // 同じ HfFileSpec が通るため、誤って転送すると器に何が書かれるか未定義のまま緑になる。
+  const { fetch, calls } = mockFetch(() => new Response(BYTES));
+  const into = new Uint8Array(new ArrayBuffer(16)).fill(0xff);
+  const spec = { path: "model.onnx", sha256: BYTES_SHA256, into };
+  try {
+    const result = await prefetchHfFile({ repo: REPO, revision: SHA }, spec, {
+      fetch,
+    });
+    assertEquals(result.fetched, true);
+    assertEquals(
+      into,
+      new Uint8Array(new ArrayBuffer(16)).fill(0xff),
+      "prefetch が器を書き換えている",
+    );
+
+    // 対照: 同じ spec でも fetchHfFile 側では器へ流れる（無視するのは prefetch だけ）。
+    const bytes = await fetchHfFile({ repo: REPO, revision: SHA }, spec, {
+      fetch,
+    });
+    assertStrictEquals(bytes.buffer, into.buffer);
+    assertEquals(bytes.byteOffset, 0);
+    assertEquals(bytes, BYTES);
+    assertEquals(calls.length, 1); // 温めたエントリへのヒット。
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
 Deno.test("prefetchHfFile: onProgress には path が付き、init は解決と取得の両方へ渡る", async () => {
   const { fetch, calls, inits } = mockFetch((url) =>
     url.includes("/api/")

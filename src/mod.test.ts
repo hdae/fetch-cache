@@ -1870,6 +1870,373 @@ Deno.test("fetchBytes: cache:false でも into は効く（受信を器へ書く
   assertEquals(bytes, BYTES_A);
 });
 
+/**
+ * body を持たない応答（arrayBuffer フォールバック経路の再現）。`new Response(null)` は
+ * 中身まで空になるので使えない — 中身のある応答の body だけを潰す。
+ */
+const bodilessResponse = (bytes: Uint8Array<ArrayBuffer>): Response => {
+  const response = new Response(bytes);
+  Object.defineProperty(response, "body", { value: null });
+  return response;
+};
+
+Deno.test("fetchBytes: body を持たない応答でも into へ写し、容量不足は throw する", async () => {
+  const { fetch } = mockFetch(() => bodilessResponse(BYTES_A));
+  const into = new Uint8Array(new ArrayBuffer(8)).fill(0xff);
+  try {
+    const bytes = await fetchBytes(URL_A, { fetch, into });
+    assertPrefixView(bytes, into, BYTES_A.length);
+    assertEquals(bytes, BYTES_A);
+    assertEquals(into[BYTES_A.length], 0xff, "実長の外へ書いている");
+    // 格納されるのは器全体ではなく実長ぶん（prefix view）。
+    const cache = await caches.open(CACHE_NAME);
+    const cached = await cache.match(URL_A);
+    assertExists(cached);
+    assertEquals(new Uint8Array(await cached.arrayBuffer()), BYTES_A);
+
+    // 容量不足は他経路と同じく fail loud（写せない先に黙って縮退しない）。
+    const error = await assertRejects(
+      () =>
+        fetchBytes(URL_B, { fetch, into: new Uint8Array(new ArrayBuffer(3)) }),
+      Error,
+      "into の容量 3 バイト",
+    );
+    assertStringIncludes(error.message, "受信 5 バイト");
+    assertEquals(
+      await cache.match(URL_B),
+      undefined,
+      "落ちた取得をキャッシュしている",
+    );
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
+Deno.test("fetchBytes: 記録不一致のヒットは self-heal し、network 内容を器へ書き直す", async () => {
+  const { fetch, calls } = mockFetch(() => new Response(BYTES_A));
+  const into = new Uint8Array(new ArrayBuffer(8)).fill(0xff);
+  try {
+    // 記録（BYTES_B のハッシュ）が期待（BYTES_A のハッシュ）と食い違うエントリ。
+    const cache = await caches.open(CACHE_NAME);
+    await cache.put(
+      URL_A,
+      new Response(BYTES_B, { headers: { [SHA_HEADER]: BYTES_B_SHA256 } }),
+    );
+
+    const bytes = await fetchBytes(URL_A, {
+      fetch,
+      into,
+      sha256: BYTES_A_SHA256,
+    });
+    // 器を指すのは self-heal 後の network 内容（フォールスルー先へ into が渡っている）。
+    assertPrefixView(bytes, into, BYTES_A.length);
+    assertEquals(bytes, BYTES_A);
+    assertEquals(into[BYTES_A.length], 0xff, "実長の外へ書いている");
+    assertEquals(calls.length, 1);
+
+    // エントリは新内容・新記録へ置換されている。
+    const replaced = await cache.match(URL_A);
+    assertExists(replaced);
+    assertEquals(replaced.headers.get(SHA_HEADER), BYTES_A_SHA256);
+    assertEquals(new Uint8Array(await replaced.arrayBuffer()), BYTES_A);
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
+Deno.test("fetchBytes: validate 拒否のヒットは器へ一度書いた後 network 内容で上書きされる", async () => {
+  const { fetch, calls } = mockFetch(() => new Response(BYTES_A));
+  const into = new Uint8Array(new ArrayBuffer(8)).fill(0xff);
+  // validate が受け取った raw を記録する（ヒット → self-heal → network の二度書きの観測点）。
+  const seen: { fromInto: boolean; copy: Uint8Array }[] = [];
+  try {
+    const cache = await caches.open(CACHE_NAME);
+    await cache.put(URL_A, new Response(BYTES_B)); // 3 バイトの破損エントリ。
+
+    const bytes = await fetchBytes(URL_A, {
+      fetch,
+      into,
+      validate: (raw) => {
+        seen.push({
+          fromInto: raw.buffer === into.buffer && raw.byteOffset === 0,
+          copy: raw.slice(),
+        });
+        if (raw.length !== BYTES_A.length) throw new Error("破損");
+      },
+    });
+    assertPrefixView(bytes, into, BYTES_A.length);
+    assertEquals(bytes, BYTES_A);
+    assertEquals(calls.length, 1);
+
+    // 1 回の fetchBytes の中で器が二度書かれる（ヒット内容 → network 内容）。
+    assertEquals(
+      seen.length,
+      2,
+      "ヒット内容と network 内容の二度書きになっていない",
+    );
+    assertEquals(seen.map((entry) => entry.fromInto), [true, true]);
+    assertEquals(seen[0].copy, BYTES_B);
+    assertEquals(seen[1].copy, BYTES_A);
+
+    // 実長の外は誰も触らない（安全側のゼロ埋めは数 GB の逆行なので入れない）。
+    assertEquals(
+      into.subarray(BYTES_A.length),
+      new Uint8Array([0xff, 0xff, 0xff]),
+      "実長の外を書き換えている",
+    );
+    // 破損エントリは network 内容へ置換されている。
+    const replaced = await cache.match(URL_A);
+    assertExists(replaced);
+    assertEquals(new Uint8Array(await replaced.arrayBuffer()), BYTES_A);
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
+Deno.test("fetchBytes: into のキャッシュヒットでは onProgress が発火しない", async () => {
+  const { fetch, calls } = mockFetch(() =>
+    chunkedResponse([new Uint8Array([1, 2, 3]), new Uint8Array([4, 5])])
+  );
+  const into = new Uint8Array(new ArrayBuffer(8)).fill(0xff);
+  const fromCache: { loaded: number; total?: number }[] = [];
+  const fromNetwork: { loaded: number; total?: number }[] = [];
+  try {
+    await fetchBytes(URL_A, { fetch }); // 温める。
+    const bytes = await fetchBytes(URL_A, {
+      fetch,
+      into,
+      onProgress: (progress) => fromCache.push(progress),
+    });
+    assertPrefixView(bytes, into, BYTES_A.length);
+    assertEquals(calls.length, 1);
+    assertEquals(fromCache, [], "キャッシュヒットで onProgress が発火している");
+
+    // 対照: 同じ配線でも network 経路なら発火する（空なのは配線漏れではない）。
+    await fetchBytes(URL_B, {
+      fetch,
+      into,
+      onProgress: (progress) => fromNetwork.push(progress),
+    });
+    assertEquals(fromNetwork, [
+      { loaded: 3, total: undefined },
+      { loaded: 5, total: undefined },
+    ]);
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
+Deno.test("fetchBytes: 空 body + into は長さ 0 の prefix view と空エントリになる", async () => {
+  const { fetch, calls } = mockFetch(() => chunkedResponse([]));
+  const into = new Uint8Array(new ArrayBuffer(8)).fill(0xff);
+  try {
+    const bytes = await fetchBytes(URL_A, { fetch, into });
+    assertPrefixView(bytes, into, 0);
+    assertEquals(into[0], 0xff, "空 body なのに器を書き換えている");
+
+    const cache = await caches.open(CACHE_NAME);
+    const cached = await cache.match(URL_A);
+    assertExists(cached);
+    assertEquals(new Uint8Array(await cached.arrayBuffer()), new Uint8Array(0));
+
+    // ヒット側も長さ 0 の prefix view（空エントリが読み出せる）。
+    const hit = await fetchBytes(URL_A, { fetch, into });
+    assertPrefixView(hit, into, 0);
+    assertEquals(calls.length, 1);
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
+Deno.test("fetchBytes: into のキャッシュヒットは body stream で器へ流す（materialize しない）", async () => {
+  // ADR 0009 のヒット側の目的（RAM ピーク削減）そのもの。`arrayBuffer()` で materialize
+  // してから写す実装だと、2 チャンク目を引く時点で器はまだ 1 バイトも書かれていない。
+  const chunks = [new Uint8Array([1, 2, 3]), new Uint8Array([4, 5])];
+  const into = new Uint8Array(new ArrayBuffer(8)).fill(0xff);
+  let pulled = 0;
+  let firstByteAtSecondPull: number | undefined;
+  let arrayBufferCalls = 0;
+  const cachedResponse = (): Response => {
+    const stream = new ReadableStream<Uint8Array<ArrayBuffer>>({
+      pull(controller) {
+        // 2 チャンク目を引く直前の器の中身 = 1 チャンク目が書かれているか。
+        if (pulled === 1) firstByteAtSecondPull = into[0];
+        if (pulled >= chunks.length) {
+          controller.close();
+          return;
+        }
+        controller.enqueue(chunks[pulled++]);
+      },
+    }, { highWaterMark: 0 });
+    const response = new Response(stream);
+    // materialize 経路に切り替わったら検出できるよう、instance 側で呼び出しを数える。
+    Object.defineProperty(response, "arrayBuffer", {
+      value: () => {
+        arrayBufferCalls++;
+        return Response.prototype.arrayBuffer.call(response);
+      },
+    });
+    return response;
+  };
+  const { fetch, calls } = mockFetch(() => new Response(BYTES_A));
+  try {
+    const bytes = await fetchBytes(URL_A, {
+      fetch,
+      into,
+      caches: failingCacheStorage({
+        match: () => Promise.resolve(cachedResponse()),
+      }),
+    });
+    assertPrefixView(bytes, into, BYTES_A.length);
+    assertEquals(bytes, BYTES_A);
+    assertEquals(
+      firstByteAtSecondPull,
+      1,
+      "ヒット body を materialize してから器へ写している",
+    );
+    assertEquals(
+      arrayBufferCalls,
+      0,
+      "ヒット body を arrayBuffer() で読んでいる",
+    );
+    assertEquals(calls.length, 0, "ヒットなのに network に出ている");
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
+Deno.test("single-flight: leader の into 容量不足は合流者にも伝播する（誰もキャッシュしない）", async () => {
+  // 合流者の容量不足がその呼び出しだけで済む（上のテスト）のと非対称: leader の器が
+  // 小さいと取得そのものが成立しないので、器を持たない合流者も道連れになる。
+  const gate = Promise.withResolvers<void>();
+  const lazy = lazyResponse([
+    new Uint8Array([1, 2]),
+    new Uint8Array([3, 4]),
+    new Uint8Array([5]),
+  ]);
+  const { fetch, calls } = mockFetch(async () => {
+    await gate.promise;
+    return lazy.response;
+  });
+  try {
+    const leader = fetchBytes(URL_A, {
+      fetch,
+      into: new Uint8Array(new ArrayBuffer(3)),
+    });
+    const follower = fetchBytes(URL_A, { fetch });
+    gate.resolve();
+    const leaderError = await assertRejects(
+      () => leader,
+      Error,
+      "into の容量 3 バイト",
+    );
+    const followerError = await assertRejects(() => follower, Error);
+    assertStrictEquals(
+      followerError,
+      leaderError,
+      "合流者へ別の失敗が渡っている",
+    );
+    assertEquals(lazy.cancelled(), true, "未消費 body を解放していない");
+    assertEquals(calls.length, 1);
+    const cache = await caches.open(CACHE_NAME);
+    assertEquals(
+      await cache.match(URL_A),
+      undefined,
+      "落ちた取得をキャッシュしている",
+    );
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
+Deno.test("fetchBytes: 同じ器を並行する別の取得へ渡すと network に出る前に throw する", async () => {
+  // 並行に渡すと 2 本の受信が同じ領域へ交互に書き、記録ハッシュ付きの不正エントリが
+  // 成立しうる（self-heal でも回復しない）ため、入口で弾く（ADR 0009）。
+  const URL_C = "https://example.com/assets/c.bin";
+  const gate = Promise.withResolvers<void>();
+  const started = Promise.withResolvers<void>();
+  const { fetch, calls } = mockFetch(async (url) => {
+    started.resolve();
+    await gate.promise;
+    return new Response(url === URL_A ? BYTES_A : BYTES_B);
+  });
+  const into = new Uint8Array(new ArrayBuffer(8));
+  try {
+    const leader = fetchBytes(URL_A, { fetch, into });
+    await started.promise; // leader が器を使用中（受信中）であることを確定させる。
+    const error = await assertRejects(
+      () => fetchBytes(URL_B, { fetch, into }),
+      Error,
+      "別の取得で使用中",
+    );
+    assertStringIncludes(error.message, URL_B);
+    assertEquals(calls, [URL_A], "2 本目が network に出ている");
+
+    gate.resolve();
+    assertPrefixView(await leader, into, BYTES_A.length);
+
+    // 完了後は台帳から外れ、同じ器を逐次に渡し回せる。
+    const b = await fetchBytes(URL_B, { fetch, into });
+    assertPrefixView(b, into, BYTES_B.length);
+    assertEquals(b, BYTES_B);
+
+    // 失敗した取得（HTTP エラー）の後も解除されている。
+    const failing = mockFetch(() =>
+      new Response("missing", { status: 404, statusText: "Not Found" })
+    );
+    await assertRejects(
+      () => fetchBytes(URL_C, { fetch: failing.fetch, into }),
+      Error,
+      "HTTP 404",
+    );
+    const again = await fetchBytes(URL_A, { fetch, into });
+    assertPrefixView(again, into, BYTES_A.length);
+    assertEquals(again, BYTES_A);
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
+Deno.test("fetchBytes: SharedArrayBuffer 背面の into は network に出る前に throw する", async () => {
+  const { fetch, calls } = mockFetch(() => new Response(BYTES_A));
+  // 型（Uint8Array<ArrayBuffer>）を素通りした呼び出しの再現 — cache.put は器を生のまま
+  // 読むので、他スレッドの書き込みで記録ハッシュと中身が食い違う。
+  const shared = new Uint8Array(
+    new SharedArrayBuffer(8),
+  ) as unknown as Uint8Array<ArrayBuffer>;
+  const error = await assertRejects(
+    () => fetchBytes(URL_A, { fetch, into: shared }),
+    Error,
+  );
+  assertStringIncludes(error.message, "SharedArrayBuffer");
+  assertStringIncludes(error.message, URL_A);
+  assertEquals(calls.length, 0);
+});
+
+Deno.test("fetchBytes: キャッシュヒットの容量不足はエントリが残っていることと回復手順を伝える", async () => {
+  // 「受信 N バイト」と言うとダウンロード失敗に見え、エントリが健在であること（＝何を
+  // すれば読めるか）が伝わらない。出どころで文言を変える契約の凍結。
+  const { fetch } = mockFetch(() => new Response(BYTES_A));
+  try {
+    await fetchBytes(URL_A, { fetch });
+    const error = await assertRejects(
+      () =>
+        fetchBytes(URL_A, { fetch, into: new Uint8Array(new ArrayBuffer(3)) }),
+      Error,
+    );
+    assertStringIncludes(error.message, "キャッシュエントリ 5 バイト以上");
+    assertStringIncludes(error.message, "エントリは残っています");
+    assertStringIncludes(error.message, "evictUrl");
+    assertEquals(
+      error.message.includes("受信"),
+      false,
+      "キャッシュ読出しを network 受信の文言で報告している",
+    );
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
 // --- prefetchUrl（streaming put・検証は読み出し側に一本化）---
 
 Deno.test("prefetchUrl: body を streaming で格納し、以後の fetchBytes は network に出ない", async () => {
