@@ -12,7 +12,9 @@
   走る。認証ヘッダ違いを区別しないのはキャッシュキーがヘッダ非依存の設計と同じ割り切り）。
   記録ハッシュを焼くのも leader の `sha256` だけ（合流者は記録を見ず、常に自分の
   `sha256` / `validate` / `decode` を保存形 raw に適用する安全側）。取得失敗は合流全員へ
-  伝播する。**self-heal が走るのはキャッシュヒット経路（leader）だけ** — 合流者側の検証
+  伝播する — leader の `into` 容量不足もここに含まれ、器が十分な（あるいは `into` を渡して
+  いない）合流者まで落ちる（合流者側の容量不足だけがその呼び出しに留まる）。
+  **self-heal が走るのはキャッシュヒット経路（leader）だけ** — 合流者側の検証
   失敗はその呼び出しの throw に留まり evict しない（合流者が evict すると leader が今格納
   した正常エントリを消し得るため。検証条件の違う並行呼び出しを混ぜる運用では注意）。
 - **非 GET はキャッシュ非対応**: Cache API は GET しか格納できない。cache 有効 + 非 GET は
@@ -41,12 +43,37 @@
 - **`into` の戻り値は次に同じバッファへ書くまでしか有効でない**（DECIDED:
   docs/decisions/0009）。バッファは呼び出し側の所有で、戻り値も `validate` / `decode` に渡る
   保存形 raw もそのバッファを指す view（`decode` 併用時はバッファに保存形・戻り値は decode
-  結果）。容量不足は縮退しない（network は打ち切ってキャッシュしない・キャッシュヒットは
-  throw するがエントリは消さず network へも縮退しない・`expectedBytes` が容量を超える申告は
-  network に出る前に throw）。single-flight の合流者は leader のバッファを共有せず、leader は
-  合流者がいるときだけ共有前に 1 回コピーする（合流者の `into` へは写す）。prefetch は `into`
-  を見ない。`fetchHfFiles` の複数 spec に同じバッファを渡すと戻り値同士が上書きし合う
-  （逐次の `fetchHfFile` で使う）。
+  結果）。prefetch は `into` を見ない。
+- **`into` は逐次にしか渡し回せない**（DECIDED: docs/decisions/0009 §5）。同じバッファを
+  **並行**する呼び出しへ渡すと入口で throw する（`fetchBytes` 直呼び・非 await の並行
+  `fetchHfFile`・`fetchHfFiles` の同一器・合流者の写し先まで cache 層の入口 1 箇所で弾く。
+  判定はバッファ同一性で、互いに素な部分ビューでも並行なら弾かれる）。`fetchHfFiles` は全
+  spec を並列取得するので、spec 毎に別のバッファを渡すか逐次の `fetchHfFile` を使う。
+  型（`Uint8Array<ArrayBuffer>`）を素通りした SharedArrayBuffer 背面も同じ入口で弾く。
+  ガードが守っているのは記録の信頼モデル（docs/decisions/0005 §5 / 0006 §2）で、並行受信が
+  同じ領域へ交互に書くと、sha256 検証（digest は呼び出し時点のコピーを取る）と `cache.put`
+  （器をその時点の中身で読む）の間に他方の書き込みが入り、**記録ハッシュは正しいのに中身が
+  違うエントリ**が成立しうる — 既定（`recheck: false`）は記録の文字列比較で信じるので
+  self-heal では回復せず、`evictUrl` / `evict` / `clearCache` まで壊れたバイトが返り続ける。
+- **`into` の容量不足は縮退しない fail loud**（DECIDED: docs/decisions/0009 §2）。network は
+  超過チャンクで受信を打ち切ってキャッシュしない。キャッシュヒットは throw するがエントリは
+  消さず network へも縮退しない。`expectedBytes` が容量を超える申告は request の前に throw
+  する（HF 層は `toSpec` で revision 解決より前）。判別は `error.name === "IntoCapacityError"`
+  （クラスは非公開）。**throw した後のバッファの内容は未定義**（失敗前に読めたぶんが先頭から
+  書き込まれている）ので、「失敗したなら前回の内容が残っている」前提のリカバリは書けない。
+  **エントリ側がバッファより大きい場合も同じ例外**になり、破損ではないので self-heal しない
+  （何度呼んでも同じ throw。回復は `evictUrl` / `evict` か、`into` 無しで 1 回読む）。
+- **`into` で消えるのは呼び出し毎の受信・戻り値バッファの確保だけ**（DECIDED:
+  docs/decisions/0009）。次の 4 つは残る: ①合流者がいるフライトでは共有前に保存形 raw を
+  1 回全長コピーするのでそのフライトだけピークが 2N になり、この確保が落ちるとダウンロード・
+  検証・`cache.put` が全て成功した後でも throw する（再試行はキャッシュヒット）②
+  `response.body` が null のランタイムは一度全量を materialize してから器へ写す ③キャッシュ
+  ヒット側の RAM 効果は Cache 実装が body を stream で返すか（全量を materialize しないか）に
+  依存する — 実装挙動であって仕様保証ではない ④`sha256` 併用時は WebCrypto の `digest` が
+  仕様上バイト列のコピーを取る。
+- **single-flight の合流者は leader のバッファを共有しない**（DECIDED: docs/decisions/0009
+  §3）。leader は合流者がいるときだけ共有前に 1 回コピーし、合流者の `into` へはそのコピーを
+  写す。leader の容量不足は取得失敗として**フライト全員へ伝播する**（上の single-flight 項）。
 - **`prefetchUrl` の検証は `sha256` 指定時のみ・縮退はしない**（DECIDED:
   docs/decisions/0005 §5）。body をそのまま cache へ流すためバイト列を手元に持てず、
   `validate` フックは走らせられない。唯一の例外が `sha256`（64 桁小文字 hex）で、指定時は

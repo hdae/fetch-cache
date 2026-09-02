@@ -34,7 +34,8 @@ HuggingFace Hub layer (`./hf`) is included.
   `sha256` **in flight**, so a corrupted download never becomes a cache entry
 - **Caller-owned buffers**: pass `into` to read a download _or a cache hit_
   straight into a buffer you allocated and get a view of it back — reuse one
-  buffer across many shards and the heap never holds more than one of them
+  buffer across sequential shard reads instead of allocating a receive buffer
+  and a result buffer per call
 - **HuggingFace layer**: resolves mutable refs (`"main"` etc.) to the current
   commit SHA, then fetches via immutable SHA-pinned URLs; files with a known
   `sha256` are cached under a **content key** (`["hf", kind, repo, path,
@@ -219,28 +220,58 @@ for (const shard of shards) {
     expectedBytes: shard.size,
     into,
   });
-  // `bytes` is `into.subarray(0, shard.size)` — consume it before the next
+  // `bytes` is `into.subarray(0, bytesReceived)` — consume it before the next
   // iteration overwrites the buffer.
   device.queue.writeBuffer(gpuBuffer, shard.offset, bytes);
 }
 ```
 
-`into` makes `fetchBytes` write straight into a buffer **you own** — both a
-network download and a cache hit (which is streamed out of Cache Storage
-instead of being materialized with `arrayBuffer()`) — and return a prefix view
-of it. No per-call allocation happens, so a loop over dozens of large shards
-keeps the heap at one buffer's worth instead of leaving a trail of dead
-buffers for the GC to catch up with. The view (and the raw bytes handed to
-`validate` / `decode`) is only valid until the next write into the same
-buffer; with `decode`, the buffer holds the stored form and the decoded form
-is returned separately.
+With `into`, `expectedBytes` stops being an allocation hint — the buffer takes
+that job. What is left is the pre-check that rejects a declared length the
+buffer cannot hold, plus (on the HF layer) the exact-length check that
+`HfFileSpec.expectedBytes` performs anyway. The buffer is the container;
+`expectedBytes` is the declaration checked against it.
 
-A buffer that is too small fails loud rather than degrading: a network
-download is cancelled at the chunk that overflows and nothing is cached, a
-cache hit throws but keeps the entry, and an `expectedBytes` larger than the
-buffer throws before the request is made. Callers that join an in-flight
-download (single-flight) never receive the leader's buffer — they get their
-own copy, or their own `into` — see
+`into` makes `fetchBytes` write straight into a buffer **you own** — both a
+network download and a cache hit (which is read out of Cache Storage through
+its body stream instead of being materialized with `arrayBuffer()`) — and
+return a prefix view of it. The per-call receive and result buffer allocations
+go away, so a sequential loop over dozens of large shards keeps the heap at one
+buffer's worth instead of leaving a trail of dead buffers for the GC to catch
+up with. The view (and the raw bytes handed to `validate` / `decode`) is only
+valid until the next write into the same buffer; with `decode`, the buffer
+holds the stored form and the decoded form is returned separately.
+
+Four things still allocate. A flight that another caller joins copies the raw
+bytes once before sharing them, so that flight peaks at twice the size — and if
+that copy cannot be allocated, the call throws even though the download,
+verification and cache write all succeeded (the retry is a cache hit). A
+runtime whose `Response.body` is `null` materializes the whole response once
+before it is copied into the buffer. On a cache hit, whether anything is
+materialized at all comes down to the Cache implementation handing out the
+entry as a stream — implementation behavior, not a spec guarantee. And with
+`sha256`, WebCrypto takes its own copy of the bytes to digest.
+
+The buffer must be passed **sequentially**. Handing the same buffer to
+concurrent calls throws at the entry point, before the download starts:
+concurrent receives would interleave in the same region and could leave a cache
+entry whose recorded hash does not match its bytes. `fetchHfFiles` fetches its
+specs in parallel, so give every spec its own buffer (or read them one at a
+time with `fetchHfFile`). A buffer backed by a `SharedArrayBuffer` is rejected
+at the same entry point.
+
+A buffer that is too small fails loud rather than degrading: a network download
+is cancelled at the chunk that overflows and nothing is cached, a cache hit
+throws but keeps the entry and does not fall back to the network, and an
+`expectedBytes` larger than the buffer throws before any request is made
+(including the HF revision resolution). The error is identifiable by
+`error.name === "IntoCapacityError"`. After any throw the contents of the
+buffer are undefined — the bytes read before the failure are already written
+from the start of it. A cache **entry** larger than the buffer raises the same
+error and is not treated as corruption, so it is not self-healed: recover with
+`evictUrl` / `evict`, or read that entry once without `into`. Callers that join
+an in-flight download (single-flight) never receive the leader's buffer — they
+get their own copy, or their own `into` — see
 [ADR 0009](https://github.com/hdae/fetch-cache/blob/main/docs/decisions/0009-into-caller-buffer.md).
 
 ### Auth & abort
@@ -408,8 +439,8 @@ A few things worth knowing:
   `sha256` are not affected (there is nothing to compare against) — drop them
   explicitly with `evictUrl(hfResolveUrl({ ...ref, revision, path }))`.
 - `prefetchHfFile` reads only `sha256` from the spec: `expectedBytes` /
-  `validate` are ignored while warming (no bytes in hand) and apply when the
-  file is read back.
+  `validate` / `into` are ignored while warming (no bytes in hand) and apply
+  when the file is read back.
 - Free a repo's sha256-declared files with `evict(["hf", "model",
   "owner/name"])`, one file with `evict(["hf", "model", "owner/name",
   "model.onnx"])` (all contents of it), and inspect what is stored with
@@ -493,6 +524,11 @@ only job, so there is nothing to degrade to (see Large assets).
 > rather than passing off existing entries as an empty list). `fetchBytes`
 > caching, `evictUrl`, and `clearCache` work on every Deno version.
 
+The JavaScript floor is Baseline 2024: `Promise.withResolvers` (Safari 17.4,
+Chrome 119, Firefox 121, Deno 1.38 and later) is used by the single-flight
+path. The type definitions assume TypeScript 5.7 or later, where `Uint8Array`
+takes a type argument (`into` is typed `Uint8Array<ArrayBuffer>`).
+
 In browsers, keep in mind that Cache Storage is subject to the browser's
 storage eviction policy (consider `navigator.storage.persist()` for large
 assets), and that cross-origin downloads — including HuggingFace Hub — depend
@@ -512,7 +548,8 @@ deno task bump patch   # 0.1.0 -> 0.1.1 (deno.json + src/mod.ts in one commit; n
 
 To publish:
 
-1. Bump the version with `deno task bump <patch|minor|major>`.
+1. Bump the version with
+   `deno task bump <patch|minor|major|premajor|preminor|prepatch|prerelease>`.
 2. `git push`, then create a GitHub Release tagged `v<version>` (e.g.
    `v0.1.1`).
 3. Publishing the Release triggers

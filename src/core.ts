@@ -129,19 +129,29 @@ export type FetchBytesOptions = {
   /**
    * 呼び出し側が確保した**書き込み先バッファ**。指定すると network 受信もキャッシュ読出しも
    * このバッファの先頭へ直接書き、戻り値はその prefix view（`into.subarray(0, n)`）になる —
-   * 呼び出し毎の確保がゼロになるので、同じバッファを渡し回せば何本読んでも RAM の増分は
-   * バッファ 1 本ぶんで止まる（数百 MiB × 数十本の shard を逐次読む用途。DECIDED:
-   * docs/decisions/0009）。`expectedBytes` の事前確保はこのバッファで置き換わる。
+   * 呼び出し毎の受信 / 戻り値バッファの確保が無くなるので、同じバッファを渡し回せば何本
+   * 読んでも RAM の増分はバッファ 1 本ぶんで止まる（数百 MiB × 数十本の shard を**逐次**読む
+   * 用途。DECIDED: docs/decisions/0009）。`expectedBytes` の事前確保はこのバッファで
+   * 置き換わる。確保は `new Uint8Array(new ArrayBuffer(n))` で行う — `Uint8Array` 型の値は
+   * `ArrayBufferLike` 背面なので、そのままではこの型に渡せない。
    *
    * バッファの**所有権は呼び出し側**にある: 戻り値（と `validate` / `decode` に渡る raw）は
    * バッファを指す view なので、次に同じバッファへ書くまでに使い終えること。`decode` 併用時は
    * バッファに入るのは保存形 raw で、戻り値は decode 結果（別バッファ）。
    *
+   * MUST NOT: 同じバッファを**並行**する呼び出しへ渡さない（逐次に渡し回すこと）— 並行受信が
+   * 同じ領域へ交互に書くと、記録ハッシュと中身が食い違うエントリが成立しうる（self-heal でも
+   * 回復しない）。入口で使用中のバッファを検知して throw する。SharedArrayBuffer 背面も同じ
+   * 入口で弾く（`cache.put` が器を生のまま読むため）。
+   *
    * MUST: 容量不足（実バイト数 > `into.byteLength`）は縮退せず throw する — network 側は受信を
    * 打ち切ってキャッシュしない、キャッシュヒット側はエントリを消さない（破損でも cache I/O
-   * 失敗でもなく呼び出し側の申告ミス）。`expectedBytes` が容量を超える申告は network に出る前に
-   * throw する。single-flight の合流者へ leader のバッファは渡らない（合流者は自分のコピー、
-   * または自分の `into` を受け取る）。
+   * 失敗でもなく呼び出し側の申告ミス）。`expectedBytes` が容量を超える申告は request の前に
+   * throw する。判別は `error.name === "IntoCapacityError"`（クラスは非公開）。throw した後の
+   * バッファの内容は未定義（失敗前に読めたぶんが先頭から書き込まれている）。エントリ側が
+   * バッファより大きい場合も同じ例外で、破損ではないので self-heal しない（回復は `evictUrl` /
+   * `evict`、または `into` 無しで 1 回読む）。single-flight の合流者へ leader のバッファは
+   * 渡らない（合流者は自分のコピー、または自分の `into` を受け取る）。
    */
   into?: Uint8Array<ArrayBuffer>;
   /**

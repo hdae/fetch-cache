@@ -74,8 +74,12 @@ export type HfFileSpec = {
    * キャッシュ読出しもこのバッファの先頭へ書き、戻り値はその prefix view になる — 同じ
    * バッファを渡し回して shard を逐次読めば、RAM の増分はバッファ 1 本ぶんで止まる
    * （DECIDED: docs/decisions/0009）。容量不足は fail loud。ファイル毎の器なので
-   * ファイル指定側に置く（`fetchHfFiles` で同じバッファを複数ファイルへ渡すと、戻り値同士が
-   * 同じ領域を指して上書きし合う — 逐次の `fetchHfFile` で使うこと）。`prefetchHfFile` は
+   * ファイル指定側に置く。
+   *
+   * MUST NOT: 同じバッファを複数の spec へ渡さない — `fetchHfFiles` は全ファイルを並列
+   * 取得するため、cache 層の入口が使用中のバッファを検知して throw する（並行受信が同じ
+   * 領域へ交互に書くと、記録ハッシュと中身が食い違うエントリが成立しうるため）。spec 毎に
+   * 別のバッファを渡すか、逐次の `fetchHfFile` で 1 本を渡し回すこと。`prefetchHfFile` は
    * 見ない（バイト列を手元に持たない）。
    */
   into?: Uint8Array<ArrayBuffer>;
@@ -334,8 +338,9 @@ export type HfPrefetchResult = {
  * 突合だけで済む（再ハッシュ無し — 数 GB のモデルで起動毎の全量ハッシュを避ける本命の
  * 使い方。疑う運用は `HfFetchOptions.recheck`）。
  * NOTE: prefetch が spec から見るのは `sha256` だけ。`expectedBytes`
- *       （`fetchHfFile` では検証 + 確保ヒント）も `spec.validate` も、渡しても prefetch では
- *       使われない（バイト列を手元に持たないため。docs/limitations.md）。
+ *       （`fetchHfFile` では検証 + 確保ヒント）も `spec.validate` も `spec.into`（呼び出し側
+ *       バッファ）も、渡しても prefetch では使われない（バイト列を手元に持たないため。
+ *       docs/limitations.md）。
  *
  * **縮退しない（fail loud）**: `caches` 不在・HTTP エラー・転送中断・put 失敗・sha256 不一致は
  * すべて throw する（cache 層 `prefetchUrl` の契約をそのまま継承）。fallback は `fetchHfFile`。

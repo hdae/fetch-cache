@@ -36,7 +36,9 @@ UI の再入）は、それぞれ network に出て二重ダウンロードに�
 - 合流者の `fetch` / `caches` / `init` / `onCacheError` は使われない（limitations 記載）。
   DI が呼び出しごとに異なるテストは cacheName を分けて合流を避ける。
 - 合流者は leader と同じ raw インスタンスを受け取る。`decode` の「raw を破壊的に変更しない
-  MUST NOT」（ADR-0003）がここでも安全性の前提になる。
+  MUST NOT」（ADR-0003）がここでも安全性の前提になる。ただし leader が `into`（呼び出し側
+  バッファ）を使い合流者がいる場合だけは、共有前にコピーを切ったものが渡る（呼び出し側所有の
+  メモリを合流者へ渡さないため — [0009](0009-into-caller-buffer.md) §3）。
 - MUST NOT: `decode` / `validate` の中から同一 (cacheName, URL) の `fetchBytes` を呼ぶ —
   自分自身のフライトに合流して自己デッドロックする（現実的な用途は無い）。
 - yomi 側の既知問題 W-E-7（並行 `getDictionary` の重複 DL）は、yomi が本バージョンへ
