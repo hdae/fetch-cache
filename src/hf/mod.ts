@@ -21,6 +21,7 @@ import {
   type DecodeBytes,
   fetchBytesWithKey,
   type FetchProgress,
+  IntoCapacityError,
   prefetchUrlWithKey,
   type ValidateBytes,
 } from "../core.ts";
@@ -272,8 +273,10 @@ const toSpec = (file: string | HfFileSpec): HfFileSpec => {
     spec.into !== undefined && spec.expectedBytes !== undefined &&
     spec.expectedBytes > spec.into.length
   ) {
-    throw new Error(
-      `fetch-cache: into の容量 ${spec.into.length} バイトに収まりません（expectedBytes ${spec.expectedBytes} バイト） (${spec.path})`,
+    throw new IntoCapacityError(
+      spec.path,
+      spec.into.length,
+      `expectedBytes ${spec.expectedBytes} バイト`,
     );
   }
   return spec;

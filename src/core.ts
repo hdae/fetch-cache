@@ -335,9 +335,10 @@ const allocateHint = (size: number): Uint8Array<ArrayBuffer> | undefined => {
  * 呼び出し側バッファ（`into`）の容量不足。呼び出し側の申告ミスなので縮退させない fail loud
  * （DECIDED: docs/decisions/0009）。キャッシュヒット経路では「破損」でも「cache I/O 失敗」でも
  * ないため、self-heal（evict）にも network への縮退にも乗せず、`instanceof` で見分けて
- * そのまま伝える。
+ * そのまま伝える。内部 export（mod.ts から再公開しない）— HF 層の入口検査も同じ型で投げ、
+ * 判別レシピ（`error.name === "IntoCapacityError"`）を層をまたいで揃える。
  */
-class IntoCapacityError extends Error {
+export class IntoCapacityError extends Error {
   constructor(requestUrl: string, capacity: number, needed: string) {
     super(
       `fetch-cache: into の容量 ${capacity} バイトに収まりません（${needed}） (${requestUrl})`,
