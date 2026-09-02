@@ -250,9 +250,10 @@ const fetchResolvedFile = (
 };
 
 /**
- * ファイル指定を HfFileSpec へ正規化する（全入口の合流点）。形式不正の `sha256` はここで
- * fail loud に弾く — 必ず不一致になる申告なので、全量ダウンロードしてから落とすと呼び出し毎に
- * 帯域を捨てることになる（cache 層の同じガードと語彙を揃え、path 付きで報告する）。
+ * ファイル指定を HfFileSpec へ正規化する（全入口の合流点）。形式不正の `sha256` と、`into` の
+ * 容量を超える `expectedBytes` はここで fail loud に弾く — 必ず不一致 / 容量不足になる申告
+ * なので、全量ダウンロードしてから落とすと呼び出し毎に帯域を捨てることになる（cache 層の
+ * 同じガードと語彙を揃え、path 付きで報告する）。
  */
 // MUST: 各入口で revision 解決（network）より前に呼ぶ — 後に回すと形式不正でも解決 API
 // 1 発（複数ファイルでは兄弟ファイルの取得開始まで）が漏れる。
@@ -261,6 +262,14 @@ const toSpec = (file: string | HfFileSpec): HfFileSpec => {
   if (spec.sha256 !== undefined && !/^[0-9a-f]{64}$/.test(spec.sha256)) {
     throw new Error(
       `fetch-cache: sha256 は 64 桁の小文字 hex で指定してください: ${spec.sha256} (${spec.path})`,
+    );
+  }
+  if (
+    spec.into !== undefined && spec.expectedBytes !== undefined &&
+    spec.expectedBytes > spec.into.length
+  ) {
+    throw new Error(
+      `fetch-cache: into の容量 ${spec.into.length} バイトに収まりません（expectedBytes ${spec.expectedBytes} バイト） (${spec.path})`,
     );
   }
   return spec;

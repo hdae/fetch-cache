@@ -361,8 +361,17 @@ const readBody = async (
   onProgress?: (progress: FetchProgress) => void,
   expectedBytes?: number,
   into?: Uint8Array<ArrayBuffer>,
+  intoSource: "network" | "cache" = "network",
 ): Promise<Uint8Array<ArrayBuffer>> => {
   const total = readTotal(response);
+  // 容量不足の文言は出どころで変える — キャッシュ読出しで「受信」と言うとダウンロード失敗に
+  // 見え、エントリが残っていること（= 回復手順）も伝わらない。
+  const overflow = (bytes: number, atLeast: boolean): string =>
+    intoSource === "cache"
+      ? `キャッシュエントリ ${bytes} バイト${
+        atLeast ? "以上" : ""
+      } — エントリは残っています（evictUrl / evict で消すか、into 無しで読み直してください）`
+      : `受信 ${bytes} バイト${atLeast ? "以上" : ""}`;
   let buffer: Uint8Array<ArrayBuffer> | undefined;
   if (into !== undefined) {
     buffer = into;
@@ -395,7 +404,7 @@ const readBody = async (
       throw new IntoCapacityError(
         requestUrl,
         into.length,
-        `受信 ${bytes.length} バイト`,
+        overflow(bytes.length, false),
       );
     }
     into.set(bytes);
@@ -415,7 +424,7 @@ const readBody = async (
           throw new IntoCapacityError(
             requestUrl,
             into.length,
-            `受信 ${loaded + value.length} バイト以上`,
+            overflow(loaded + value.length, true),
           );
         }
         // 申告超過（Content-Encoding 越しの content-length 等）。ここまでの内容を蓄積経路へ
@@ -546,6 +555,16 @@ type InflightEntry = {
 const inflight = new Map<string, InflightEntry>();
 
 /**
+ * 使用中の呼び出し側バッファ（`into.buffer`）。同じバッファを並行する呼び出しへ渡すと 2 本の
+ * 受信が同じ領域へ交互に書き、sha256 検証（digest は呼び出し時点のコピーを取る）と cache.put
+ * （器をその時点の中身で読む）の間に他方の書き込みが入って「記録ハッシュは正しいのに中身が
+ * 違う」エントリが成立しうる — 記録の信頼モデル（docs/decisions/0005 §5 / 0006 §2）が破れ、
+ * self-heal でも回復しない。逐次利用（契約）では起きないので、並行使用を入口で fail loud に
+ * 弾く（DECIDED: docs/decisions/0009）。判定は buffer 同一性（部分ビュー同士の重なりは見ない）。
+ */
+const buffersInUse = new Set<ArrayBuffer>();
+
+/**
  * 進捗リスナーの隔離ラッパ。進捗は任意情報（正しさの要件ではない）なので、リスナーの throw で
  * 取得を落とさない — 特に single-flight の合流フライトでは 1 リスナーの事故が他の呼び出しの
  * ダウンロードまで巻き添えにする。onCacheError と同じ「落とさず・無言にもしない」縮退方針。
@@ -624,6 +643,7 @@ const acquireAndDecode = async (
               undefined,
               undefined,
               opts.into,
+              "cache",
             );
         }
       }
@@ -747,72 +767,14 @@ export const fetchBytes = (
 ): Promise<Uint8Array> => fetchBytesWithKey(url, undefined, opts);
 
 /**
- * 内部導管（mod.ts から再公開しない = パッケージ利用者からは到達不能）: 配列キーを注入する
- * `fetchBytes`。HF 層が既定の内容キーを渡すために使う。`key` が undefined なら URL がキー
- * （= 公開 `fetchBytes` と同一挙動）。公開 `key` オプションは 0.5.0 で撤去した
- * （DECIDED: docs/decisions/0008）。
+ * 取得本体: cache 無効の素の取得 / single-flight の合流 / leader。入口検査と `into` の
+ * 使用中登録は fetchBytesWithKey 側で済んでいる。
  */
-export const fetchBytesWithKey = async (
-  url: string | URL,
-  key: CacheKey | undefined,
-  opts: FetchBytesOptions = {},
+const runFlight = async (
+  requestUrl: string,
+  storageKey: string,
+  opts: FetchBytesOptions,
 ): Promise<Uint8Array> => {
-  const requestUrl = normalizeUrl(url);
-
-  // Cache API は GET しか格納できない。`caches` の有無に依らず（Node.js でも）一貫して
-  // fail loud にするため、ガードは「キャッシュを使う意図」（cache !== false）で判定する。
-  const method = (opts.init?.method ?? "GET").toUpperCase();
-  if ((opts.cache ?? true) && method !== "GET") {
-    throw new Error(
-      `fetch-cache: GET 以外（${method}）はキャッシュできません（Cache API の制約）。` +
-        `cache: false を指定してください (${requestUrl})`,
-    );
-  }
-
-  // キーの直列化はここで 1 回だけ（要素の検査も serializeKey が行う）。cache を触らない
-  // 呼び出しでのキー指定は矛盾なので fail loud（DECIDED: docs/decisions/0006。公開 key の
-  // 撤去後は HF 層内部の誤用ガード）。
-  let storageKey = requestUrl;
-  if (key !== undefined) {
-    if (opts.cache === false) {
-      throw new Error(
-        `fetch-cache: cache: false と key は併用できません（キャッシュを触らない呼び出しにキーは無意味です） (${requestUrl})`,
-      );
-    }
-    storageKey = serializeKey(key);
-  }
-
-  // sha256 の形式不正は必ず不一致になる申告（＝全量ダウンロードしてから落ちる）なので
-  // network に出る前に弾く。crypto.subtle 不在も入口で fail loud（ヒット検証・network 検証の
-  // 両方が依存するため、縮退経路の奥で気付くと無駄な再取得が走る）。
-  if (opts.sha256 !== undefined) {
-    if (!SHA256_HEX.test(opts.sha256)) {
-      throw new Error(
-        `fetch-cache: sha256 は 64 桁の小文字 hex で指定してください: ${opts.sha256} (${requestUrl})`,
-      );
-    }
-    if (typeof crypto === "undefined" || crypto.subtle === undefined) {
-      throw new Error(
-        `fetch-cache: crypto.subtle が利用できないため sha256 検証ができません (${requestUrl})`,
-      );
-    }
-  } else if (opts.recheck !== undefined) {
-    throw new Error(
-      `fetch-cache: recheck は sha256 とセットでのみ指定できます (${requestUrl})`,
-    );
-  }
-  // 容量を超える申告は必ず容量不足になる（＝受信してから落ちる）ので network に出る前に弾く。
-  if (
-    opts.into !== undefined && opts.expectedBytes !== undefined &&
-    opts.expectedBytes > opts.into.length
-  ) {
-    throw new IntoCapacityError(
-      requestUrl,
-      opts.into.length,
-      `expectedBytes ${opts.expectedBytes} バイト`,
-    );
-  }
-
   // cache 無効の呼び出しは合流しない（非 GET・「必ず新規取得」の意図を保つ）。
   if (opts.cache === false) {
     const { decoded } = await acquireAndDecode(
@@ -828,6 +790,10 @@ export const fetchBytesWithKey = async (
 
   // 合流キーは cache と同じキー空間そのもの（直列化済みキー or URL。名前空間は内部固定
   // 1 個なので連結不要 — DECIDED: docs/decisions/0006）。
+  // MUST: fetchBytesWithKey の入口からここ（followers += 1）まで await を挟まない — 挟むと
+  // 合流が leader の raw.slice() 判定（followers > 0）より後にずれ込み、leader が呼び出し側
+  // バッファをそのまま共有して合流者の手元が書き換わる（`into` 使用時のメモリ安全性）。
+  // 二重フライト（TOCTOU）だけでなく所有権の問題でもある。
   const existing = inflight.get(storageKey);
   if (existing !== undefined) {
     // 合流: raw（保存形）を受け取り、自分の sha256 / validate / decode を適用する。
@@ -903,6 +869,97 @@ export const fetchBytesWithKey = async (
     // 成否に依らずフライトを閉じる（失敗を記憶すると自然回復を妨げる）。合流者は
     // promise への参照を直接持つため、この削除で取りこぼしは起きない。
     inflight.delete(storageKey);
+  }
+};
+
+/**
+ * 内部導管（mod.ts から再公開しない = パッケージ利用者からは到達不能）: 配列キーを注入する
+ * `fetchBytes`。HF 層が既定の内容キーを渡すために使う。`key` が undefined なら URL がキー
+ * （= 公開 `fetchBytes` と同一挙動）。公開 `key` オプションは 0.5.0 で撤去した
+ * （DECIDED: docs/decisions/0008）。
+ */
+export const fetchBytesWithKey = async (
+  url: string | URL,
+  key: CacheKey | undefined,
+  opts: FetchBytesOptions = {},
+): Promise<Uint8Array> => {
+  const requestUrl = normalizeUrl(url);
+
+  // Cache API は GET しか格納できない。`caches` の有無に依らず（Node.js でも）一貫して
+  // fail loud にするため、ガードは「キャッシュを使う意図」（cache !== false）で判定する。
+  const method = (opts.init?.method ?? "GET").toUpperCase();
+  if ((opts.cache ?? true) && method !== "GET") {
+    throw new Error(
+      `fetch-cache: GET 以外（${method}）はキャッシュできません（Cache API の制約）。` +
+        `cache: false を指定してください (${requestUrl})`,
+    );
+  }
+
+  // キーの直列化はここで 1 回だけ（要素の検査も serializeKey が行う）。cache を触らない
+  // 呼び出しでのキー指定は矛盾なので fail loud（DECIDED: docs/decisions/0006。公開 key の
+  // 撤去後は HF 層内部の誤用ガード）。
+  let storageKey = requestUrl;
+  if (key !== undefined) {
+    if (opts.cache === false) {
+      throw new Error(
+        `fetch-cache: cache: false と key は併用できません（キャッシュを触らない呼び出しにキーは無意味です） (${requestUrl})`,
+      );
+    }
+    storageKey = serializeKey(key);
+  }
+
+  // sha256 の形式不正は必ず不一致になる申告（＝全量ダウンロードしてから落ちる）なので
+  // network に出る前に弾く。crypto.subtle 不在も入口で fail loud（ヒット検証・network 検証の
+  // 両方が依存するため、縮退経路の奥で気付くと無駄な再取得が走る）。
+  if (opts.sha256 !== undefined) {
+    if (!SHA256_HEX.test(opts.sha256)) {
+      throw new Error(
+        `fetch-cache: sha256 は 64 桁の小文字 hex で指定してください: ${opts.sha256} (${requestUrl})`,
+      );
+    }
+    if (typeof crypto === "undefined" || crypto.subtle === undefined) {
+      throw new Error(
+        `fetch-cache: crypto.subtle が利用できないため sha256 検証ができません (${requestUrl})`,
+      );
+    }
+  } else if (opts.recheck !== undefined) {
+    throw new Error(
+      `fetch-cache: recheck は sha256 とセットでのみ指定できます (${requestUrl})`,
+    );
+  }
+  // 容量を超える申告は必ず容量不足になる（＝受信してから落ちる）ので network に出る前に弾く。
+  if (
+    opts.into !== undefined && opts.expectedBytes !== undefined &&
+    opts.expectedBytes > opts.into.length
+  ) {
+    throw new IntoCapacityError(
+      requestUrl,
+      opts.into.length,
+      `expectedBytes ${opts.expectedBytes} バイト`,
+    );
+  }
+
+  if (opts.into === undefined) {
+    return await runFlight(requestUrl, storageKey, opts);
+  }
+  // 型（Uint8Array<ArrayBuffer>）を素通りした SharedArrayBuffer 背面は弾く — cache.put は器を
+  // 生のまま読むので、他スレッドの書き込みで記録ハッシュと中身が食い違う。
+  const buffer = opts.into.buffer;
+  if (!(buffer instanceof ArrayBuffer)) {
+    throw new Error(
+      `fetch-cache: into は ArrayBuffer 背面の Uint8Array を渡してください（SharedArrayBuffer 不可） (${requestUrl})`,
+    );
+  }
+  if (buffersInUse.has(buffer)) {
+    throw new Error(
+      `fetch-cache: into のバッファは別の取得で使用中です。同じバッファは逐次に渡し回してください（並行に渡すと受信が交互に書かれ、記録ハッシュ付きの不正エントリが残りえます） (${requestUrl})`,
+    );
+  }
+  buffersInUse.add(buffer);
+  try {
+    return await runFlight(requestUrl, storageKey, opts);
+  } finally {
+    buffersInUse.delete(buffer);
   }
 };
 
