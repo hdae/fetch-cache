@@ -270,8 +270,8 @@ buffer are undefined — the bytes read before the failure are already written
 from the start of it. A cache **entry** larger than the buffer raises the same
 error and is not treated as corruption, so it is not self-healed: recover with
 `evictUrl` / `evict`, or read that entry once without `into`. Callers that join
-an in-flight download (single-flight) never receive the leader's buffer — they
-get their own copy, or their own `into` — see
+an in-flight download (single-flight) never receive the leader's `into`
+buffer — they get their own copy, or their own `into` — see
 [ADR 0009](https://github.com/hdae/fetch-cache/blob/main/docs/decisions/0009-into-caller-buffer.md).
 
 ### Auth & abort
@@ -525,8 +525,8 @@ only job, so there is nothing to degrade to (see Large assets).
 > caching, `evictUrl`, and `clearCache` work on every Deno version.
 
 The JavaScript floor is Baseline 2024: `Promise.withResolvers` (Safari 17.4,
-Chrome 119, Firefox 121, Deno 1.38 and later) is used by the single-flight
-path. The type definitions assume TypeScript 5.7 or later, where `Uint8Array`
+Chrome 119, Firefox 121, Deno 1.38, Node.js 22 and later) is used by the
+single-flight path. The type definitions assume TypeScript 5.7 or later, where `Uint8Array`
 takes a type argument (`into` is typed `Uint8Array<ArrayBuffer>`).
 
 In browsers, keep in mind that Cache Storage is subject to the browser's
