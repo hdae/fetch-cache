@@ -2,6 +2,7 @@ import {
   assertEquals,
   assertExists,
   assertRejects,
+  assertStrictEquals,
   assertStringIncludes,
 } from "@std/assert";
 import {
@@ -805,6 +806,36 @@ Deno.test("HfFileSpec.expectedBytes は受信バッファの確保ヒントと�
     controller.enqueue(reused);
     controller.close();
     assertEquals(await promise, new Uint8Array([1, 2, 3, 4, 5, 6]));
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
+Deno.test("HfFileSpec.into は cache 層へ流れ、network もキャッシュヒットも器の prefix view を返す", async () => {
+  const { fetch, calls } = mockFetch(() => new Response(BYTES));
+  const into = new Uint8Array(new ArrayBuffer(16)).fill(0xff);
+  const spec = {
+    path: "model.onnx",
+    sha256: BYTES_SHA256,
+    expectedBytes: BYTES.length,
+    into,
+  };
+  try {
+    const fromNetwork = await fetchHfFile({ repo: REPO, revision: SHA }, spec, {
+      fetch,
+    });
+    assertStrictEquals(fromNetwork.buffer, into.buffer);
+    assertEquals(fromNetwork, BYTES);
+    assertEquals(into[BYTES.length], 0xff, "実長の外へ書いている");
+    assertEquals(calls.length, 1);
+
+    into.fill(0);
+    const fromCache = await fetchHfFile({ repo: REPO, revision: SHA }, spec, {
+      fetch,
+    });
+    assertStrictEquals(fromCache.buffer, into.buffer);
+    assertEquals(fromCache, BYTES);
+    assertEquals(calls.length, 1);
   } finally {
     await caches.delete(CACHE_NAME);
   }

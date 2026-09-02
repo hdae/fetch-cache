@@ -127,6 +127,24 @@ export type FetchBytesOptions = {
    */
   expectedBytes?: number;
   /**
+   * 呼び出し側が確保した**書き込み先バッファ**。指定すると network 受信もキャッシュ読出しも
+   * このバッファの先頭へ直接書き、戻り値はその prefix view（`into.subarray(0, n)`）になる —
+   * 呼び出し毎の確保がゼロになるので、同じバッファを渡し回せば何本読んでも RAM の増分は
+   * バッファ 1 本ぶんで止まる（数百 MiB × 数十本の shard を逐次読む用途。DECIDED:
+   * docs/decisions/0009）。`expectedBytes` の事前確保はこのバッファで置き換わる。
+   *
+   * バッファの**所有権は呼び出し側**にある: 戻り値（と `validate` / `decode` に渡る raw）は
+   * バッファを指す view なので、次に同じバッファへ書くまでに使い終えること。`decode` 併用時は
+   * バッファに入るのは保存形 raw で、戻り値は decode 結果（別バッファ）。
+   *
+   * MUST: 容量不足（実バイト数 > `into.byteLength`）は縮退せず throw する — network 側は受信を
+   * 打ち切ってキャッシュしない、キャッシュヒット側はエントリを消さない（破損でも cache I/O
+   * 失敗でもなく呼び出し側の申告ミス）。`expectedBytes` が容量を超える申告は network に出る前に
+   * throw する。single-flight の合流者へ leader のバッファは渡らない（合流者は自分のコピー、
+   * または自分の `into` を受け取る）。
+   */
+  into?: Uint8Array<ArrayBuffer>;
+  /**
    * ダウンロード進捗（チャンク毎）。キャッシュヒット時は呼ばれない。進捗は任意情報であり、
    * リスナーの throw は取得を落とさない（console.warn で通知して続行 — single-flight の
    * 合流フライトで 1 リスナーの事故が他の呼び出しを巻き添えにしないため。
@@ -304,6 +322,21 @@ const allocateHint = (size: number): Uint8Array<ArrayBuffer> | undefined => {
 };
 
 /**
+ * 呼び出し側バッファ（`into`）の容量不足。呼び出し側の申告ミスなので縮退させない fail loud
+ * （DECIDED: docs/decisions/0009）。キャッシュヒット経路では「破損」でも「cache I/O 失敗」でも
+ * ないため、self-heal（evict）にも network への縮退にも乗せず、`instanceof` で見分けて
+ * そのまま伝える。
+ */
+class IntoCapacityError extends Error {
+  constructor(requestUrl: string, capacity: number, needed: string) {
+    super(
+      `fetch-cache: into の容量 ${capacity} バイトに収まりません（${needed}） (${requestUrl})`,
+    );
+    this.name = "IntoCapacityError";
+  }
+}
+
+/**
  * body を streaming で読み切り、チャンク毎に onProgress を発火する。
  * body が null のランタイム向けに arrayBuffer フォールバックを持つ（そのときは読み切り後に 1 回発火）。
  *
@@ -311,7 +344,11 @@ const allocateHint = (size: number): Uint8Array<ArrayBuffer> | undefined => {
  * チャンクを直接書き込む。チャンク蓄積 → 連結だと連結の瞬間に N + N がヒープに載るため
  * （数 GB 級で実害）、ピークを 1N に抑えるのが目的。申告が外れたら蓄積経路へ落ちるだけで、
  * 申告そのものは検証に使わない（docs/limitations.md の「content-length と突合しない」を維持）。
- * 戻り値は常に buffer 全体を占める tight view（呼び出し側の zero-copy 前提を壊さない）。
+ * 戻り値は buffer 全体を占める tight view（呼び出し側の zero-copy 前提を壊さない）。
+ *
+ * `into`（呼び出し側バッファ）があれば確保せずそこへ書き、戻り値はその prefix view になる。
+ * 容量超過は蓄積経路へ落とせない（呼び出し側の器の外に書く先が無い）ので、受信を打ち切って
+ * throw する（DECIDED: docs/decisions/0009）。
  *
  * 明示 `expectedBytes` の**確保失敗**だけは縮退しない: 縮退した蓄積経路も終端で同じ長さの
  * 連結バッファ（下の `new Uint8Array(loaded)`）を要求し、同じ理由で落ちる。全量ダウンロード後に
@@ -323,10 +360,13 @@ const readBody = async (
   requestUrl: string,
   onProgress?: (progress: FetchProgress) => void,
   expectedBytes?: number,
+  into?: Uint8Array<ArrayBuffer>,
 ): Promise<Uint8Array<ArrayBuffer>> => {
   const total = readTotal(response);
   let buffer: Uint8Array<ArrayBuffer> | undefined;
-  if (expectedBytes !== undefined) {
+  if (into !== undefined) {
+    buffer = into;
+  } else if (expectedBytes !== undefined) {
     if (Number.isSafeInteger(expectedBytes) && expectedBytes > 0) {
       try {
         buffer = new Uint8Array(expectedBytes);
@@ -346,11 +386,20 @@ const readBody = async (
   }
   const body = response.body;
   if (body === null) {
-    // この経路は buffer を使わない（全量が一度ヒープに載るフォールバック）。確保済みでも
-    // 参照を捨てるだけで害はない。
+    // この経路は確保済み buffer を使わない（全量が一度ヒープに載るフォールバック）。確保済みでも
+    // 参照を捨てるだけで害はない。`into` だけは契約（戻り値 = into の prefix view）を守るため写す。
     const bytes = new Uint8Array(await response.arrayBuffer());
     onProgress?.({ loaded: bytes.length, total });
-    return bytes;
+    if (into === undefined) return bytes;
+    if (bytes.length > into.length) {
+      throw new IntoCapacityError(
+        requestUrl,
+        into.length,
+        `受信 ${bytes.length} バイト`,
+      );
+    }
+    into.set(bytes);
+    return into.subarray(0, bytes.length);
   }
   const chunks: Uint8Array[] = [];
   let loaded = 0;
@@ -360,6 +409,15 @@ const readBody = async (
     if (done) break;
     if (buffer !== undefined) {
       if (loaded + value.length > buffer.length) {
+        if (into !== undefined) {
+          // 呼び出し側バッファの外へは書けない。未消費 body を解放してから throw する。
+          await reader.cancel().catch(() => {});
+          throw new IntoCapacityError(
+            requestUrl,
+            into.length,
+            `受信 ${loaded + value.length} バイト以上`,
+          );
+        }
         // 申告超過（Content-Encoding 越しの content-length 等）。ここまでの内容を蓄積経路へ
         // 引き継いで以降は従来どおり溜める。
         chunks.push(buffer.subarray(0, loaded));
@@ -372,6 +430,8 @@ const readBody = async (
     loaded += value.length;
     onProgress?.({ loaded, total });
   }
+  // 呼び出し側バッファは prefix view で返す（tight view にする＝コピーになる — 契約が逆）。
+  if (into !== undefined) return into.subarray(0, loaded);
   // 申告不足（宣言 > 実受信）のときだけ実長へ詰め直す（tight view を保つ）。
   if (buffer !== undefined) {
     return loaded === buffer.length ? buffer : buffer.slice(0, loaded);
@@ -414,12 +474,12 @@ const storableResponse = (bytes: Uint8Array, sha256?: string): Response => {
 };
 
 /**
- * buffer 全体を占める ArrayBuffer 背面の view か（= そのまま digest へ渡せるか）。
- * SharedArrayBuffer 背面はここで弾く（述語が主張する `Uint8Array<ArrayBuffer>` を嘘にしない）。
+ * ArrayBuffer 背面の view か（= そのまま WebCrypto へ渡せるか）。部分ビューでよい —
+ * ハッシュ対象は view の範囲。SharedArrayBuffer 背面だけが拒否される。
  */
-const isTightView = (bytes: Uint8Array): bytes is Uint8Array<ArrayBuffer> =>
-  bytes.buffer instanceof ArrayBuffer && bytes.byteOffset === 0 &&
-  bytes.byteLength === bytes.buffer.byteLength;
+const hasArrayBufferBacking = (
+  bytes: Uint8Array,
+): bytes is Uint8Array<ArrayBuffer> => bytes.buffer instanceof ArrayBuffer;
 
 /**
  * materialize 済みバイト列の一括ハッシュ（native crypto.subtle — 純 TS 逐次実装より速い。
@@ -429,10 +489,9 @@ const isTightView = (bytes: Uint8Array): bytes is Uint8Array<ArrayBuffer> =>
 const sha256HexNative = async (bytes: Uint8Array): Promise<string> => {
   const digest = await crypto.subtle.digest(
     "SHA-256",
-    // MUST: 手前で余計なコピーを作らない — 数 GB 級ではコピー 1 回ぶんが効く。この層が渡す
-    // bytes は tight な ArrayBuffer 背面なのでそのまま渡せる。部分ビュー・SharedArrayBuffer
-    // 背面（WebCrypto が拒否する）が来たときだけコピーで背面を保証する。
-    isTightView(bytes) ? bytes : new Uint8Array(bytes),
+    // MUST: 手前で余計なコピーを作らない — 数 GB 級ではコピー 1 回ぶんが効く。`into` の
+    // prefix view もそのまま渡す。SharedArrayBuffer 背面のときだけコピーで背面を保証する。
+    hasArrayBufferBacking(bytes) ? bytes : new Uint8Array(bytes),
   );
   return Array.from(
     new Uint8Array(digest),
@@ -474,12 +533,14 @@ const checkAndDecode = async (
  * sha256 / validate / decode をこれに適用する（decode との直交 — DECIDED: docs/decisions/0004）。
  */
 type InflightEntry = {
-  /** 先行呼び出しの取得結果。decoded は先行呼び出しのオプションで decode 済みの値。 */
-  promise: Promise<{ raw: Uint8Array; decoded: Uint8Array }>;
+  /** 先行呼び出しの保存形 raw（合流者が各自の sha256 / validate / decode を適用する）。 */
+  promise: Promise<Uint8Array>;
   /** 進捗の fan-out 先（合流者の onProgress もここに登録される）。 */
   listeners: Set<(progress: FetchProgress) => void>;
   /** 直近の進捗。合流時に 1 回即時通知して、合流者の表示を現在地へ追いつかせる。 */
   state: { last?: FetchProgress };
+  /** 合流者の数。leader が `into` を使ったとき、共有する raw をコピーへ切り替える判定に使う。 */
+  followers: number;
 };
 
 const inflight = new Map<string, InflightEntry>();
@@ -553,10 +614,22 @@ const acquireAndDecode = async (
           staleRecord = true;
           await cached.body?.cancel().catch(() => {});
         } else {
-          cachedBytes = new Uint8Array(await cached.arrayBuffer());
+          // 呼び出し側バッファ（into）があればキャッシュ本体を stream でそこへ流し込む
+          // （ヒット毎の確保ゼロ — ADR 0009）。無ければ従来どおり 1 本に materialize する。
+          cachedBytes = opts.into === undefined
+            ? new Uint8Array(await cached.arrayBuffer())
+            : await readBody(
+              cached,
+              requestUrl,
+              undefined,
+              undefined,
+              opts.into,
+            );
         }
       }
     } catch (error) {
+      // 呼び出し側バッファの容量不足は申告ミスであって cache I/O の失敗ではない（縮退させない）。
+      if (error instanceof IntoCapacityError) throw error;
       // 読出し失敗は miss と同じ扱いで network へ縮退する。
       onCacheError({ op: "match", url: requestUrl, error });
     }
@@ -617,6 +690,7 @@ const acquireAndDecode = async (
     requestUrl,
     emitProgress,
     opts.expectedBytes,
+    opts.into,
   );
   // sha256 / validate / decode 成功後にのみ cache.put（不一致物・不正物をキャッシュに
   // 残さない）。失敗はそのまま throw。put するのは常に保存形 raw（decode 前）。
@@ -727,6 +801,17 @@ export const fetchBytesWithKey = async (
       `fetch-cache: recheck は sha256 とセットでのみ指定できます (${requestUrl})`,
     );
   }
+  // 容量を超える申告は必ず容量不足になる（＝受信してから落ちる）ので network に出る前に弾く。
+  if (
+    opts.into !== undefined && opts.expectedBytes !== undefined &&
+    opts.expectedBytes > opts.into.length
+  ) {
+    throw new IntoCapacityError(
+      requestUrl,
+      opts.into.length,
+      `expectedBytes ${opts.expectedBytes} バイト`,
+    );
+  }
 
   // cache 無効の呼び出しは合流しない（非 GET・「必ず新規取得」の意図を保つ）。
   if (opts.cache === false) {
@@ -746,13 +831,26 @@ export const fetchBytesWithKey = async (
   const existing = inflight.get(storageKey);
   if (existing !== undefined) {
     // 合流: raw（保存形）を受け取り、自分の sha256 / validate / decode を適用する。
+    existing.followers += 1;
     if (opts.onProgress !== undefined) {
       const isolated = isolateProgress(opts.onProgress, requestUrl);
       existing.listeners.add(isolated);
       // 直近の進捗を 1 回即時通知して、合流者の表示を現在地へ追いつかせる。
       if (existing.state.last !== undefined) isolated(existing.state.last);
     }
-    const { raw } = await existing.promise;
+    let raw = await existing.promise;
+    if (opts.into !== undefined) {
+      // 共有物（leader の raw）を自分のバッファへ写して契約（戻り値 = into の prefix view）を守る。
+      if (raw.length > opts.into.length) {
+        throw new IntoCapacityError(
+          requestUrl,
+          opts.into.length,
+          `保存形 ${raw.length} バイト`,
+        );
+      }
+      opts.into.set(raw);
+      raw = opts.into.subarray(0, raw.length);
+    }
     return await checkAndDecode(raw, opts);
   }
 
@@ -770,16 +868,42 @@ export const fetchBytesWithKey = async (
     state.last = progress;
     for (const listener of [...listeners]) listener(progress);
   };
-  const promise = acquireAndDecode(requestUrl, storageKey, opts, emit).finally(
-    () => {
-      // 成否に依らずフライトを閉じる（失敗を記憶すると自然回復を妨げる）。合流者は
-      // promise への参照を直接持つため、この削除で取りこぼしは起きない。
-      inflight.delete(storageKey);
-    },
-  );
-  inflight.set(storageKey, { promise, listeners, state });
-  const { decoded } = await promise;
-  return decoded;
+  // 合流者へ渡す raw は leader の結果と別の promise で配る（leader が `into` を使ったときに
+  // 合流者ぶんだけコピーへ差し替えるため）。合流者ゼロで失敗したときの未処理拒否は
+  // leader 自身が下の catch で受けるので、共有側は握って黙らせておく。
+  const shared = Promise.withResolvers<Uint8Array>();
+  shared.promise.catch(() => {});
+  const entry: InflightEntry = {
+    promise: shared.promise,
+    listeners,
+    state,
+    followers: 0,
+  };
+  inflight.set(storageKey, entry);
+  try {
+    const { raw, decoded } = await acquireAndDecode(
+      requestUrl,
+      storageKey,
+      opts,
+      emit,
+    );
+    // MUST: leader が `into` を使ったなら合流者へ raw をそのまま渡さない — raw は leader の
+    // 呼び出し側バッファを指しており、その呼び出し側が次の取得で同じバッファへ書いた瞬間に
+    // 合流者の手元が書き換わる（合流者の検証は非同期で、書き換え前に終わる保証が無い）。
+    // 合流者がいるときだけ共有前にコピーを切る。この resolve は leader の呼び出し側へ制御が
+    // 戻る前に同期で終わるので、コピー元が上書きされることはない。
+    shared.resolve(
+      opts.into !== undefined && entry.followers > 0 ? raw.slice() : raw,
+    );
+    return decoded;
+  } catch (error) {
+    shared.reject(error);
+    throw error;
+  } finally {
+    // 成否に依らずフライトを閉じる（失敗を記憶すると自然回復を妨げる）。合流者は
+    // promise への参照を直接持つため、この削除で取りこぼしは起きない。
+    inflight.delete(storageKey);
+  }
 };
 
 export type PrefetchUrlOptions = {

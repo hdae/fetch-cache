@@ -38,6 +38,15 @@
   content-length 由来の確保失敗は従来どおり「ヒント無し」へ縮退する（サーバ申告は信頼せず、
   実受信が上限に収まるなら取得は成立するため）。形式不正の申告（非整数・0 以下）も従来どおり
   確保を試みる前に「ヒント無し」へ落ちる。
+- **`into` の戻り値は次に同じバッファへ書くまでしか有効でない**（DECIDED:
+  docs/decisions/0009）。バッファは呼び出し側の所有で、戻り値も `validate` / `decode` に渡る
+  保存形 raw もそのバッファを指す view（`decode` 併用時はバッファに保存形・戻り値は decode
+  結果）。容量不足は縮退しない（network は打ち切ってキャッシュしない・キャッシュヒットは
+  throw するがエントリは消さず network へも縮退しない・`expectedBytes` が容量を超える申告は
+  network に出る前に throw）。single-flight の合流者は leader のバッファを共有せず、leader は
+  合流者がいるときだけ共有前に 1 回コピーする（合流者の `into` へは写す）。prefetch は `into`
+  を見ない。`fetchHfFiles` の複数 spec に同じバッファを渡すと戻り値同士が上書きし合う
+  （逐次の `fetchHfFile` で使う）。
 - **`prefetchUrl` の検証は `sha256` 指定時のみ・縮退はしない**（DECIDED:
   docs/decisions/0005 §5）。body をそのまま cache へ流すためバイト列を手元に持てず、
   `validate` フックは走らせられない。唯一の例外が `sha256`（64 桁小文字 hex）で、指定時は

@@ -69,6 +69,16 @@ export type HfFileSpec = {
    * なる。ファイル毎に形式が違うため、呼び出しオプションではなくファイル指定側に置く。
    */
   decode?: DecodeBytes;
+  /**
+   * 呼び出し側が確保した書き込み先バッファ（cache 層の `into` へそのまま転送）。受信も
+   * キャッシュ読出しもこのバッファの先頭へ書き、戻り値はその prefix view になる — 同じ
+   * バッファを渡し回して shard を逐次読めば、RAM の増分はバッファ 1 本ぶんで止まる
+   * （DECIDED: docs/decisions/0009）。容量不足は fail loud。ファイル毎の器なので
+   * ファイル指定側に置く（`fetchHfFiles` で同じバッファを複数ファイルへ渡すと、戻り値同士が
+   * 同じ領域を指して上書きし合う — 逐次の `fetchHfFile` で使うこと）。`prefetchHfFile` は
+   * 見ない（バイト列を手元に持たない）。
+   */
+  into?: Uint8Array<ArrayBuffer>;
 };
 
 const DEFAULT_HUB_URL = "https://huggingface.co";
@@ -228,6 +238,7 @@ const fetchResolvedFile = (
     decode: spec.decode,
     // 既に持っているバイト数申告を受信バッファの確保ヒントとして流す（検証は validate 側）。
     expectedBytes: spec.expectedBytes,
+    into: spec.into,
     onProgress: onProgress === undefined
       ? undefined
       : (progress) => onProgress({ ...progress, path: spec.path }),

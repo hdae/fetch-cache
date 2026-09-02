@@ -32,6 +32,9 @@ HuggingFace Hub layer (`./hf`) is included.
   without an extra full-size copy; `prefetchUrl` streams a response straight
   into the cache and never materializes it at all — optionally verifying a
   `sha256` **in flight**, so a corrupted download never becomes a cache entry
+- **Caller-owned buffers**: pass `into` to read a download _or a cache hit_
+  straight into a buffer you allocated and get a view of it back — reuse one
+  buffer across many shards and the heap never holds more than one of them
 - **HuggingFace layer**: resolves mutable refs (`"main"` etc.) to the current
   commit SHA, then fetches via immutable SHA-pinned URLs; files with a known
   `sha256` are cached under a **content key** (`["hf", kind, repo, path,
@@ -205,6 +208,41 @@ fail for the same reason (Chromium caps a single ArrayBuffer at 2,145,386,496
 bytes). A failing allocation for a server-declared content-length still degrades
 — see [ADR 0007](https://github.com/hdae/fetch-cache/blob/main/docs/decisions/0007-explicit-expected-bytes-fail-loud.md).
 
+### Reusing one buffer across many reads (`into`)
+
+```typescript
+// One buffer sized for the largest shard, reused for every read.
+const into = new Uint8Array(new ArrayBuffer(largestShardBytes));
+for (const shard of shards) {
+  const bytes = await fetchBytes(shard.url, {
+    sha256: shard.sha256,
+    expectedBytes: shard.size,
+    into,
+  });
+  // `bytes` is `into.subarray(0, shard.size)` — consume it before the next
+  // iteration overwrites the buffer.
+  device.queue.writeBuffer(gpuBuffer, shard.offset, bytes);
+}
+```
+
+`into` makes `fetchBytes` write straight into a buffer **you own** — both a
+network download and a cache hit (which is streamed out of Cache Storage
+instead of being materialized with `arrayBuffer()`) — and return a prefix view
+of it. No per-call allocation happens, so a loop over dozens of large shards
+keeps the heap at one buffer's worth instead of leaving a trail of dead
+buffers for the GC to catch up with. The view (and the raw bytes handed to
+`validate` / `decode`) is only valid until the next write into the same
+buffer; with `decode`, the buffer holds the stored form and the decoded form
+is returned separately.
+
+A buffer that is too small fails loud rather than degrading: a network
+download is cancelled at the chunk that overflows and nothing is cached, a
+cache hit throws but keeps the entry, and an `expectedBytes` larger than the
+buffer throws before the request is made. Callers that join an in-flight
+download (single-flight) never receive the leader's buffer — they get their
+own copy, or their own `into` — see
+[ADR 0009](https://github.com/hdae/fetch-cache/blob/main/docs/decisions/0009-into-caller-buffer.md).
+
 ### Auth & abort
 
 ```typescript
@@ -301,8 +339,10 @@ How the cache key is chosen (per file):
   Cache management above).
 
 `expectedBytes` (exact length check) and a custom per-file `validate` run on
-top of the generic layer's hooks, so they also protect cache reads. A per-file
-`decode` maps the stored form to the usage form:
+top of the generic layer's hooks, so they also protect cache reads. `into` (a
+caller-owned buffer, see above) is a per-file setting as well — put it on the
+`HfFileSpec` of sequential `fetchHfFile` reads. A per-file `decode` maps the
+stored form to the usage form:
 
 ```typescript
 import { decodeGzip } from "@hdae/fetch-cache";
