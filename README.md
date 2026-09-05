@@ -316,8 +316,9 @@ Defaults are `{ statuses: [429, 503], maxRetries: 5, baseDelayMs: 1000 }`. A
 `Retry-After` header wins when present — both forms are read, delta-seconds and
 an HTTP-date (a date in the past means "now"), and anything else counts as no
 header, a malformed number such as `1.5` or `+120` included: only a value
-starting with a day name is handed to `Date.parse`, which would otherwise read
-those as dates in the past and retry with no wait at all. The header is
+starting with a letter is handed to `Date.parse` (every RFC 9110 HTTP-date
+starts with a day name), which would otherwise read those as dates in the past
+and retry with no wait at all. The header is
 **followed as given unless you set `maxDelayMs`**, because a long wait from the
 hub means the request will not pass before then; that cap is per wait rather
 than per call, so a server that keeps answering `Retry-After: 3600` is waited

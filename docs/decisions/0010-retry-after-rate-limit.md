@@ -40,8 +40,9 @@
 ### 2. 待機は Retry-After 優先、無ければ指数バックオフ
 
 `Retry-After` は delta-seconds（非負整数の秒）と HTTP-date（現在時刻との差・過去なら 0）の
-両形式を読む。HTTP-date として `Date.parse` に渡すのは**曜日名で始まる値だけ**とする — RFC
-9110 の HTTP-date 3 形式（IMF-fixdate / RFC 850 / asctime）はいずれも曜日名で始まるのに対し、
+両形式を読む。HTTP-date として `Date.parse` に渡すのは**英字で始まる値だけ**とする — RFC
+9110 の HTTP-date 3 形式（IMF-fixdate / RFC 850 / asctime）はいずれも曜日名で始まるので正規の
+値はこの検査で落ちない一方、
 V8 の `Date.parse` は `"1.5"` / `"+120"` のような数値系の書式ミスを 2000 年前後の日付として
 受理してしまい、渡すと「過去 → 待機 0」に化けて rate limit 中の相手へ待機ゼロで連打すること
 になるためである。どちらとしても解釈できない値は「指示なし」へ落とす（サーバの書式ミスで
