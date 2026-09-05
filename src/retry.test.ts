@@ -49,6 +49,25 @@ const failThenBytes = (
   };
 };
 
+/**
+ * 期限付きで待つ。待機の上限・中断が効かなくなる退行は「赤」ではなく実時間のハング
+ * （1〜5 時間）として現れ、`deno test` にはテスト単位のタイムアウトが無い。決着しない経路は
+ * 必ずここを通して有限時間で落とす。
+ */
+const withDeadline = <T>(
+  promise: Promise<T>,
+  ms: number,
+  message: string,
+): Promise<T> => {
+  let deadline: ReturnType<typeof setTimeout> | undefined = undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    deadline = setTimeout(() => reject(new Error(message)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => {
+    clearTimeout(deadline);
+  });
+};
+
 Deno.test("再試行: 429 + Retry-After は既定で 1 回待って取り直し、結果はキャッシュされる", async () => {
   const { fetch, calls } = mockFetch(
     failThenBytes(1, 429, { "retry-after": "0" }),
@@ -153,17 +172,61 @@ Deno.test("再試行: 解釈できない Retry-After は「指示なし」扱い
   }
 });
 
+Deno.test("再試行: 数値系の書式ミスの Retry-After も「指示なし」扱いで baseDelayMs に落ちる", async () => {
+  // Date.parse は "1.5" / "+120" を 2000 年前後の日付として受理する。そのまま渡すと
+  // 「過去の日時 → 待機 0」に化け、rate limit 中の相手へ待機ゼロで打ち直すことになる。
+  try {
+    for (const malformed of ["1.5", "+120", "-5", "1,5"]) {
+      const { fetch, calls } = mockFetch(
+        failThenBytes(1, 429, { "retry-after": malformed }),
+      );
+      const seen: RetryContext[] = [];
+      const bytes = await fetchBytes(URL_A, {
+        fetch,
+        retry: { baseDelayMs: 1, maxRetries: 1 },
+        onRetry: (c) => seen.push(c),
+      });
+      assertEquals(bytes, BYTES_A, malformed);
+      assertEquals(calls.length, 2, malformed); // 書式ミスで取得を落とさない。
+      assertEquals(seen.length, 1, malformed);
+      // 指示として読まない = 待機は baseDelayMs 系列（0 ms の連打にならない）。
+      assertEquals(seen[0].delayMs, 1, malformed);
+      assertEquals(seen[0].retryAfter, malformed); // 生ヘッダはそのまま通知する。
+      await caches.delete(CACHE_NAME);
+    }
+    // 対照: delta-seconds として正しい "0" は指示どおり待機 0（バックオフには落ちない）。
+    const { fetch, calls } = mockFetch(
+      failThenBytes(1, 429, { "retry-after": "0" }),
+    );
+    const seen: RetryContext[] = [];
+    await fetchBytes(URL_A, {
+      fetch,
+      retry: { baseDelayMs: 1, maxRetries: 1 },
+      onRetry: (c) => seen.push(c),
+    });
+    assertEquals(calls.length, 2);
+    assertEquals(seen[0].delayMs, 0);
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
 Deno.test("再試行: maxDelayMs は Retry-After の指示も上限で切る", async () => {
   const { fetch, calls } = mockFetch(
     failThenBytes(1, 429, { "retry-after": "3600" }),
   );
   const seen: RetryContext[] = [];
   try {
-    const bytes = await fetchBytes(URL_A, {
-      fetch,
-      retry: { maxDelayMs: 0 },
-      onRetry: (c) => seen.push(c),
-    });
+    // deadline: 上限が効かなければ実時間で 1 時間待つ経路なので、必ず有限時間で赤くする。
+    const bytes = await withDeadline(
+      fetchBytes(URL_A, {
+        fetch,
+        retry: { maxDelayMs: 0 },
+        onRetry: (c) => seen.push(c),
+      }),
+      2_000,
+      "maxDelayMs で切られず実時間で待っている",
+    );
     assertEquals(bytes, BYTES_A);
     assertEquals(calls.length, 2);
     assertEquals(seen[0].delayMs, 0);
@@ -200,6 +263,48 @@ Deno.test("再試行: 使い切ったら従来の文言で throw し、キャッ
   }
 });
 
+Deno.test("再試行: policy の形式不正は要求を出す前に throw する（network に出ない）", async () => {
+  // NaN・負・非整数・範囲外は「守れない待機は再試行しない」「回数で止まる」の 2 つの MUST を
+  // 裏返す（`maxRetries: NaN` は `attempt >= NaN` が恒偽で止まらない）。sha256 / expectedBytes と
+  // 同じく、network に出る前に fail loud で弾く。
+  const cases = [
+    { retry: { maxDelayMs: NaN }, field: "maxDelayMs" },
+    { retry: { maxRetries: NaN }, field: "maxRetries" },
+    { retry: { maxRetries: 2.5 }, field: "maxRetries" },
+    { retry: { baseDelayMs: -1 }, field: "baseDelayMs" },
+    { retry: { statuses: [200] }, field: "statuses" },
+  ] as const;
+  try {
+    for (const { retry, field } of cases) {
+      const { fetch, calls } = mockFetch(() => new Response(BYTES_A));
+      const error = await assertRejects(
+        () => fetchBytes(URL_A, { fetch, retry }),
+        Error,
+      );
+      assertEquals(
+        error.message.startsWith(`fetch-cache: retry.${field} は`),
+        true,
+        error.message,
+      );
+      assertEquals(calls.length, 0, field); // 要求は 1 度も出ていない。
+    }
+    // prefetchUrl 経路も同じ 1 本を通る（検査の位置は fetchWithRetry の入口）。
+    const { fetch, calls } = mockFetch(() => new Response(BYTES_A));
+    const error = await assertRejects(
+      () => prefetchUrl(URL_A, { fetch, retry: { maxRetries: NaN } }),
+      Error,
+    );
+    assertEquals(
+      error.message.startsWith("fetch-cache: retry.maxRetries は"),
+      true,
+      error.message,
+    );
+    assertEquals(calls.length, 0);
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
 Deno.test("再試行: 対象外ステータスと retry:false は 1 回目でそのまま throw する", async () => {
   const notFound = mockFetch(() =>
     new Response("missing", { status: 404, statusText: "Not Found" })
@@ -221,6 +326,101 @@ Deno.test("再試行: 対象外ステータスと retry:false は 1 回目でそ
     assertEquals(limited.calls.length, 1);
     assertStringIncludes(optedOut.message, "fetch-cache: HTTP 429");
     assertEquals(optedOut.message.includes("再試行"), false);
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
+Deno.test("再試行: retry:false は 503 も 1 回目でそのまま throw する", async () => {
+  // opt-out は既定の対象ステータス全体に効く（429 だけの話ではない）。
+  const { fetch, calls } = mockFetch(() =>
+    new Response("down", {
+      status: 503,
+      statusText: "Service Unavailable",
+      headers: { "retry-after": "0" },
+    })
+  );
+  try {
+    const error = await assertRejects(
+      () => fetchBytes(URL_A, { fetch, retry: false }),
+      Error,
+    );
+    assertEquals(calls.length, 1);
+    assertStringIncludes(error.message, "fetch-cache: HTTP 503");
+    assertEquals(error.message.includes("再試行"), false);
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
+Deno.test("再試行: maxRetries:0 と statuses:[] はどちらも再試行を止める", async () => {
+  const limited = (): Response =>
+    new Response("rate limited", {
+      ...RATE_LIMITED,
+      headers: { "retry-after": "0" },
+    });
+  const capped = mockFetch(limited);
+  const empty = mockFetch(limited);
+  const seen: RetryContext[] = [];
+  try {
+    // 回数側の下限: 0 回なら初回で決着する（対象ステータスでも打ち直さない）。
+    const cappedError = await assertRejects(
+      () =>
+        fetchBytes(URL_A, {
+          fetch: capped.fetch,
+          retry: { maxRetries: 0 },
+          onRetry: (c) => seen.push(c),
+        }),
+      Error,
+    );
+    assertEquals(capped.calls.length, 1);
+    assertStringIncludes(cappedError.message, "fetch-cache: HTTP 429");
+    assertEquals(cappedError.message.includes("再試行"), false);
+
+    // 対象側の下限: 空集合なら 429 も対象外（既定の [429, 503] は置換されている）。
+    const emptyError = await assertRejects(
+      () =>
+        fetchBytes(URL_B, {
+          fetch: empty.fetch,
+          retry: { statuses: [] },
+          onRetry: (c) => seen.push(c),
+        }),
+      Error,
+    );
+    assertEquals(empty.calls.length, 1);
+    assertStringIncludes(emptyError.message, "fetch-cache: HTTP 429");
+    assertEquals(emptyError.message.includes("再試行"), false);
+    assertEquals(seen, []); // どちらの経路でも通知は無い。
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
+Deno.test("再試行: 再試行の後に届いた対象外ステータスにも回数の接尾辞が付く", async () => {
+  // 接尾辞の条件は「最終ステータスが 429 / 503」ではなく「再試行が 1 回以上走った」。
+  let call = 0;
+  const { fetch, calls } = mockFetch(() => {
+    call += 1;
+    return call === 1
+      ? new Response("rate limited", {
+        ...RATE_LIMITED,
+        headers: { "retry-after": "0" },
+      })
+      : new Response("missing", { status: 404, statusText: "Not Found" });
+  });
+  try {
+    const error = await assertRejects(
+      () => fetchBytes(URL_A, { fetch }),
+      Error,
+    );
+    assertEquals(calls.length, 2);
+    assertEquals(
+      error.message.startsWith(
+        `fetch-cache: HTTP 404 Not Found (${URL_A})`,
+      ),
+      true,
+    );
+    assertStringIncludes(error.message, "（再試行 1 回の後）");
   } finally {
     await caches.delete(CACHE_NAME);
   }
@@ -265,6 +465,38 @@ Deno.test("再試行: setTimeout の上限を超える Retry-After は待たず�
   }
 });
 
+Deno.test("再試行: 上限超えで止めても、それまでの再試行回数は文言に残る", async () => {
+  // 1 回目は待てる指示（0 秒）で再試行し、2 回目で待てない指示（30 日）が来る経路。返るのは
+  // 「そのラウンドの応答」で、加算済みの回数は接尾辞に残る（「最初の応答」ではない）。
+  let call = 0;
+  const { fetch, calls } = mockFetch(() => {
+    call += 1;
+    return new Response("rate limited", {
+      ...RATE_LIMITED,
+      headers: { "retry-after": call === 1 ? "0" : "2592000" },
+    });
+  });
+  const seen: RetryContext[] = [];
+  try {
+    const error = await assertRejects(
+      // deadline: 上限判定を落とすと実時間で 30 日待つ経路なので、必ず有限時間で赤くする。
+      () =>
+        withDeadline(
+          fetchBytes(URL_A, { fetch, onRetry: (c) => seen.push(c) }),
+          2_000,
+          "待てない指示で待機に入っている（実時間で待っている）",
+        ),
+      Error,
+    );
+    assertEquals(calls.length, 2); // 2 回目の応答で打ち止め（3 回目は出さない）。
+    assertEquals(seen.length, 1); // 2 回目のラウンドは回数に数えず通知もしない。
+    assertEquals(seen[0].attempt, 1);
+    assertEquals(error.message.endsWith("（再試行 1 回の後）"), true);
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
 Deno.test("再試行: GET / HEAD 以外は再試行しない（cache:false の POST は打ち直さない）", async () => {
   const { fetch, calls } = mockFetch(() =>
     new Response("rate limited", {
@@ -294,6 +526,27 @@ Deno.test("再試行: GET / HEAD 以外は再試行しない（cache:false の P
   }
 });
 
+Deno.test("再試行: HEAD は冪等なので再試行する（cache:false 経由）", async () => {
+  const { fetch, calls } = mockFetch(
+    failThenBytes(1, 429, { "retry-after": "0" }),
+  );
+  const seen: RetryContext[] = [];
+  try {
+    const bytes = await fetchBytes(URL_A, {
+      fetch,
+      cache: false, // GET 以外が通るのはこの経路だけ（DECIDED: docs/decisions/0002）。
+      init: { method: "HEAD" },
+      onRetry: (c) => seen.push(c),
+    });
+    assertEquals(bytes, BYTES_A);
+    assertEquals(calls.length, 2); // 副作用が無い method なので打ち直してよい。
+    assertEquals(seen.length, 1);
+    assertEquals(seen[0].status, 429);
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
 Deno.test("再試行: 待機中の abort は timer を消して signal.reason で reject する", async () => {
   const controller = new AbortController();
   const reason = new Error("呼び出し側からの中断");
@@ -312,28 +565,21 @@ Deno.test("再試行: 待機中の abort は timer を消して signal.reason �
       setTimeout(() => controller.abort(reason), 0);
     },
   });
-  // deadline: 中断が効かなければハングする経路なので、必ず有限時間で赤くする。
-  let deadline: ReturnType<typeof setTimeout> | undefined = undefined;
-  const timeout = new Promise<never>((_, reject) => {
-    deadline = setTimeout(
-      () => reject(new Error("待機が中断されなかった（実時間で待っている）")),
-      2_000,
-    );
-  });
   try {
-    const error = await Promise.race([
+    // deadline: 中断が効かなければハングする経路なので、必ず有限時間で赤くする。
+    const error = await withDeadline(
       promise.then(
         () => {
           throw new Error("abort したのに resolve した");
         },
         (thrown: unknown) => thrown,
       ),
-      timeout,
-    ]);
+      2_000,
+      "待機が中断されなかった（実時間で待っている）",
+    );
     assertStrictEquals(error, reason); // signal.reason がそのまま出る。
     assertEquals(calls.length, 1); // 待機を抜けた先の再取得には進まない。
   } finally {
-    clearTimeout(deadline);
     await caches.delete(CACHE_NAME);
   }
 });
@@ -349,12 +595,17 @@ Deno.test("再試行: 既に aborted の signal では待たずに reject する
   );
   try {
     const error = await assertRejects(
+      // deadline: 既 aborted を見落とすとリスナーは二度と発火せず 1 時間待つ経路になる。
       () =>
-        fetchBytes(URL_A, {
-          fetch,
-          init: { signal: controller.signal },
-          onRetry: () => controller.abort(reason), // 待機に入る直前に中断される。
-        }),
+        withDeadline(
+          fetchBytes(URL_A, {
+            fetch,
+            init: { signal: controller.signal },
+            onRetry: () => controller.abort(reason), // 待機に入る直前に中断される。
+          }),
+          2_000,
+          "既に aborted の signal で待機に入っている（実時間で待っている）",
+        ),
       Error,
     );
     assertStrictEquals(error, reason);
@@ -402,6 +653,76 @@ Deno.test("再試行: prefetchUrl 経路も同じ 1 本を通る", async () => {
     assertEquals(seen.length, 1);
     const cache = await caches.open(CACHE_NAME);
     assertExists(await cache.match(URL_A));
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
+Deno.test("再試行: prefetchUrl の HTTP エラー文言にも再試行回数が付く", async () => {
+  const { fetch, calls } = mockFetch(() =>
+    new Response("rate limited", {
+      ...RATE_LIMITED,
+      headers: { "retry-after": "0" },
+    })
+  );
+  try {
+    const error = await assertRejects(
+      () =>
+        prefetchUrl(URL_A, {
+          fetch,
+          retry: { maxRetries: 1, baseDelayMs: 0 },
+        }),
+      Error,
+    );
+    assertEquals(calls.length, 2); // 初回 + 再試行 1 回。
+    // 先頭部分は fetchBytes 側と同じ従来文言で、回数だけが末尾に足される。
+    assertEquals(
+      error.message.startsWith(
+        `fetch-cache: HTTP 429 Too Many Requests (${URL_A})`,
+      ),
+      true,
+    );
+    assertStringIncludes(error.message, "（再試行 1 回の後）");
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
+Deno.test("再試行: single-flight の合流者は leader の再試行を待つ（合流者の retry / onRetry は使われない）", async () => {
+  // 再試行は leader のフライトの中で完結する。合流者が渡した retry: false / onRetry は
+  // 取得そのものに関わらないので効かない（docs/limitations.md の合流者一覧）。
+  const gate = Promise.withResolvers<void>();
+  let first = true;
+  const { fetch, calls } = mockFetch(async () => {
+    if (first) {
+      first = false;
+      // leader が network に出た状態で止め、決着前に合流者を作らせる。
+      await gate.promise;
+      return new Response("rate limited", {
+        ...RATE_LIMITED,
+        headers: { "retry-after": "0" },
+      });
+    }
+    return new Response(BYTES_A);
+  });
+  const leaderSeen: RetryContext[] = [];
+  const joinerSeen: RetryContext[] = [];
+  try {
+    const leader = fetchBytes(URL_A, {
+      fetch,
+      onRetry: (c) => leaderSeen.push(c),
+    });
+    const joiner = fetchBytes(URL_A, {
+      fetch,
+      retry: false,
+      onRetry: (c) => joinerSeen.push(c),
+    });
+    gate.resolve();
+    assertEquals(await leader, BYTES_A);
+    assertEquals(await joiner, BYTES_A); // 合流者も 429 ではなく再試行後の結果を受け取る。
+    assertEquals(calls.length, 2); // leader の 429 → 200 のみ（合流者は network に出ない）。
+    assertEquals(leaderSeen.length, 1);
+    assertEquals(joinerSeen, []);
   } finally {
     await caches.delete(CACHE_NAME);
   }

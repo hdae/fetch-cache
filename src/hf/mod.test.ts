@@ -1310,6 +1310,67 @@ Deno.test("fetchHfFile / prefetchHfFile: ちょうど expectedBytes ぶんなら
   }
 });
 
+Deno.test("fetchHfFile: into 使用時も受信上限が先に立つ（器不足ではなく申告違反で落ちる）", async () => {
+  // 判定順の MUST（ADR 0011）: 上限を渡す HF 層では expectedBytes <= into.length が入口で
+  // 保証されているので、超過は必ず「申告違反」として報告されなければならない。
+  let supplied = (): number => 0;
+  const { fetch } = mockFetch(() => {
+    const lazy = lazyChunks([FOUR(), FOUR(), FOUR()]);
+    supplied = lazy.supplied;
+    return lazy.response;
+  });
+  const into = new Uint8Array(new ArrayBuffer(6));
+  try {
+    const error = await assertRejects(
+      () =>
+        fetchHfFile(
+          { repo: REPO, revision: SHA },
+          { path: "model.onnx", expectedBytes: 6, into },
+          { fetch },
+        ),
+      Error,
+    );
+    assertEquals(error.name === "IntoCapacityError", false, error.message);
+    assertStringIncludes(error.message, "受信が申告 6 バイトを超えた");
+    assertEquals(error.message.includes("into の容量"), false);
+    assertEquals(supplied(), 2); // 3 チャンク目は要求されない。
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
+Deno.test("fetchHfFile: expectedBytes:0 は妥当な申告（空は成功・1 バイトで超過）", async () => {
+  // 0 バイトファイルの申告は形式不正ではない。確保ヒントとしては無視されるが、上限としては
+  // 効く（0 を超えた時点で打ち切る）。
+  const { fetch } = mockFetch((url) =>
+    url.endsWith("/empty.bin")
+      ? new Response(new Uint8Array(0))
+      : new Response(new Uint8Array([9]))
+  );
+  try {
+    const bytes = await fetchHfFile(
+      { repo: REPO, revision: SHA },
+      { path: "empty.bin", expectedBytes: 0 },
+      { fetch },
+    );
+    assertEquals(bytes.length, 0);
+
+    const error = await assertRejects(
+      () =>
+        fetchHfFile(
+          { repo: REPO, revision: SHA },
+          { path: "one.bin", expectedBytes: 0 },
+          { fetch },
+        ),
+      Error,
+    );
+    // 全量後の「バイト数不一致」ではなく、超過時点での打ち切りとして落ちる。
+    assertStringIncludes(error.message, "受信が申告 0 バイトを超えた");
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
 Deno.test("fetchHfFile: expectedBytes に足りない受信は従来どおり全量後の不一致で落ちる", async () => {
   let supplied = (): number => 0;
   const { fetch } = mockFetch(() => {

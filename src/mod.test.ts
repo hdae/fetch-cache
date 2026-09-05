@@ -2753,6 +2753,51 @@ Deno.test("prefetchUrl: body が null の応答でも sha256 は検証される"
   }
 });
 
+Deno.test("受信上限: body が null の経路でも判定は onProgress より先（進捗に超過を流さない）", async () => {
+  // この経路は打ち切れない（全量が届いてから手元に来る）ので受信量は確定値になり、文言に
+  // 「以上」は付かない。超過した loaded を進捗として流さないのは stream 経路と同じ契約。
+  const { fetch } = mockFetch(() => bodilessResponse(BYTES_A));
+  const fetched: number[] = [];
+  const prefetched: number[] = [];
+  try {
+    const error = await assertRejects(
+      () =>
+        fetchBytesWithKey(URL_A, undefined, {
+          fetch,
+          maxBytes: 2,
+          onProgress: (p) => fetched.push(p.loaded),
+        }),
+      Error,
+    );
+    assertStringIncludes(
+      error.message,
+      "受信が申告 2 バイトを超えた（5 バイト）",
+    );
+    assertEquals(fetched, []);
+
+    const prefetchError = await assertRejects(
+      () =>
+        prefetchUrlWithKey(URL_B, undefined, {
+          fetch,
+          maxBytes: 2,
+          onProgress: (p) => prefetched.push(p.loaded),
+        }),
+      Error,
+    );
+    assertStringIncludes(
+      prefetchError.message,
+      "受信が申告 2 バイトを超えた（5 バイト）",
+    );
+    assertEquals(prefetched, []);
+    // put の前に落ちるのでエントリは成立しない。
+    const cache = await caches.open(CACHE_NAME);
+    assertEquals(await cache.match(URL_A), undefined);
+    assertEquals(await cache.match(URL_B), undefined);
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
 Deno.test("prefetchUrl: 既存エントリの記録が期待 sha256 と食い違えば温め直して置換する", async () => {
   const { fetch, calls } = mockFetch(() => new Response(BYTES_A));
   try {
