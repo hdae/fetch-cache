@@ -10,15 +10,26 @@
  * @module
  */
 
-/** 再試行方針。省略時は既定値。`retry: false` で再試行しない（従来どおり即 throw）。 */
+/**
+ * 再試行方針。省略時は既定値。`retry: false` で再試行しない（従来どおり即 throw）。
+ *
+ * 各値は形式検査され、外れた値は network に出る前に throw する（`sha256` / `expectedBytes` の
+ * 形式検査と同じ fail loud — NaN 等を黙って受けると待機の上限ガードが素通りする）。
+ */
 export type RetryPolicy = {
-  /** 再試行する HTTP ステータス。既定 [429, 503]。 */
+  /** 再試行する HTTP ステータス（**400〜599 の整数**）。既定 [429, 503]。 */
   statuses?: readonly number[];
-  /** 再試行の最大回数（初回の要求は数えない）。既定 5。 */
+  /** 再試行の最大回数（初回の要求は数えない。**0 以上の整数**）。既定 5。 */
   maxRetries?: number;
-  /** Retry-After が無いときの 1 回目の待機 ms。以後 2 倍ずつ（1, 2, 4, 8, 16 秒）。既定 1000。 */
+  /**
+   * Retry-After が無いときの待機の基準 ms（**0 以上の有限数**）。既定 1000。待機は再試行の
+   * 通算回数で 2 倍ずつ伸びる（1, 2, 4, 8, 16 秒 — Retry-After に従った回も回数に数える）。
+   */
   baseDelayMs?: number;
-  /** 待機の上限 ms（Retry-After の指示にも適用）。省略時は上限なし（サーバの指示どおり待つ）。 */
+  /**
+   * 待機の上限 ms（**0 以上の有限数**。Retry-After の指示にも適用）。省略時は上限なし
+   * （サーバの指示どおり待つ）。
+   */
   maxDelayMs?: number;
 };
 
@@ -56,17 +67,60 @@ const isRetriableMethod = (method: string): boolean =>
   method === "GET" || method === "HEAD";
 
 /**
- * Retry-After の解釈。delta-seconds（非負整数の秒）と HTTP-date（現在時刻との差・過去なら 0）
- * の 2 形式を読む。どちらとしても解釈できない値は undefined =「指示なし」へ落とす
- * （サーバの書式ミスで取得を落とさない — 待機規則の既定へ委ねれば済む）。
+ * Retry-After の解釈。delta-seconds（非負整数の秒）と HTTP-date（曜日名で始まる日時 —
+ * 現在時刻との差・過去なら 0）の 2 形式を読む。どちらとしても解釈できない値は undefined
+ * =「指示なし」へ落とす（サーバの書式ミスで取得を落とさない — 待機規則の既定へ委ねれば済む）。
+ *
+ * MUST: 英字で始まらない値を `Date.parse` に渡さない — V8 は "1.5" / "+120" のような数値系の
+ * 書式ミスを 2000 年前後の日付として受理するので、渡すと「過去 → 待機 0」に化けて「指示なし」へ
+ * 落とせない（rate limit 中の相手へ待機ゼロで連打することになる）。RFC 9110 の HTTP-date 3 形式
+ * （IMF-fixdate / RFC 850 / asctime）はいずれも曜日名で始まるため、この検査で正規の値は落ちない。
  */
 const parseRetryAfter = (value: string | undefined): number | undefined => {
   if (value === undefined) return undefined;
   const trimmed = value.trim();
   if (/^\d+$/.test(trimmed)) return Number(trimmed) * 1000;
+  if (!/^[A-Za-z]/.test(trimmed)) return undefined;
   const at = Date.parse(trimmed);
   if (Number.isNaN(at)) return undefined;
   return Math.max(0, at - Date.now());
+};
+
+/**
+ * RetryPolicy の形式検査（要求の前に fail loud）。NaN は `Math.min` を通っても NaN のままで
+ * `NaN > MAX_TIMER_MS` が偽になり「守れない待機は再試行しない」ガードを素通りする。
+ * `maxRetries: NaN` は `attempt >= NaN` が恒偽で回数では止まらなくなる。黙って受けるとこの
+ * 2 つの MUST が裏返るため、`expectedBytes` / `sha256` と同じく入口で弾く。
+ */
+const validatePolicy = (policy: RetryPolicy, url: string): void => {
+  const { statuses, maxRetries, baseDelayMs, maxDelayMs } = policy;
+  if (
+    maxRetries !== undefined &&
+    (!Number.isSafeInteger(maxRetries) || maxRetries < 0)
+  ) {
+    throw new Error(
+      `fetch-cache: retry.maxRetries は 0 以上の整数で指定してください: ${maxRetries} (${url})`,
+    );
+  }
+  for (
+    const [name, value] of [
+      ["baseDelayMs", baseDelayMs],
+      ["maxDelayMs", maxDelayMs],
+    ] as const
+  ) {
+    if (value !== undefined && !(Number.isFinite(value) && value >= 0)) {
+      throw new Error(
+        `fetch-cache: retry.${name} は 0 以上の有限数で指定してください: ${value} (${url})`,
+      );
+    }
+  }
+  for (const status of statuses ?? []) {
+    if (!Number.isSafeInteger(status) || status < 400 || status > 599) {
+      throw new Error(
+        `fetch-cache: retry.statuses は 400〜599 の整数で指定してください: ${status} (${url})`,
+      );
+    }
+  }
 };
 
 /**
@@ -136,10 +190,13 @@ export const retrySuffix = (retries: number): string =>
  * 接続リソースを保持し続けるため）。`onRetry` は待機の**前**に呼ぶ。
  *
  * 再試行しないのは 2 つ。①GET / HEAD 以外（`cache: false` 経由の POST 等 — 副作用のある
- * 要求を盲目的に打ち直さない）②`maxDelayMs` 適用後の待機が `MAX_TIMER_MS` を超えるとき
- * （setTimeout が即時発火するので「待った」ことにできない）。どちらも最初の応答をそのまま
- * 返し、再試行回数にも数えない（`onRetry` も呼ばない）— 呼び出し点が従来どおりの文言で
- * 落とす（DECIDED: docs/decisions/0010）。
+ * 要求を盲目的に打ち直さない）は最初の応答をそのまま返す（`retries` は 0）。②`maxDelayMs`
+ * 適用後の待機が `MAX_TIMER_MS` を超えるとき（setTimeout が即時発火するので「待った」ことに
+ * できない）は**そのラウンドの応答**をそのまま返す — そのラウンドは再試行回数に数えず
+ * `onRetry` も呼ばないが、それまでに再試行していれば `retries` にはその回数が残り、呼び出し点の
+ * 文言末尾にも付く（DECIDED: docs/decisions/0010）。
+ *
+ * `policy` の形式不正（NaN・負・非整数・範囲外のステータス）は要求の前に throw する。
  */
 export const fetchWithRetry = async (
   fetchImpl: typeof globalThis.fetch,
@@ -148,6 +205,7 @@ export const fetchWithRetry = async (
   policy: RetryPolicy | false | undefined,
   onRetry: ((context: RetryContext) => void) | undefined,
 ): Promise<RetryOutcome> => {
+  if (policy !== undefined && policy !== false) validatePolicy(policy, url);
   if (
     policy === false ||
     !isRetriableMethod((init?.method ?? "GET").toUpperCase())
