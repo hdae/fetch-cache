@@ -316,7 +316,11 @@ Defaults are `{ statuses: [429, 503], maxRetries: 5, baseDelayMs: 1000 }`. A
 `Retry-After` header wins when present — both forms are read, delta-seconds and
 an HTTP-date (a date in the past means "now") — and **it is followed as given
 unless you set `maxDelayMs`**, because a long wait from the hub means the
-request will not pass before then. Without the header the wait doubles from
+request will not pass before then. A wait `setTimeout` cannot hold (longer than
+`2**31 - 1` ms, about 24.8 days — it would fire immediately instead of waiting)
+is not honored and not retried: the response comes back as it is, uncounted and
+without an `onRetry` call, so pass `maxDelayMs` when you would rather cap the
+wait and retry anyway. Without the header the wait doubles from
 `baseDelayMs` (1, 2, 4, 8, 16 seconds). `onRetry` is called _before_ each wait
 and a throwing listener never fails the download (it is warned about and
 ignored, like `onProgress`). Waiting respects the `AbortSignal` you passed via

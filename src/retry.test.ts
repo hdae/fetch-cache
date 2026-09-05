@@ -13,6 +13,7 @@ import { mockFetch } from "./testing/mock_fetch.ts";
 const CACHE_NAME = "fetch-cache";
 
 const URL_A = "https://example.com/assets/a.bin";
+const URL_B = "https://example.com/assets/b.bin";
 const BYTES_A = new Uint8Array([1, 2, 3, 4, 5]);
 const SHA = "0123456789abcdef0123456789abcdef01234567";
 const REPO = "owner/name";
@@ -215,6 +216,74 @@ Deno.test("再試行: 対象外ステータスと retry:false は 1 回目でそ
     assertEquals(limited.calls.length, 1);
     assertStringIncludes(optedOut.message, "fetch-cache: HTTP 429");
     assertEquals(optedOut.message.includes("再試行"), false);
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
+Deno.test("再試行: setTimeout の上限を超える Retry-After は待たずに応答を返す（再試行しない）", async () => {
+  // 2592000 秒 = 30 日 > 2**31-1 ms（約 24.8 日）。待てないので再試行に意味が無い経路。
+  const { fetch, calls } = mockFetch(() =>
+    new Response("rate limited", {
+      ...RATE_LIMITED,
+      headers: { "retry-after": "2592000" },
+    })
+  );
+  const seen: RetryContext[] = [];
+  try {
+    const error = await assertRejects(
+      () => fetchBytes(URL_A, { fetch, onRetry: (c) => seen.push(c) }),
+      Error,
+    );
+    assertEquals(calls.length, 1); // 即時発火で打ち直さない（待ったことにできないため）。
+    assertEquals(seen, []); // 再試行していないので通知も無い。
+    assertStringIncludes(error.message, "fetch-cache: HTTP 429");
+    assertEquals(error.message.includes("再試行"), false); // 回数にも数えない。
+
+    // 対照: maxDelayMs で待機を切れば、同じ応答でも従来どおり再試行する（判定は上限適用後）。
+    const capped = mockFetch(
+      failThenBytes(1, 429, { "retry-after": "2592000" }),
+    );
+    assertEquals(
+      await fetchBytes(URL_B, {
+        fetch: capped.fetch,
+        retry: { maxDelayMs: 0 },
+        onRetry: (c) => seen.push(c),
+      }),
+      BYTES_A,
+    );
+    assertEquals(capped.calls.length, 2);
+    assertEquals(seen.length, 1);
+    assertEquals(seen[0].delayMs, 0);
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
+Deno.test("再試行: GET / HEAD 以外は再試行しない（cache:false の POST は打ち直さない）", async () => {
+  const { fetch, calls } = mockFetch(() =>
+    new Response("rate limited", {
+      ...RATE_LIMITED,
+      headers: { "retry-after": "0" },
+    })
+  );
+  const seen: RetryContext[] = [];
+  try {
+    const error = await assertRejects(
+      () =>
+        fetchBytes(URL_A, {
+          fetch,
+          cache: false, // 非 GET が通るのはこの経路だけ（DECIDED: docs/decisions/0002）。
+          init: { method: "POST", body: "payload" },
+          onRetry: (c) => seen.push(c),
+        }),
+      Error,
+    );
+    // 副作用のある要求を打ち直さない = 429 でも 1 回きり。
+    assertEquals(calls.length, 1);
+    assertEquals(seen, []);
+    assertStringIncludes(error.message, "fetch-cache: HTTP 429");
+    assertEquals(error.message.includes("再試行"), false);
   } finally {
     await caches.delete(CACHE_NAME);
   }

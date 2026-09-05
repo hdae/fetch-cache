@@ -45,6 +45,17 @@ const DEFAULT_MAX_RETRIES = 5;
 const DEFAULT_BASE_DELAY_MS = 1000;
 
 /**
+ * setTimeout が扱える待機の上限（符号付き 32bit の最大 = 約 24.8 日）。これを超える指定は
+ * 実装が 1 に潰して**即時発火**する（Deno は TimeoutOverflowWarning を出す）ため、待った
+ * ことにできない。MUST: 超える待機は再試行しない（下の `fetchWithRetry` 参照）。
+ */
+const MAX_TIMER_MS = 2 ** 31 - 1;
+
+/** 再試行してよい method か（副作用のある要求を打ち直さない MUST — 冪等な GET / HEAD だけ）。 */
+const isRetriableMethod = (method: string): boolean =>
+  method === "GET" || method === "HEAD";
+
+/**
  * Retry-After の解釈。delta-seconds（非負整数の秒）と HTTP-date（現在時刻との差・過去なら 0）
  * の 2 形式を読む。どちらとしても解釈できない値は undefined =「指示なし」へ落とす
  * （サーバの書式ミスで取得を落とさない — 待機規則の既定へ委ねれば済む）。
@@ -123,6 +134,12 @@ export const retrySuffix = (retries: number): string =>
  *
  * 待機は `init.signal` で中断でき、再試行の前に失敗応答の body は解放する（未消費 body は
  * 接続リソースを保持し続けるため）。`onRetry` は待機の**前**に呼ぶ。
+ *
+ * 再試行しないのは 2 つ。①GET / HEAD 以外（`cache: false` 経由の POST 等 — 副作用のある
+ * 要求を盲目的に打ち直さない）②`maxDelayMs` 適用後の待機が `MAX_TIMER_MS` を超えるとき
+ * （setTimeout が即時発火するので「待った」ことにできない）。どちらも最初の応答をそのまま
+ * 返し、再試行回数にも数えない（`onRetry` も呼ばない）— 呼び出し点が従来どおりの文言で
+ * 落とす（DECIDED: docs/decisions/0010）。
  */
 export const fetchWithRetry = async (
   fetchImpl: typeof globalThis.fetch,
@@ -131,7 +148,10 @@ export const fetchWithRetry = async (
   policy: RetryPolicy | false | undefined,
   onRetry: ((context: RetryContext) => void) | undefined,
 ): Promise<RetryOutcome> => {
-  if (policy === false) {
+  if (
+    policy === false ||
+    !isRetriableMethod((init?.method ?? "GET").toUpperCase())
+  ) {
     return { response: await fetchImpl(url, init), retries: 0 };
   }
   const statuses = policy?.statuses ?? DEFAULT_STATUSES;
@@ -144,13 +164,16 @@ export const fetchWithRetry = async (
     if (!statuses.includes(response.status) || attempt >= maxRetries) {
       return { response, retries: attempt };
     }
-    attempt += 1;
     const retryAfter = response.headers.get("retry-after") ?? undefined;
     // Retry-After があればサーバの指示が優先。無ければ指数バックオフ（既定 1, 2, 4, 8, 16 秒）。
     const delayMs = Math.min(
-      parseRetryAfter(retryAfter) ?? baseDelayMs * 2 ** (attempt - 1),
+      parseRetryAfter(retryAfter) ?? baseDelayMs * 2 ** attempt,
       maxDelayMs ?? Infinity,
     );
+    // MUST: 守れない待機は再試行しない — setTimeout の上限を超える指定は即時発火するので、
+    // 再試行しても「指示を無視して打ち直した」だけになる（回数も 1 回ぶん無駄に減る）。
+    if (delayMs > MAX_TIMER_MS) return { response, retries: attempt };
+    attempt += 1;
     await response.body?.cancel().catch(() => {});
     notifyRetry(onRetry, {
       url,
