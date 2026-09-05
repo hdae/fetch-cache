@@ -468,11 +468,12 @@ const readBody = async (
     // この経路は確保済み buffer を使わない（全量が一度ヒープに載るフォールバック）。確保済みでも
     // 参照を捨てるだけで害はない。`into` だけは契約（戻り値 = into の prefix view）を守るため写す。
     const bytes = new Uint8Array(await response.arrayBuffer());
-    onProgress?.({ loaded: bytes.length, total });
     // この経路は打ち切れない（全量が届いてから手元に来る）ので、受信後に長さで判定する。
+    // stream 経路と同じく、超過した受信量は進捗に流さない（判定は onProgress より先）。
     if (maxBytes !== undefined && bytes.length > maxBytes) {
       throw exceededMaxBytes(requestUrl, maxBytes, bytes.length, false);
     }
+    onProgress?.({ loaded: bytes.length, total });
     if (into === undefined) return bytes;
     if (bytes.length > into.length) {
       throw new IntoCapacityError(
@@ -1260,12 +1261,13 @@ export const prefetchUrlWithKey = async (
   if (body === null) {
     // body が null のランタイム向けフォールバック（この経路だけは全量が一度ヒープに載る）。
     const bytes = new Uint8Array(await response.arrayBuffer());
-    emit?.({ loaded: bytes.length, total });
     // この経路は打ち切れない（全量が届いてから手元に来る）ので受信後に長さで判定する。
-    // まだ put していないので、そのまま throw すればエントリは作られない。
+    // まだ put していないので、そのまま throw すればエントリは作られない。stream 経路と
+    // 同じく、超過した受信量は進捗に流さない（判定は onProgress より先）。
     if (maxBytes !== undefined && bytes.length > maxBytes) {
       throw exceededMaxBytes(requestUrl, maxBytes, bytes.length, false);
     }
+    emit?.({ loaded: bytes.length, total });
     if (hasher !== undefined) {
       hasher.update(bytes);
       const actual = hasher.hex();
