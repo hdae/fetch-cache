@@ -333,7 +333,11 @@ first response. When the retries run out, the error is the familiar
 appended — the prefix is unchanged, so existing matching still works. This
 applies to `prefetchUrl` and to the HF layer as well, where `retry` / `onRetry`
 travel to both the revision resolution and the file download, exactly like
-`init`. See
+`init` — a call that joins an in-flight single-flight fetch waits out the
+leader's retries and its own `retry` / `onRetry` go unused, like the rest of the
+joiner caveats in
+[docs/limitations.md](https://github.com/hdae/fetch-cache/blob/main/docs/limitations.md).
+See
 [ADR 0010](https://github.com/hdae/fetch-cache/blob/main/docs/decisions/0010-retry-after-rate-limit.md).
 
 ### Cache management
