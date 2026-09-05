@@ -321,16 +321,21 @@ Deno.test("single-flight: 取得失敗は合流全員へ伝播するが、失敗
   const { fetch, calls } = mockFetch(async () => {
     await gate.promise;
     attempt++;
+    // 失敗の見本は再試行の対象外ステータスで作る（429 / 503 は既定で取り直されるため —
+    // DECIDED: docs/decisions/0010）。
     return attempt === 1
-      ? new Response("down", { status: 503, statusText: "Service Unavailable" })
+      ? new Response("down", {
+        status: 500,
+        statusText: "Internal Server Error",
+      })
       : new Response(BYTES_A);
   });
   try {
     const first = fetchBytes(URL_A, { fetch });
     const second = fetchBytes(URL_A, { fetch });
     gate.resolve();
-    await assertRejects(() => first, Error, "HTTP 503");
-    await assertRejects(() => second, Error, "HTTP 503");
+    await assertRejects(() => first, Error, "HTTP 500");
+    await assertRejects(() => second, Error, "HTTP 500");
     assertEquals(calls.length, 1);
 
     // フライトは閉じているので、次の呼び出しは新規に取得して成功する。
@@ -2737,8 +2742,10 @@ Deno.test("prefetchUrl: 温め直しの取得が失敗しても既存エント�
   // 「先に delete → 取り直し」だと、delete 後の fetch / put 失敗で温め済みの数 GB だけを
   // 失う失敗窓ができる（レビュー B1）。put は同一キーを置換するので削除は不要 — 失敗時は
   // 旧エントリがそのまま残ることを凍結する。
+  // 失敗の見本は再試行の対象外ステータスで作る（429 / 503 は既定で取り直されるため —
+  // DECIDED: docs/decisions/0010）。
   const { fetch } = mockFetch(() =>
-    new Response("down", { status: 503, statusText: "Service Unavailable" })
+    new Response("down", { status: 500, statusText: "Internal Server Error" })
   );
   try {
     const cache = await caches.open(CACHE_NAME);
@@ -2751,7 +2758,7 @@ Deno.test("prefetchUrl: 温め直しの取得が失敗しても既存エント�
     await assertRejects(
       () => prefetchUrl(URL_A, { fetch, sha256: BYTES_A_SHA256 }),
       Error,
-      "HTTP 503",
+      "HTTP 500",
     );
 
     // 既存エントリは無傷（内容も記録も温め直し前のまま）。
