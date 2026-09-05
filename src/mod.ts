@@ -13,7 +13,9 @@
  * `prefetchUrl` は body をそのまま cache へ流し込む streaming 版で、巨大アセットをヒープに
  * 載せずに温めるためにある（`sha256` を渡せば通過中に検証し、通ったエントリにだけ記録
  * ハッシュを焼く）。取得系はいずれも 429 / 503 を既定で再試行する（`Retry-After` に従い、
- * `retry: false` で従来どおり即 throw — DECIDED: docs/decisions/0010）。
+ * `retry: false` で従来どおり即 throw — DECIDED: docs/decisions/0010）。再試行するのは
+ * **GET / HEAD だけ**で、`cache: false` 経由でしか network に出ない他の method は 429 / 503
+ * でも打ち直さず最初の応答で throw する。
  *
  * キャッシュキーは URL、または**ライブラリが生成する配列キー**（HF 層の内容キー
  * `["hf", kind, repo, path, sha256]` 等。直列化はこの層が所有し、予約 origin の URL へ畳む）。

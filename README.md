@@ -314,28 +314,42 @@ const impatient = await fetchBytes(url, { retry: false });
 
 Defaults are `{ statuses: [429, 503], maxRetries: 5, baseDelayMs: 1000 }`. A
 `Retry-After` header wins when present — both forms are read, delta-seconds and
-an HTTP-date (a date in the past means "now") — and **it is followed as given
-unless you set `maxDelayMs`**, because a long wait from the hub means the
-request will not pass before then. A wait `setTimeout` cannot hold (longer than
-`2**31 - 1` ms, about 24.8 days — it would fire immediately instead of waiting)
-is not honored and not retried: the response comes back as it is, uncounted and
-without an `onRetry` call, so pass `maxDelayMs` when you would rather cap the
-wait and retry anyway. Without the header the wait doubles from
-`baseDelayMs` (1, 2, 4, 8, 16 seconds). `onRetry` is called _before_ each wait
-and a throwing listener never fails the download (it is warned about and
-ignored, like `onProgress`). Waiting respects the `AbortSignal` you passed via
-`init`: an abort rejects with `signal.reason` instead of sleeping it out.
+an HTTP-date (a date in the past means "now"), and anything else counts as no
+header, a malformed number such as `1.5` or `+120` included: only a value
+starting with a day name is handed to `Date.parse`, which would otherwise read
+those as dates in the past and retry with no wait at all. The header is
+**followed as given unless you set `maxDelayMs`**, because a long wait from the
+hub means the request will not pass before then; that cap is per wait rather
+than per call, so a server that keeps answering `Retry-After: 3600` is waited
+out once per retry — five hours in total at the default `maxRetries`. A wait
+`setTimeout` cannot hold (longer than `2**31 - 1` ms, about 24.8 days — it would
+fire immediately instead of waiting) is not honored and not retried: that
+round's response comes back as it is, with the round left out of the count and
+without an `onRetry` call, though retries already made still count and still
+show up in the error message — so pass `maxDelayMs` when you would rather cap
+the wait and retry anyway. Without the header the wait doubles from
+`baseDelayMs` (1, 2, 4, 8, 16 seconds). Malformed policy values (`NaN`,
+negative, a non-integer, a status outside 400–599) throw before any request is
+made. `onRetry` is called _before_ each wait and a throwing listener never fails
+the download (it is warned about and ignored, like `onProgress`). Waiting
+respects the `AbortSignal` you passed via `init`: an abort rejects with
+`signal.reason` instead of sleeping it out.
 
 Only what the status code proves may succeed later is retried. Connection
 errors, transfers cut off mid-body, and every other 4xx / 5xx throw on the
-first response. When the retries run out, the error is the familiar
-`fetch-cache: HTTP 429 Too Many Requests (url)` with `（再試行 N 回の後）`
-appended — the prefix is unchanged, so existing matching still works. This
-applies to `prefetchUrl` and to the HF layer as well, where `retry` / `onRetry`
-travel to both the revision resolution and the file download, exactly like
-`init` — a call that joins an in-flight single-flight fetch waits out the
-leader's retries and its own `retry` / `onRetry` go unused, like the rest of the
-joiner caveats in
+first response. Only `GET` and `HEAD` are retried, too: any other method reaches
+the network through `cache: false` alone, and a request that is not idempotent
+is never re-sent on a guess — there a `429` or `503` throws on the first
+response, whatever `retry` says. When the retries run out, the error is the
+familiar `fetch-cache: HTTP 429 Too Many Requests (url)` with
+`（再試行 N 回の後）` appended — the prefix is unchanged, so existing matching
+still works. The suffix tracks the retry count, not the final status: once a
+retry has run, a `429` that turns into a `404` reports the `404` with the suffix
+on it. This applies to `prefetchUrl` and to the HF layer as well, where
+`retry` / `onRetry` travel to both the revision resolution and the file
+download, exactly like `init` — a call that joins an in-flight single-flight
+fetch waits out the leader's retries and its own `retry` / `onRetry` go unused,
+like the rest of the joiner caveats in
 [docs/limitations.md](https://github.com/hdae/fetch-cache/blob/main/docs/limitations.md).
 See
 [ADR 0010](https://github.com/hdae/fetch-cache/blob/main/docs/decisions/0010-retry-after-rate-limit.md).
@@ -426,7 +440,10 @@ instead of being downloaded in full only to fail the same length check at the
 end (a short response still fails at the end, as before — see
 [ADR 0011](https://github.com/hdae/fetch-cache/blob/main/docs/decisions/0011-hf-expected-bytes-bound.md);
 on the generic layer `expectedBytes` stays an allocation hint and never a
-check). `into` (a
+check). On a runtime that cannot hand the body over as a stream (`response.body`
+is null, so the fallback reads it whole) there is nothing to cut off and the
+length is checked once everything has arrived: the bound changes what the error
+says, not how many bytes cross the wire. `into` (a
 caller-owned buffer, see above) is a per-file setting as well — put it on the
 `HfFileSpec` of sequential `fetchHfFile` reads. A per-file `decode` maps the
 stored form to the usage form:
