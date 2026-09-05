@@ -9,6 +9,7 @@
  * `fetchBytes` の validate フックへ合成され、`sha256` は cache 層の一級オプションへ渡る
  * （キャッシュヒットは記録ハッシュとの突合だけで済み、再ハッシュは走らない — 疑う運用は
  * `recheck`）。ファイル毎の `decode` で「保存形 ≠ 利用形」にも対応する。
+ * revision 解決もファイル取得も 429 / 503 は既定で再試行する（DECIDED: docs/decisions/0010）。
  *
  * @module
  */
@@ -25,10 +26,23 @@ import {
   prefetchUrlWithKey,
   type ValidateBytes,
 } from "../core.ts";
+import {
+  fetchWithRetry,
+  type RetryContext,
+  type RetryPolicy,
+  retrySuffix,
+} from "../retry.ts";
 
 // `./hf` の公開シグネチャに現れる cache 層の型を再公開する（`./hf` 単独利用者が `.`
 // エントリを併せて import しなくて済むように。`.` エントリの同名型と同一物）。
-export type { CacheErrorContext, DecodeBytes, FetchProgress, ValidateBytes };
+export type {
+  CacheErrorContext,
+  DecodeBytes,
+  FetchProgress,
+  RetryContext,
+  RetryPolicy,
+  ValidateBytes,
+};
 
 export type HfRepoKind = "model" | "dataset" | "space";
 
@@ -141,7 +155,14 @@ export const hfResolveUrl = (ref: HfRepoRef & { path: string }): string => {
  */
 export const resolveHfRevision = async (
   ref: HfRepoRef,
-  opts: { fetch?: typeof globalThis.fetch; init?: RequestInit } = {},
+  opts: {
+    fetch?: typeof globalThis.fetch;
+    init?: RequestInit;
+    /** 再試行方針（cache 層と同じ既定・`false` で無効 — DECIDED: docs/decisions/0010）。 */
+    retry?: RetryPolicy | false;
+    /** 再試行 1 回ごとの通知（待機の前に呼ばれる）。 */
+    onRetry?: (context: RetryContext) => void;
+  } = {},
 ): Promise<string> => {
   const revision = ref.revision ?? "main";
   if (isCommitSha(revision)) return revision;
@@ -151,12 +172,21 @@ export const resolveHfRevision = async (
     encodeURIComponent(revision)
   }`;
   const fetchImpl = opts.fetch ?? globalThis.fetch;
-  const response = await fetchImpl(url, opts.init);
+  // 解決 API も 429 を返す（Hub の rate limit はファイル取得と共通）。cache 層と同じ 1 本を通す。
+  const { response, retries } = await fetchWithRetry(
+    fetchImpl,
+    url,
+    opts.init,
+    opts.retry,
+    opts.onRetry,
+  );
   if (!response.ok) {
     // 未消費 body は接続リソースを保持し続けるため解放してから throw する（mod.ts と同じ扱い）。
     await response.body?.cancel().catch(() => {});
     throw new Error(
-      `fetch-cache: HTTP ${response.status} ${response.statusText} (${url})`,
+      `fetch-cache: HTTP ${response.status} ${response.statusText} (${url})${
+        retrySuffix(retries)
+      }`,
     );
   }
   const info = await response.json() as { sha?: unknown };
@@ -187,6 +217,14 @@ export type HfFetchOptions = {
    * docs/decisions/0006 §2）。`sha256` の無いファイルには影響しない。
    */
   recheck?: boolean;
+  /**
+   * 再試行方針（既定で有効 — 429 / 503 を `Retry-After` に従って取り直す）。`init` と同じく
+   * **revision 解決とファイル取得の両方**へ渡る。`retry: false` で従来どおり即 throw する
+   * （DECIDED: docs/decisions/0010）。
+   */
+  retry?: RetryPolicy | false;
+  /** 再試行 1 回ごとの通知（待機の前に呼ばれる）。revision 解決・ファイル取得の両方から届く。 */
+  onRetry?: (context: RetryContext) => void;
 };
 
 /**
@@ -249,6 +287,8 @@ const fetchResolvedFile = (
       : (progress) => onProgress({ ...progress, path: spec.path }),
     onCacheError: opts.onCacheError,
     init: opts.init,
+    retry: opts.retry,
+    onRetry: opts.onRetry,
     fetch: opts.fetch,
     caches: opts.caches,
   });
@@ -296,6 +336,8 @@ export const fetchHfFile = async (
   const revision = await resolveHfRevision(ref, {
     fetch: opts.fetch,
     init: opts.init,
+    retry: opts.retry,
+    onRetry: opts.onRetry,
   });
   return await fetchResolvedFile(ref, revision, spec, opts);
 };
@@ -309,6 +351,13 @@ export type HfPrefetchOptions = {
   fetch?: typeof globalThis.fetch;
   /** CacheStorage の差し替え（cache 層へそのまま渡す）。既定 globalThis.caches。 */
   caches?: CacheStorage;
+  /**
+   * 再試行方針（既定で有効・`init` と同じく revision 解決とファイル取得の両方へ渡る）。
+   * `retry: false` で従来どおり即 throw する（DECIDED: docs/decisions/0010）。
+   */
+  retry?: RetryPolicy | false;
+  /** 再試行 1 回ごとの通知（待機の前に呼ばれる）。 */
+  onRetry?: (context: RetryContext) => void;
 };
 
 /** `prefetchHfFile` の結果（何をしたか + どの revision / URL を温めたか）。 */
@@ -362,6 +411,8 @@ export const prefetchHfFile = async (
   const revision = await resolveHfRevision(ref, {
     fetch: opts.fetch,
     init: opts.init,
+    retry: opts.retry,
+    onRetry: opts.onRetry,
   });
   const url = hfResolveUrl({ ...ref, revision, path: spec.path });
   const onProgress = opts.onProgress;
@@ -371,6 +422,8 @@ export const prefetchHfFile = async (
       ? undefined
       : (progress) => onProgress({ ...progress, path: spec.path }),
     init: opts.init,
+    retry: opts.retry,
+    onRetry: opts.onRetry,
     fetch: opts.fetch,
     caches: opts.caches,
   });
@@ -393,6 +446,8 @@ export const fetchHfFiles = async <Names extends string>(
   const revision = await resolveHfRevision(ref, {
     fetch: opts.fetch,
     init: opts.init,
+    retry: opts.retry,
+    onRetry: opts.onRetry,
   });
   const entries = await Promise.all(
     names.map(async (name, index) =>

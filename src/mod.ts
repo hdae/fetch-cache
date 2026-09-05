@@ -12,7 +12,8 @@
  * （Node.js 等）では素の fetch にフォールバックする＝キャッシュは正しさの要件ではなく最適化。
  * `prefetchUrl` は body をそのまま cache へ流し込む streaming 版で、巨大アセットをヒープに
  * 載せずに温めるためにある（`sha256` を渡せば通過中に検証し、通ったエントリにだけ記録
- * ハッシュを焼く）。
+ * ハッシュを焼く）。取得系はいずれも 429 / 503 を既定で再試行する（`Retry-After` に従い、
+ * `retry: false` で従来どおり即 throw — DECIDED: docs/decisions/0010）。
  *
  * キャッシュキーは URL、または**ライブラリが生成する配列キー**（HF 層の内容キー
  * `["hf", kind, repo, path, sha256]` 等。直列化はこの層が所有し、予約 origin の URL へ畳む）。
@@ -48,3 +49,6 @@ export type {
   PrefetchUrlOptions,
   ValidateBytes,
 } from "./core.ts";
+// 再試行の公開面（`retry` / `onRetry` の型）。実装は内部モジュール src/retry.ts
+// （DECIDED: docs/decisions/0010）。
+export type { RetryContext, RetryPolicy } from "./retry.ts";

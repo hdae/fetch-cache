@@ -15,6 +15,12 @@
  */
 
 import { createSha256 } from "./sha256.ts";
+import {
+  fetchWithRetry,
+  type RetryContext,
+  type RetryPolicy,
+  retrySuffix,
+} from "./retry.ts";
 
 /** ダウンロード進捗。`total` は content-length ヘッダがあるときだけ入る。 */
 export type FetchProgress = { loaded: number; total?: number };
@@ -177,6 +183,20 @@ export type FetchBytesOptions = {
    *       DECIDED: docs/decisions/0002）。
    */
   init?: RequestInit;
+  /**
+   * 再試行方針（既定で有効）。対象ステータス（既定 429 / 503）の応答は `Retry-After` に
+   * 従って待ってから取り直す。`retry: false` で従来どおり最初の応答で即 throw する
+   * （DECIDED: docs/decisions/0010）。
+   *
+   * NOTE: 再試行するのは HTTP ステータスで見える rate limit / 一時的な不能だけ。接続
+   *       エラー・受信途中の切断は対象外（そのまま throw する）。
+   */
+  retry?: RetryPolicy | false;
+  /**
+   * 再試行 1 回ごとの通知（待機の**前**に呼ばれる）。進捗と同じく任意情報なので、リスナーの
+   * throw は取得を落とさない（console.warn で通知して続行）。
+   */
+  onRetry?: (context: RetryContext) => void;
   /** fetch の差し替え（テスト・カスタム輸送用）。既定 globalThis.fetch。 */
   fetch?: typeof globalThis.fetch;
   /** CacheStorage の差し替え（テストの隔離・故障注入用）。既定 globalThis.caches。 */
@@ -707,13 +727,24 @@ const acquireAndDecode = async (
     }
   }
 
-  const response = await fetchImpl(requestUrl, opts.init);
+  // 429 / 503 は Retry-After に従って取り直す（既定で有効・`retry: false` で従来どおり
+  // 即 throw — DECIDED: docs/decisions/0010）。回数を使い切ったら最後の応答が返り、下の
+  // 従来どおりの文言で落ちる（末尾に再試行回数だけが加わる）。
+  const { response, retries } = await fetchWithRetry(
+    fetchImpl,
+    requestUrl,
+    opts.init,
+    opts.retry,
+    opts.onRetry,
+  );
   if (!response.ok) {
     // 未消費 body は接続リソースを保持し続けるため解放してから throw する。
     // cancel 自体の失敗は握りつぶす（本命の HTTP エラーを優先する後始末）。
     await response.body?.cancel().catch(() => {});
     throw new Error(
-      `fetch-cache: HTTP ${response.status} ${response.statusText} (${requestUrl})`,
+      `fetch-cache: HTTP ${response.status} ${response.statusText} (${requestUrl})${
+        retrySuffix(retries)
+      }`,
     );
   }
   const bytes = await readBody(
@@ -747,7 +778,9 @@ const acquireAndDecode = async (
  * `decode` がキャッシュ内容を拒否したら evict して network から取り直す（self-heal —
  * `sha256` 指定時は「内容が変わった」検知を兼ねる: 同一キーのまま取得元を切り替えると同じ
  * キーへ上書きされる）。network 取得物が検証に落ちたらそのまま throw し、不正物はキャッシュ
- * しない。HTTP エラーは `fetch-cache: HTTP {status} {statusText} ({url})` で throw する。
+ * しない。HTTP エラーは `fetch-cache: HTTP {status} {statusText} ({url})` で throw する
+ * （429 / 503 は既定で Retry-After に従って取り直し、使い切ってから同じ文言で落ちる —
+ * DECIDED: docs/decisions/0010）。
  * cache に入るのは常に保存形（raw）で、戻り値は `decode` 適用後（省略時は raw）。
  *
  * **single-flight**: 同一キー（URL。HF 層経由では内容キー）への並行呼び出しは 1 フライトに
@@ -999,6 +1032,13 @@ export type PrefetchUrlOptions = {
   onProgress?: (progress: FetchProgress) => void;
   /** fetch へそのまま渡す RequestInit（Authorization / AbortSignal など）。GET のみ。 */
   init?: RequestInit;
+  /**
+   * 再試行方針（既定で有効・`fetchBytes` と同じ扱い）。`retry: false` で従来どおり最初の
+   * 応答で即 throw する（DECIDED: docs/decisions/0010）。
+   */
+  retry?: RetryPolicy | false;
+  /** 再試行 1 回ごとの通知（待機の前に呼ばれる）。リスナーの throw は取得を落とさない。 */
+  onRetry?: (context: RetryContext) => void;
   /** fetch の差し替え（テスト・カスタム輸送用）。既定 globalThis.fetch。 */
   fetch?: typeof globalThis.fetch;
   /** CacheStorage の差し替え（テストの隔離・故障注入用）。既定 globalThis.caches。 */
@@ -1025,7 +1065,8 @@ export type PrefetchUrlOptions = {
  * — `cache: false` と同じ割り切り）。
  *
  * **縮退しない（fail loud）**: `caches` が無い / open 失敗 / HTTP エラー / 転送中断 /
- * put 失敗（quota 超過等）はすべて throw する。cache への格納がこの関数の唯一の仕事であり、
+ * put 失敗（quota 超過等）はすべて throw する（HTTP エラーのうち 429 / 503 だけは既定で
+ * Retry-After に従って取り直し、使い切ってから throw する — DECIDED: docs/decisions/0010）。cache への格納がこの関数の唯一の仕事であり、
  * 手元にバイトも残らないので「続行」に意味が無いため（`fetchBytes` の縮退契約
  * ADR 0001 とはここが違う）。呼び出し側は throw を受けたら `fetchBytes` へフォールバック
  * すればよい（そちらは全量をヒープに載せる代わりに cache 失敗でも結果を返す）。
@@ -1103,12 +1144,21 @@ export const prefetchUrlWithKey = async (
   }
 
   const fetchImpl = opts.fetch ?? globalThis.fetch;
-  const response = await fetchImpl(requestUrl, opts.init);
+  // 429 / 503 の再試行は fetchBytes と同じ 1 本を通る（DECIDED: docs/decisions/0010）。
+  const { response, retries } = await fetchWithRetry(
+    fetchImpl,
+    requestUrl,
+    opts.init,
+    opts.retry,
+    opts.onRetry,
+  );
   if (!response.ok) {
     // 未消費 body は接続リソースを保持し続けるため解放してから throw する（fetchBytes と同じ）。
     await response.body?.cancel().catch(() => {});
     throw new Error(
-      `fetch-cache: HTTP ${response.status} ${response.statusText} (${requestUrl})`,
+      `fetch-cache: HTTP ${response.status} ${response.statusText} (${requestUrl})${
+        retrySuffix(retries)
+      }`,
     );
   }
 
