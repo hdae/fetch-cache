@@ -8,7 +8,8 @@
  * がキー（DECIDED: docs/decisions/0006 §4）。`expectedBytes` / カスタム `validate` は
  * `fetchBytes` の validate フックへ合成され、`sha256` は cache 層の一級オプションへ渡る
  * （キャッシュヒットは記録ハッシュとの突合だけで済み、再ハッシュは走らない — 疑う運用は
- * `recheck`）。ファイル毎の `decode` で「保存形 ≠ 利用形」にも対応する。
+ * `recheck`）。ファイル毎の `decode` で「保存形 ≠ 利用形」にも対応する。`expectedBytes` は
+ * 受信の**上限**でもあり、宣言を超えた時点で受信を打ち切る（DECIDED: docs/decisions/0011）。
  * revision 解決もファイル取得も 429 / 503 は既定で再試行する（DECIDED: docs/decisions/0010）。
  *
  * @module
@@ -59,7 +60,12 @@ export type HfRepoRef = {
 
 export type HfFileSpec = {
   path: string;
-  /** バイト数検証（不一致 throw）。Hub 上の保存形 raw に対して。 */
+  /**
+   * バイト数検証（不一致 throw）。Hub 上の保存形 raw に対して。受信が宣言を**超えた**時点で
+   * 打ち切って throw もする（全量受信後の厳密一致で必ず落ちる失敗を早く出すだけ。汎用層の
+   * `expectedBytes` は確保ヒントのままで、この上限は HF 層だけの契約 — DECIDED:
+   * docs/decisions/0011）。`prefetchHfFile` でも上限としてだけ効く。
+   */
   expectedBytes?: number;
   /**
    * 期待 SHA-256（**64 桁の小文字 hex** — 形式不正は network に出る前に throw。不一致も
@@ -281,6 +287,10 @@ const fetchResolvedFile = (
     decode: spec.decode,
     // 既に持っているバイト数申告を受信バッファの確保ヒントとして流す（検証は validate 側）。
     expectedBytes: spec.expectedBytes,
+    // 同じ申告を受信の上限としても渡す。宣言があるファイルは全量受信後の長さ厳密一致
+    // （buildValidate）で必ず落ちるので、超過した時点で打ち切って同じ失敗を早く出す
+    // （汎用層の「ヒントのみ」契約はそのまま — DECIDED: docs/decisions/0011）。
+    maxBytes: spec.expectedBytes,
     into: spec.into,
     onProgress: onProgress === undefined
       ? undefined
@@ -389,10 +399,11 @@ export type HfPrefetchResult = {
  * 一致したエントリにだけ記録ハッシュが焼かれる。以後の `fetchHfFile` はヒット時に記録との
  * 突合だけで済む（再ハッシュ無し — 数 GB のモデルで起動毎の全量ハッシュを避ける本命の
  * 使い方。疑う運用は `HfFetchOptions.recheck`）。
- * NOTE: prefetch が spec から見るのは `sha256` だけ。`expectedBytes`
- *       （`fetchHfFile` では検証 + 確保ヒント）も `spec.validate` も `spec.into`（呼び出し側
- *       バッファ）も、渡しても prefetch では使われない（バイト列を手元に持たないため。
- *       docs/limitations.md）。
+ * NOTE: prefetch が spec から見るのは `sha256` と `expectedBytes` の 2 つ。`expectedBytes` は
+ *       通過中の**受信上限**として働き、宣言を超えた時点で stream を error にして put ごと
+ *       潰す（エントリは成立しない — DECIDED: docs/decisions/0011。読み出し側の長さ厳密一致は
+ *       `fetchHfFile` の担当のまま）。`spec.validate` と `spec.into`（呼び出し側バッファ）は
+ *       渡しても prefetch では使われない（バイト列を手元に持たないため。docs/limitations.md）。
  *
  * **縮退しない（fail loud）**: `caches` 不在・HTTP エラー・転送中断・put 失敗・sha256 不一致は
  * すべて throw する（cache 層 `prefetchUrl` の契約をそのまま継承）。fallback は `fetchHfFile`。
@@ -418,6 +429,9 @@ export const prefetchHfFile = async (
   const onProgress = opts.onProgress;
   const fetched = await prefetchUrlWithKey(url, contentKey(ref, spec), {
     sha256: spec.sha256,
+    // 宣言があれば受信の上限として使う（超過は読み出し時の長さ検証で必ず落ちるので、
+    // 通過中に打ち切って同じ失敗を早く出す — DECIDED: docs/decisions/0011）。
+    maxBytes: spec.expectedBytes,
     onProgress: onProgress === undefined
       ? undefined
       : (progress) => onProgress({ ...progress, path: spec.path }),

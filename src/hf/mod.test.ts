@@ -13,6 +13,7 @@ import {
   prefetchHfFile,
   resolveHfRevision,
 } from "./mod.ts";
+import { listKeys } from "../mod.ts";
 import { mockFetch } from "../testing/mock_fetch.ts";
 
 // 名前空間は内部固定 1 個（cache 層と共通 — DECIDED: docs/decisions/0006 §3）。
@@ -1161,6 +1162,133 @@ Deno.test("prefetchHfFile: onProgress には path が付き、init は解決と�
     assertEquals(calls.length, 2);
     assertEquals(inits[0], init);
     assertEquals(inits[1], init);
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
+// --- HF 層の受信バイト上限（expectedBytes を超えた時点で打ち切る — ADR 0011） ---
+
+/**
+ * 要求されたぶんだけ 1 チャンク供給する Response（highWaterMark 0 = 先読みしない）。
+ * 供給数のカウンタで「受信が途中で打ち切られたか」を観測する。
+ */
+const lazyChunks = (
+  chunks: readonly Uint8Array<ArrayBuffer>[],
+): { response: Response; supplied: () => number } => {
+  let index = 0;
+  const stream = new ReadableStream<Uint8Array<ArrayBuffer>>({
+    pull(controller) {
+      if (index >= chunks.length) {
+        controller.close();
+        return;
+      }
+      controller.enqueue(chunks[index]);
+      index += 1;
+    },
+  }, { highWaterMark: 0 });
+  return { response: new Response(stream), supplied: () => index };
+};
+
+const FOUR = (): Uint8Array<ArrayBuffer> => new Uint8Array([9, 9, 9, 9]);
+
+Deno.test("fetchHfFile: 受信が expectedBytes を超えたら残りを読まずに throw し、キャッシュしない", async () => {
+  let supplied = (): number => 0;
+  const { fetch, calls } = mockFetch(() => {
+    const lazy = lazyChunks([FOUR(), FOUR(), FOUR()]);
+    supplied = lazy.supplied;
+    return lazy.response;
+  });
+  const spec = { path: "model.onnx", expectedBytes: 6 };
+  try {
+    const error = await assertRejects(
+      () => fetchHfFile({ repo: REPO, revision: SHA }, spec, { fetch }),
+      Error,
+    );
+    // 全量後の厳密一致（バイト数不一致）ではなく、超過時点での打ち切りとして落ちる。
+    assertStringIncludes(error.message, "受信が申告 6 バイトを超えた");
+    assertStringIncludes(error.message, "8 バイト以上");
+    assertEquals(supplied(), 2); // 3 チャンク目は要求されない。
+
+    // 不正物はキャッシュしない = 同じ呼び出しは再び network に出る。
+    await assertRejects(
+      () => fetchHfFile({ repo: REPO, revision: SHA }, spec, { fetch }),
+      Error,
+    );
+    assertEquals(calls.length, 2);
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
+Deno.test("prefetchHfFile: 受信が expectedBytes を超えたら throw し、エントリを成立させない", async () => {
+  const { fetch } = mockFetch(() =>
+    lazyChunks([FOUR(), FOUR(), FOUR()]).response
+  );
+  try {
+    const error = await assertRejects(
+      () =>
+        prefetchHfFile(
+          { repo: REPO, revision: SHA },
+          { path: "model.onnx", sha256: BYTES_SHA256, expectedBytes: 6 },
+          { fetch },
+        ),
+      Error,
+    );
+    assertStringIncludes(error.message, "受信が申告 6 バイトを超えた");
+    // 取得内容の不正であって cache I/O の失敗ではない（汎用文言に化けさせない）。
+    assertEquals(error.message.includes("キャッシュ書込みに失敗"), false);
+    assertEquals(await listKeys(["hf"]), []);
+    const cache = await caches.open(CACHE_NAME);
+    assertEquals(
+      await cache.match(contentKeyUrl("model.onnx", BYTES_SHA256)),
+      undefined,
+    );
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
+Deno.test("fetchHfFile / prefetchHfFile: ちょうど expectedBytes ぶんなら成功する", async () => {
+  const { fetch } = mockFetch(() =>
+    lazyChunks([FOUR(), FOUR(), FOUR()]).response
+  );
+  const spec = { path: "model.onnx", expectedBytes: 12 };
+  try {
+    const bytes = await fetchHfFile({ repo: REPO, revision: SHA }, spec, {
+      fetch,
+    });
+    assertEquals(bytes.length, 12);
+    await caches.delete(CACHE_NAME);
+    const result = await prefetchHfFile({ repo: REPO, revision: SHA }, spec, {
+      fetch,
+    });
+    assertEquals(result.fetched, true);
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
+Deno.test("fetchHfFile: expectedBytes に足りない受信は従来どおり全量後の不一致で落ちる", async () => {
+  let supplied = (): number => 0;
+  const { fetch } = mockFetch(() => {
+    const lazy = lazyChunks([FOUR()]);
+    supplied = lazy.supplied;
+    return lazy.response;
+  });
+  try {
+    const error = await assertRejects(
+      () =>
+        fetchHfFile(
+          { repo: REPO, revision: SHA },
+          { path: "model.onnx", expectedBytes: 8 },
+          { fetch },
+        ),
+      Error,
+    );
+    // 上限は「超過」だけを見る。不足は打ち切る理由が無いので検証（validate）の担当のまま。
+    assertStringIncludes(error.message, "バイト数不一致: 4 != 8");
+    assertEquals(supplied(), 1); // 最後まで読み切っている。
   } finally {
     await caches.delete(CACHE_NAME);
   }

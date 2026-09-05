@@ -203,6 +203,22 @@ export type FetchBytesOptions = {
   caches?: CacheStorage;
 };
 
+/**
+ * 内部導管（`fetchBytesWithKey`）専用のオプション。公開 `FetchBytesOptions` には載せない
+ * （パッケージ利用者からは到達不能）。
+ */
+export type FetchBytesWithKeyOptions = FetchBytesOptions & {
+  /**
+   * 受信バイト数の上限。超えた時点で受信を打ち切って throw する（キャッシュしない）。
+   *
+   * 汎用層の `expectedBytes` は確保ヒントのままで検証には使わない（ADR 0005 / 0007）。この
+   * 上限は「全量受信後に長さの厳密一致で**必ず**落ちる」ことが確定している層 — HF 層の
+   * `HfFileSpec.expectedBytes` — が、同じ失敗を早く出すためだけに使う内部の口
+   * （DECIDED: docs/decisions/0011）。
+   */
+  maxBytes?: number;
+};
+
 // 名前空間は内部固定 1 個。区分けはキー先頭要素 + プレフィックス操作で行う（cacheName
 // オプションは 0.5.0 で撤去 — DECIDED: docs/decisions/0006 §3）。
 const DEFAULT_CACHE_NAME = "fetch-cache";
@@ -368,6 +384,23 @@ export class IntoCapacityError extends Error {
 }
 
 /**
+ * 受信バイト上限（内部導管の `maxBytes`）の超過。宣言より多く届いた時点で受信を打ち切る
+ * ため、`atLeast` のときの受信量は「そこまでに読めた分」= 下限になる（DECIDED:
+ * docs/decisions/0011）。`fetchBytes` 経路も `prefetchUrl` 経路も同じ文言で落とす。
+ */
+const exceededMaxBytes = (
+  requestUrl: string,
+  maxBytes: number,
+  received: number,
+  atLeast: boolean,
+): Error =>
+  new Error(
+    `fetch-cache: 受信が申告 ${maxBytes} バイトを超えた（${received} バイト${
+      atLeast ? "以上" : ""
+    }） (${requestUrl})`,
+  );
+
+/**
  * body を streaming で読み切り、チャンク毎に onProgress を発火する。
  * body が null のランタイム向けに arrayBuffer フォールバックを持つ（そのときは読み切り後に 1 回発火）。
  *
@@ -385,6 +418,11 @@ export class IntoCapacityError extends Error {
  * 連結バッファ（下の `new Uint8Array(loaded)`）を要求し、同じ理由で落ちる。全量ダウンロード後に
  * 落とすのは帯域を捨てるだけなので、受信前に fail loud で throw する（DECIDED:
  * docs/decisions/0007。形式不正の申告は従来どおり「ヒント無し」= 確保失敗とは別分岐）。
+ *
+ * `maxBytes`（内部導管専用）があれば、超えた時点で受信を打ち切って throw する。判定は
+ * `into` の容量検査より**先**に行う — 上限を渡す HF 層は `expectedBytes <= into.length` を
+ * 入口で保証しており、超過は常にこちらが先に捕まるべき事象（申告違反であって器不足ではない
+ * — DECIDED: docs/decisions/0011）。
  */
 const readBody = async (
   response: Response,
@@ -393,6 +431,7 @@ const readBody = async (
   expectedBytes?: number,
   into?: Uint8Array<ArrayBuffer>,
   intoSource: "network" | "cache" = "network",
+  maxBytes?: number,
 ): Promise<Uint8Array<ArrayBuffer>> => {
   const total = readTotal(response);
   // 容量不足の文言は出どころで変える — キャッシュ読出しで「受信」と言うとダウンロード失敗に
@@ -430,6 +469,10 @@ const readBody = async (
     // 参照を捨てるだけで害はない。`into` だけは契約（戻り値 = into の prefix view）を守るため写す。
     const bytes = new Uint8Array(await response.arrayBuffer());
     onProgress?.({ loaded: bytes.length, total });
+    // この経路は打ち切れない（全量が届いてから手元に来る）ので、受信後に長さで判定する。
+    if (maxBytes !== undefined && bytes.length > maxBytes) {
+      throw exceededMaxBytes(requestUrl, maxBytes, bytes.length, false);
+    }
     if (into === undefined) return bytes;
     if (bytes.length > into.length) {
       throw new IntoCapacityError(
@@ -447,6 +490,18 @@ const readBody = async (
   while (true) {
     const { done, value } = await reader.read();
     if (done) break;
+    // MUST: `into` の容量検査より先に判定する — 上限を渡す層では `expectedBytes <= into.length`
+    // が保証されており、超過は器不足ではなく申告違反として報告されるべき（ADR 0011）。
+    if (maxBytes !== undefined && loaded + value.length > maxBytes) {
+      // 未消費 body は接続リソースを保持し続けるため解放してから throw する。
+      await reader.cancel().catch(() => {});
+      throw exceededMaxBytes(
+        requestUrl,
+        maxBytes,
+        loaded + value.length,
+        true,
+      );
+    }
     if (buffer !== undefined) {
       if (loaded + value.length > buffer.length) {
         if (into !== undefined) {
@@ -626,7 +681,7 @@ const isolateProgress = (
 const acquireAndDecode = async (
   requestUrl: string,
   storageKey: string,
-  opts: FetchBytesOptions,
+  opts: FetchBytesWithKeyOptions,
   emitProgress: ((progress: FetchProgress) => void) | undefined,
 ): Promise<{ raw: Uint8Array; decoded: Uint8Array }> => {
   const fetchImpl = opts.fetch ?? globalThis.fetch;
@@ -753,6 +808,8 @@ const acquireAndDecode = async (
     emitProgress,
     opts.expectedBytes,
     opts.into,
+    "network",
+    opts.maxBytes,
   );
   // sha256 / validate / decode 成功後にのみ cache.put（不一致物・不正物をキャッシュに
   // 残さない）。失敗はそのまま throw。put するのは常に保存形 raw（decode 前）。
@@ -817,7 +874,7 @@ export const fetchBytes = (
 const runFlight = async (
   requestUrl: string,
   storageKey: string,
-  opts: FetchBytesOptions,
+  opts: FetchBytesWithKeyOptions,
 ): Promise<Uint8Array> => {
   // cache 無効の呼び出しは合流しない（非 GET・「必ず新規取得」の意図を保つ）。
   if (opts.cache === false) {
@@ -925,7 +982,7 @@ const runFlight = async (
 export const fetchBytesWithKey = async (
   url: string | URL,
   key: CacheKey | undefined,
-  opts: FetchBytesOptions = {},
+  opts: FetchBytesWithKeyOptions = {},
 ): Promise<Uint8Array> => {
   const requestUrl = normalizeUrl(url);
 
@@ -1046,6 +1103,18 @@ export type PrefetchUrlOptions = {
 };
 
 /**
+ * 内部導管（`prefetchUrlWithKey`）専用のオプション。公開 `PrefetchUrlOptions` には載せない。
+ */
+export type PrefetchUrlWithKeyOptions = PrefetchUrlOptions & {
+  /**
+   * 受信バイト数の上限。通過中に超えた時点で stream を error にして `cache.put` ごと
+   * reject させる（エントリは成立しない）。用途は `FetchBytesWithKeyOptions.maxBytes` と
+   * 同じ（DECIDED: docs/decisions/0011）。
+   */
+  maxBytes?: number;
+};
+
+/**
  * URL の内容を**ヒープに全量を載せずに**キャッシュへ格納する（streaming prefetch）。
  * network 応答の body をそのまま `cache.put` へ流すため、数 GB 級でも JS ヒープの使用は
  * チャンク数個ぶんで済む。戻り値は「network から取得して格納した」なら true、
@@ -1089,7 +1158,7 @@ export const prefetchUrl = (
 export const prefetchUrlWithKey = async (
   url: string | URL,
   key: CacheKey | undefined,
-  opts: PrefetchUrlOptions = {},
+  opts: PrefetchUrlWithKeyOptions = {},
 ): Promise<boolean> => {
   const requestUrl = normalizeUrl(url);
 
@@ -1166,14 +1235,18 @@ export const prefetchUrlWithKey = async (
   const emit = opts.onProgress === undefined
     ? undefined
     : isolateProgress(opts.onProgress, requestUrl);
+  const maxBytes = opts.maxBytes;
   const hasher = expectedSha256 === undefined ? undefined : createSha256();
   const mismatch = (actual: string): Error =>
     new Error(
       `fetch-cache: prefetch の SHA-256 不一致: ${actual} != ${expectedSha256} (${requestUrl})`,
     );
-  // 不一致は put の reject として現れるが、それは cache I/O の失敗ではなく取得内容の不正。
-  // put のラップメッセージに埋もれさせず本来のエラーを投げるため、ここで捕まえておく。
-  let integrityError: Error | undefined;
+  // 通過中に検出した「取得内容の不正」（sha256 不一致 / 受信上限超過）。どちらも stream を
+  // error にして put ごと reject させるが、それは cache I/O の失敗ではないので、put の
+  // ラップメッセージに埋もれさせず本来のエラーを投げるため捕まえておく。`label` は保険
+  // delete まで失敗したときの報告で事由を名指しするために添える（欧文で始まる語の直前の
+  // 空白は既存文言をそのまま保つためのもの — 下流が読む文字列を理由なく変えない）。
+  let streamFailure: { error: Error; label: string } | undefined;
 
   // 記録ハッシュは Response の構築時点で焼く。put の成立と通過中検証の通過が不可分に
   // なり、「記録だけ付いた不正エントリ」が構造的に作れなくなる（DECIDED: docs/decisions/0005）。
@@ -1187,6 +1260,11 @@ export const prefetchUrlWithKey = async (
     // body が null のランタイム向けフォールバック（この経路だけは全量が一度ヒープに載る）。
     const bytes = new Uint8Array(await response.arrayBuffer());
     emit?.({ loaded: bytes.length, total });
+    // この経路は打ち切れない（全量が届いてから手元に来る）ので受信後に長さで判定する。
+    // まだ put していないので、そのまま throw すればエントリは作られない。
+    if (maxBytes !== undefined && bytes.length > maxBytes) {
+      throw exceededMaxBytes(requestUrl, maxBytes, bytes.length, false);
+    }
     if (hasher !== undefined) {
       hasher.update(bytes);
       const actual = hasher.hex();
@@ -1202,6 +1280,16 @@ export const prefetchUrlWithKey = async (
       new TransformStream<Uint8Array, Uint8Array>({
         transform(chunk, controller) {
           loaded += chunk.byteLength;
+          // 宣言を超えた時点で打ち切る（以降を受け取っても長さ検証は必ず落ちる — ADR 0011）。
+          // stream を error にすれば put ごと reject され、エントリは成立しない。
+          if (maxBytes !== undefined && loaded > maxBytes) {
+            streamFailure = {
+              error: exceededMaxBytes(requestUrl, maxBytes, loaded, true),
+              label: "受信バイト上限の超過",
+            };
+            controller.error(streamFailure.error);
+            return;
+          }
           // 通過中検証があるときはチャンクを複製し、ハッシュと格納へ同じ複製を渡す。元の
           // チャンクは呼び出し側（fetch 差し替えや onProgress リスナー）が参照を握ったまま
           // update 後に書き換えられるため、共有すると「記録は付いたが中身がハッシュと違う」
@@ -1219,8 +1307,8 @@ export const prefetchUrlWithKey = async (
           const actual = hasher.hex();
           if (actual === expectedSha256) return;
           // stream を error にして cache.put ごと reject させる（＝エントリ不成立）。
-          integrityError = mismatch(actual);
-          controller.error(integrityError);
+          streamFailure = { error: mismatch(actual), label: " SHA-256 不一致" };
+          controller.error(streamFailure.error);
         },
       }),
     );
@@ -1232,13 +1320,13 @@ export const prefetchUrlWithKey = async (
   } catch (error) {
     // 転送中断も quota 超過もここに集まる（どちらも put の reject として現れる）。原因は
     // cause に残し、「手元にバイトが無い＝縮退できない」ことを呼び出し側へ伝える。
-    if (integrityError !== undefined) throw integrityError;
+    if (streamFailure !== undefined) throw streamFailure.error;
     throw new Error(
       `fetch-cache: prefetch のキャッシュ書込みに失敗しました（バイト列は手元に残らないため fetchBytes へフォールバックしてください） (${requestUrl})`,
       { cause: error },
     );
   }
-  if (integrityError !== undefined) {
+  if (streamFailure !== undefined) {
     // 保険: stream の error を無視してエントリを作る Cache 実装があっても、記録付きの不正
     // エントリだけは残さない（記録は以後の検証を省かせるので、残ると恒久的に効いてしまう）。
     try {
@@ -1247,11 +1335,11 @@ export const prefetchUrlWithKey = async (
       // 保険まで失敗 = 記録付きの不正エントリが残っている可能性がある。黙殺すると以後の
       // 既定読み出しが記録を信じ続けるため、両方の失敗を束ねて fail loud に出す。
       throw new AggregateError(
-        [integrityError, deleteError],
-        `fetch-cache: prefetch の SHA-256 不一致に加え、不正エントリの削除にも失敗しました（エントリが残っていれば記録が信頼され続けます — evict してください） (${requestUrl})`,
+        [streamFailure.error, deleteError],
+        `fetch-cache: prefetch の${streamFailure.label}に加え、不正エントリの削除にも失敗しました（エントリが残っていれば記録が信頼され続けます — evict してください） (${requestUrl})`,
       );
     }
-    throw integrityError;
+    throw streamFailure.error;
   }
   return true;
 };
