@@ -65,6 +65,10 @@ export type HfFileSpec = {
    * 打ち切って throw もする（全量受信後の厳密一致で必ず落ちる失敗を早く出すだけ。汎用層の
    * `expectedBytes` は確保ヒントのままで、この上限は HF 層だけの契約 — DECIDED:
    * docs/decisions/0011）。`prefetchHfFile` でも上限としてだけ効く。
+   *
+   * **0 以上の安全整数**（負・非整数は network に出る前に throw — `sha256` の形式検査と同じ
+   * 扱い）。実長と一致し得ない申告であり、上限として使う以上そのままだと最初のチャンクで
+   * 「申告を超えた」と落ちて事由が紛れるため。
    */
   expectedBytes?: number;
   /**
@@ -305,10 +309,10 @@ const fetchResolvedFile = (
 };
 
 /**
- * ファイル指定を HfFileSpec へ正規化する（全入口の合流点）。形式不正の `sha256` と、`into` の
- * 容量を超える `expectedBytes` はここで fail loud に弾く — 必ず不一致 / 容量不足になる申告
- * なので、全量ダウンロードしてから落とすと呼び出し毎に帯域を捨てることになる（cache 層の
- * 同じガードと語彙を揃え、path 付きで報告する）。
+ * ファイル指定を HfFileSpec へ正規化する（全入口の合流点）。形式不正の `sha256` /
+ * `expectedBytes` と、`into` の容量を超える `expectedBytes` はここで fail loud に弾く —
+ * 必ず不一致 / 容量不足になる申告なので、全量ダウンロードしてから落とすと呼び出し毎に帯域を
+ * 捨てることになる（cache 層の同じガードと語彙を揃え、path 付きで報告する）。
  */
 // MUST: 各入口で revision 解決（network）より前に呼ぶ — 後に回すと形式不正でも解決 API
 // 1 発（複数ファイルでは兄弟ファイルの取得開始まで）が漏れる。
@@ -317,6 +321,16 @@ const toSpec = (file: string | HfFileSpec): HfFileSpec => {
   if (spec.sha256 !== undefined && !/^[0-9a-f]{64}$/.test(spec.sha256)) {
     throw new Error(
       `fetch-cache: sha256 は 64 桁の小文字 hex で指定してください: ${spec.sha256} (${spec.path})`,
+    );
+  }
+  // 実長になり得ない申告（負・非整数・安全整数の外）は必ず不一致になる。受信の上限としても
+  // 渡すので（ADR 0011）、弾かないと最初のチャンクで「申告を超えた」と落ちて事由が紛れる。
+  if (
+    spec.expectedBytes !== undefined &&
+    (!Number.isSafeInteger(spec.expectedBytes) || spec.expectedBytes < 0)
+  ) {
+    throw new Error(
+      `fetch-cache: expectedBytes は 0 以上の整数で指定してください: ${spec.expectedBytes} (${spec.path})`,
     );
   }
   if (

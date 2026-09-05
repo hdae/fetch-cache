@@ -1073,6 +1073,47 @@ Deno.test("fetchHfFiles: 1 つでも形式不正の spec があれば解決に�
   assertEquals(calls.length, 0); // 正常な兄弟ファイル（good）の取得も始まらない。
 });
 
+Deno.test("fetchHfFile / prefetchHfFile / fetchHfFiles: 形式不正の expectedBytes は要求の前に fail loud", async () => {
+  // 上限として渡すので（ADR 0011）、弾かないと最初のチャンクで「申告を超えた」と落ちて事由が
+  // 紛れる。可変 ref なら解決 API にも出ないこと（検査が解決より前）まで判別できる。
+  const { fetch, calls } = mockFetch((url) =>
+    url.includes("/api/") ? Response.json({ sha: SHA }) : new Response(BYTES)
+  );
+  for (const expectedBytes of [-1, 1.5]) {
+    const error = await assertRejects(
+      () =>
+        fetchHfFile({ repo: REPO }, { path: "model.onnx", expectedBytes }, {
+          fetch,
+        }),
+      Error,
+    );
+    assertStringIncludes(error.message, "expectedBytes は 0 以上の整数");
+    assertStringIncludes(error.message, `: ${expectedBytes} (model.onnx)`);
+  }
+  await assertRejects(
+    () =>
+      prefetchHfFile(
+        { repo: REPO },
+        { path: "model.onnx", expectedBytes: -1 },
+        { fetch },
+      ),
+    Error,
+    "expectedBytes は 0 以上の整数",
+  );
+  await assertRejects(
+    () =>
+      fetchHfFiles(
+        { repo: REPO },
+        { good: "a.bin", bad: { path: "b.bin", expectedBytes: 1.5 } },
+        { fetch },
+      ),
+    Error,
+    "expectedBytes は 0 以上の整数",
+  );
+  // 解決 API にも、正常な兄弟ファイル（good）の取得にも出ない。
+  assertEquals(calls.length, 0);
+});
+
 Deno.test("fetchHfFile / fetchHfFiles: into の容量を超える expectedBytes は可変 ref の解決 API にも出ない", async () => {
   // 固定 SHA だと解決が元々走らず順序の欠陥を検出できない — 可変 ref が唯一の判別点。
   const { fetch, calls } = mockFetch((url) =>
