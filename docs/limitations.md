@@ -32,7 +32,18 @@
 - **`expectedBytes` / content-length は確保ヒントであって検証ではない**（DECIDED:
   docs/decisions/0005）。受信バッファを事前確保して RAM ピークを 1N に抑えるためだけに使い、
   申告と実受信がずれても取得は落とさない（超過なら蓄積経路へ、不足なら実長へ詰め直す）。
-  長さの検証がしたいなら `validate`（HF 層の `expectedBytes`）で行う。
+  長さの検証がしたいなら `validate`（HF 層の `expectedBytes`）で行う。**例外は HF 層だけ** —
+  `HfFileSpec.expectedBytes` は検証を持つ層の宣言なので受信の上限としても働き、超過した時点で
+  打ち切って throw する（DECIDED: docs/decisions/0011。汎用層 `FetchBytesOptions` の契約は
+  ヒントのまま不変で、上限を渡す口は内部導管にしか無い）。
+- **再試行するのはステータスで見える rate limit / 一時的な不能だけ**（DECIDED:
+  docs/decisions/0010）。既定の対象は 429 / 503 で、接続エラー・受信途中の切断・その他の
+  4xx / 5xx は 1 回目でそのまま throw する（成功に転じる根拠が無いため）。**`maxDelayMs` を
+  渡さない限り `Retry-After` の指示どおり待つ** — 上限を勝手に決めないのは、長い待機ほど
+  「その時間待たなければ通らない」ことを意味し、短く切れば再試行を消費するだけになるため。
+  恒久的に 503 を返すサーバに対しては既定で最大 31 秒（1+2+4+8+16）待ってから落ちる。急ぐ
+  呼び出しは `maxRetries` / `maxDelayMs` を絞るか `retry: false` を渡す。合流者（single-flight）
+  の `retry` / `onRetry` は使われない（取得は leader のオプションで走る — 上の single-flight 項）。
 - **確保そのものが落ちたときだけは申告の出どころで扱いが割れる**（DECIDED:
   docs/decisions/0007）。呼び出し側が `expectedBytes` を**明示**していてそのサイズを確保
   できなければ、受信を始める前に body を cancel して throw する（蓄積経路も終端で同じ長さの
@@ -82,10 +93,11 @@
   self-heal で evict されるので恒久化しない）。`caches` 不在・open 失敗・HTTP エラー・転送
   中断・put 失敗（quota 等）・sha256 不一致はすべて throw する（手元にバイトが無く「続行」に
   意味が無いため。ADR 0001 の縮退契約は `fetchBytes` 専用）。
-- **prefetch が見る検証指定は `sha256` だけ**（DECIDED: docs/decisions/0005 §5）。
-  `prefetchHfFile` に `spec.expectedBytes` / `spec.validate` を渡しても prefetch では
-  使われない（バイト列を手元に持たないため。どちらも `fetchHfFile` で読み出すときには
-  通常どおり効く）。
+- **prefetch が見る spec は `sha256` と `expectedBytes` だけ**（DECIDED: docs/decisions/0005
+  §5・0011）。`expectedBytes` は**上限としてだけ**効く — 超過した時点で stream を error に
+  して put ごと潰す（エントリは成立しない）が、**不足は検出しない**（長さの厳密一致は
+  `fetchHfFile` で読み出すときの担当）。`spec.validate` / `spec.into` は prefetch では
+  使われない（バイト列を手元に持たないため。どちらも読み出し時には通常どおり効く）。
 - **prefetch の既存エントリ検査は記録ハッシュ突合のみ（実バイトは検証しない）**（DECIDED:
   docs/decisions/0005 §5・0008）。`sha256` 指定時、既存エントリは記録ハッシュとの文字列
   比較で判定する — 一致なら network に出ない（`prefetchUrl` は false、`prefetchHfFile` は

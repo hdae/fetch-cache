@@ -43,6 +43,10 @@ HuggingFace Hub layer (`./hf`) is included.
   cache hit, and switching revisions keeps both contents side by side
 - **Prefix management**: HF entries can be listed and evicted by key prefix —
   `evict(["hf", "model", "owner/name"])` frees a whole repo
+- **Rate limits absorbed**: a `429` or `503` is retried automatically, honoring
+  the server's `Retry-After` (exponential backoff when there is no header),
+  interruptible through your `AbortSignal` — `retry: false` opts out, `onRetry`
+  observes every wait
 - **fetch-compatible options**: pass a standard `RequestInit` via `init` (auth
   headers for gated repos, `AbortSignal`, …) or swap out `fetch` / `caches`
   (testing, custom transport)
@@ -291,6 +295,43 @@ The cache key is the URL only (headers are not part of it), and only GET can
 be cached — pass `cache: false` for other methods. See
 [docs/limitations.md](https://github.com/hdae/fetch-cache/blob/main/docs/limitations.md).
 
+### Rate limiting (429) and retries
+
+```typescript
+// On by default: 429 and 503 are retried, honoring Retry-After.
+const bytes = await fetchBytes(url);
+
+// Tune it, or watch what happens.
+const tuned = await fetchBytes(url, {
+  retry: { maxRetries: 3, maxDelayMs: 30_000 },
+  onRetry: ({ status, attempt, delayMs, retryAfter }) =>
+    console.log(status, attempt, delayMs, retryAfter),
+});
+
+// Opt out: the first response throws exactly as it did before.
+const impatient = await fetchBytes(url, { retry: false });
+```
+
+Defaults are `{ statuses: [429, 503], maxRetries: 5, baseDelayMs: 1000 }`. A
+`Retry-After` header wins when present — both forms are read, delta-seconds and
+an HTTP-date (a date in the past means "now") — and **it is followed as given
+unless you set `maxDelayMs`**, because a long wait from the hub means the
+request will not pass before then. Without the header the wait doubles from
+`baseDelayMs` (1, 2, 4, 8, 16 seconds). `onRetry` is called _before_ each wait
+and a throwing listener never fails the download (it is warned about and
+ignored, like `onProgress`). Waiting respects the `AbortSignal` you passed via
+`init`: an abort rejects with `signal.reason` instead of sleeping it out.
+
+Only what the status code proves may succeed later is retried. Connection
+errors, transfers cut off mid-body, and every other 4xx / 5xx throw on the
+first response. When the retries run out, the error is the familiar
+`fetch-cache: HTTP 429 Too Many Requests (url)` with `（再試行 N 回の後）`
+appended — the prefix is unchanged, so existing matching still works. This
+applies to `prefetchUrl` and to the HF layer as well, where `retry` / `onRetry`
+travel to both the revision resolution and the file download, exactly like
+`init`. See
+[ADR 0010](https://github.com/hdae/fetch-cache/blob/main/docs/decisions/0010-retry-after-rate-limit.md).
+
 ### Cache management
 
 ```typescript
@@ -370,7 +411,14 @@ How the cache key is chosen (per file):
   Cache management above).
 
 `expectedBytes` (exact length check) and a custom per-file `validate` run on
-top of the generic layer's hooks, so they also protect cache reads. `into` (a
+top of the generic layer's hooks, so they also protect cache reads. On this
+layer `expectedBytes` is an upper bound as well: a response that grows past the
+declared length is cut off at the chunk that crosses it and throws right there,
+instead of being downloaded in full only to fail the same length check at the
+end (a short response still fails at the end, as before — see
+[ADR 0011](https://github.com/hdae/fetch-cache/blob/main/docs/decisions/0011-hf-expected-bytes-bound.md);
+on the generic layer `expectedBytes` stays an allocation hint and never a
+check). `into` (a
 caller-owned buffer, see above) is a per-file setting as well — put it on the
 `HfFileSpec` of sequential `fetchHfFile` reads. A per-file `decode` maps the
 stored form to the usage form:
@@ -403,7 +451,7 @@ const ref = { repo: "owner/name" };
 // Resolve the revision once, then prefetch against the immutable SHA (no
 // repeated resolution requests, no chance of files drifting across revisions).
 const revision = await resolveHfRevision(ref);
-for (const spec of MODEL_FILES) { // [{ path, sha256 }, …] — prefetch reads only sha256
+for (const spec of MODEL_FILES) { // [{ path, sha256 }, …] — prefetch reads sha256 + expectedBytes
   await prefetchHfFile({ ...ref, revision }, spec, {
     onProgress: ({ path, loaded, total }) => console.log(path, loaded, total),
   });
@@ -438,9 +486,11 @@ A few things worth knowing:
   declare a `sha256` and self-heals on a mismatch. Files **without** a
   `sha256` are not affected (there is nothing to compare against) — drop them
   explicitly with `evictUrl(hfResolveUrl({ ...ref, revision, path }))`.
-- `prefetchHfFile` reads only `sha256` from the spec: `expectedBytes` /
-  `validate` / `into` are ignored while warming (no bytes in hand) and apply
-  when the file is read back.
+- `prefetchHfFile` reads `sha256` and `expectedBytes` from the spec — the
+  latter only as the upper bound above, so a response that overruns it never
+  becomes an entry (a short one is not detected while warming: the exact length
+  check belongs to the read). `validate` / `into` are ignored while warming (no
+  bytes in hand) and apply when the file is read back.
 - Free a repo's sha256-declared files with `evict(["hf", "model",
   "owner/name"])`, one file with `evict(["hf", "model", "owner/name",
   "model.onnx"])` (all contents of it), and inspect what is stored with
