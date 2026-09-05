@@ -1492,6 +1492,21 @@ Deno.test("fetchBytes: 申告を超えて届いたら蓄積経路へ落ちて全
   }
 });
 
+Deno.test("fetchBytes: 明示 expectedBytes を超えて届いても全量を返す（汎用層の申告は上限にならない）", async () => {
+  // HF 層の `expectedBytes` は受信の上限だが、汎用層のそれは確保ヒントのまま（ADR 0011 の
+  // 互換の主張）。上限が汎用層まで降りると、この取得は 2 チャンク目で throw に変わる。
+  const { fetch } = mockFetch(() =>
+    chunkedResponse([new Uint8Array([1, 2, 3]), new Uint8Array([4, 5, 6, 7])])
+  );
+  try {
+    const bytes = await fetchBytes(URL_A, { fetch, expectedBytes: 3 });
+    assertEquals(bytes, new Uint8Array([1, 2, 3, 4, 5, 6, 7]));
+    assertEquals(isTightView(bytes), true);
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
 Deno.test("fetchBytes: 申告に足りない受信は実長へ詰め直して tight view で返す", async () => {
   const { fetch } = mockFetch(() =>
     chunkedResponse([new Uint8Array([1, 2, 3])])
@@ -2626,6 +2641,54 @@ Deno.test("prefetchUrl: 保険 delete まで失敗したら黙殺せず両方の
   assertStringIncludes(error.message, "削除にも失敗");
   assertEquals(error.errors.length, 2);
   assertStringIncludes((error.errors[0] as Error).message, "SHA-256 不一致");
+  assertEquals((error.errors[1] as Error).message, "delete failed");
+});
+
+Deno.test("prefetchUrl: 受信上限の超過で保険 delete まで失敗したら、事由を名指しして束ねて throw する", async () => {
+  // 保険 delete 失敗の報告は事由（sha256 不一致 / 受信バイト上限の超過）を名指しする。上限側の
+  // 文言は分岐が違うのでここでしか凍結できない — 取り違えると「SHA-256 不一致」と誤報しても緑。
+  const brokenCaches: CacheStorage = {
+    open: () => {
+      const wrapper = {
+        match: (_request: RequestInfo | URL) => Promise.resolve(undefined),
+        put: async (_request: RequestInfo | URL, response: Response) => {
+          // body を消費して resolve（消費しないと上限の検出そのものが走らない）。
+          await response.arrayBuffer().catch(() => {});
+        },
+        delete: (_request: RequestInfo | URL) =>
+          Promise.reject(new Error("delete failed")),
+        keys: () => Promise.resolve([] as Request[]),
+      };
+      return Promise.resolve(wrapper);
+    },
+    has: () => Promise.resolve(false),
+    delete: () => Promise.resolve(false),
+    keys: () => Promise.resolve([]),
+    match: () => Promise.resolve(undefined),
+  };
+  const { fetch } = mockFetch(() =>
+    chunkedResponse([BYTES_A.slice(0, 2), BYTES_A.slice(2)])
+  );
+
+  const error = await assertRejects(
+    () =>
+      prefetchUrlWithKey(URL_A, undefined, {
+        fetch,
+        maxBytes: 2, // 2 チャンク目（計 5 バイト）で超過する。
+        caches: brokenCaches,
+      }),
+    AggregateError,
+  );
+  assertStringIncludes(
+    error.message,
+    "prefetch の受信バイト上限の超過に加え",
+  );
+  assertStringIncludes(error.message, "削除にも失敗");
+  assertEquals(error.errors.length, 2);
+  assertStringIncludes(
+    (error.errors[0] as Error).message,
+    "受信が申告 2 バイトを超えた",
+  );
   assertEquals((error.errors[1] as Error).message, "delete failed");
 });
 

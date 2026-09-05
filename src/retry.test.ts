@@ -6,7 +6,12 @@ import {
   assertStringIncludes,
 } from "@std/assert";
 import { fetchBytes, prefetchUrl, type RetryContext } from "./mod.ts";
-import { fetchHfFile, resolveHfRevision } from "./hf/mod.ts";
+import {
+  fetchHfFile,
+  fetchHfFiles,
+  prefetchHfFile,
+  resolveHfRevision,
+} from "./hf/mod.ts";
 import { mockFetch } from "./testing/mock_fetch.ts";
 
 // 名前空間は内部固定 1 個（cache 層と共通 — DECIDED: docs/decisions/0006 §3）。
@@ -452,6 +457,104 @@ Deno.test("再試行: HF 層の retry / onRetry は revision 解決とファイ�
       "https://huggingface.co/api/models/owner/name/revision/main",
       `https://huggingface.co/owner/name/resolve/${SHA}/a.bin`,
     ]);
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
+Deno.test("再試行: prefetchHfFile 経路にも retry / onRetry が透過する", async () => {
+  const { fetch, calls } = mockFetch(
+    failThenBytes(1, 429, { "retry-after": "0" }),
+  );
+  const seen: RetryContext[] = [];
+  try {
+    const result = await prefetchHfFile(
+      { repo: REPO, revision: SHA },
+      "a.bin",
+      { fetch, onRetry: (c) => seen.push(c) },
+    );
+    assertEquals(result.fetched, true);
+    assertEquals(calls.length, 2);
+    assertEquals(seen.length, 1);
+    assertEquals(seen[0].url, result.url);
+    // 再試行の末に温めたエントリは通常どおり成立する（打ち切られた 429 は残さない）。
+    const cache = await caches.open(CACHE_NAME);
+    assertExists(await cache.match(result.url));
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
+Deno.test("再試行: fetchHfFiles 経路にも retry / onRetry が透過する（ファイル毎に効く）", async () => {
+  const limited = new Set<string>();
+  const { fetch, calls } = mockFetch((url) => {
+    // URL ごとに 1 回だけ 429（並列取得する両ファイルが各自で再試行する）。
+    if (!limited.has(url)) {
+      limited.add(url);
+      return new Response("rate limited", {
+        ...RATE_LIMITED,
+        headers: { "retry-after": "0" },
+      });
+    }
+    return new Response(BYTES_A);
+  });
+  const seen: RetryContext[] = [];
+  try {
+    const files = await fetchHfFiles(
+      { repo: REPO, revision: SHA },
+      { a: "a.bin", b: "b.bin" },
+      { fetch, onRetry: (c) => seen.push(c) },
+    );
+    assertEquals(files.a, BYTES_A);
+    assertEquals(files.b, BYTES_A);
+    assertEquals(calls.length, 4); // 2 ファイル × (429 → 200)。
+    assertEquals(seen.length, 2);
+    // 取得できたぶんは格納済み = 2 回目は network に出ない。
+    await fetchHfFiles({ repo: REPO, revision: SHA }, { a: "a.bin" }, {
+      fetch,
+    });
+    assertEquals(calls.length, 4);
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
+Deno.test("再試行: statuses を差し替えると対象が入れ替わる（既定の 429 は外れる）", async () => {
+  let first = true;
+  const teapot = mockFetch(() => {
+    if (first) {
+      first = false;
+      return new Response("teapot", {
+        status: 418,
+        statusText: "I'm a teapot",
+        headers: { "retry-after": "0" },
+      });
+    }
+    return new Response(BYTES_A);
+  });
+  const limited = mockFetch(() => new Response("rate limited", RATE_LIMITED));
+  const seen: RetryContext[] = [];
+  try {
+    const bytes = await fetchBytes(URL_A, {
+      fetch: teapot.fetch,
+      retry: { statuses: [418] },
+      onRetry: (c) => seen.push(c),
+    });
+    assertEquals(bytes, BYTES_A);
+    assertEquals(teapot.calls.length, 2);
+    assertEquals(seen.map((c) => c.status), [418]);
+
+    // 差し替えは置換であって追加ではない — 既定の 429 は 1 回目でそのまま throw する。
+    const error = await assertRejects(
+      () =>
+        fetchBytes(URL_B, {
+          fetch: limited.fetch,
+          retry: { statuses: [418] },
+        }),
+      Error,
+    );
+    assertEquals(limited.calls.length, 1);
+    assertStringIncludes(error.message, "fetch-cache: HTTP 429");
   } finally {
     await caches.delete(CACHE_NAME);
   }
