@@ -338,9 +338,21 @@ const isReservedUrl = (url: string): boolean =>
 const globalCaches = (): CacheStorage | undefined =>
   typeof caches !== "undefined" ? caches : undefined;
 
+/** 取得系（`fetchBytes` / `prefetchUrl`）の既定通知 — この経路の縮退先は network。 */
 const defaultOnCacheError = (context: CacheErrorContext): void => {
   console.warn(
     `fetch-cache: キャッシュ ${context.op} に失敗したため network へ縮退します (${context.url})`,
+    context.error,
+  );
+};
+
+/**
+ * `openCachedUrl` 系の既定通知。この経路は network に出る口を持たず、縮退先は「エントリ
+ * 無し」（`undefined`）なので、取得系と同じ文言を使うと縮退先を偽ることになる。
+ */
+const defaultOnOpenCacheError = (context: CacheErrorContext): void => {
+  console.warn(
+    `fetch-cache: キャッシュ ${context.op} に失敗したためエントリ無しとして扱います (${context.url})`,
     context.error,
   );
 };
@@ -1345,6 +1357,334 @@ export const prefetchUrlWithKey = async (
     throw streamFailure.error;
   }
   return true;
+};
+
+/**
+ * 開いたキャッシュエントリ（`openCachedUrl` の戻り値）。全量を materialize せずに区間だけを
+ * 読み出すためのハンドルで、キャッシュキー・記録ハッシュの判定は開いた時点で済んでいる。
+ */
+export type CachedEntry = {
+  /**
+   * 区間 `[offset, offset + length)` を読む。戻りは **length ちょうど**の新しい
+   * `Uint8Array`。範囲外（`offset + length` が本文長を超える）と、本文が途中で尽きた場合は
+   * throw する — 黙って短く返すと呼び出し側が末尾の欠けを検出できない（fail loud）。
+   *
+   * `options.signal` は "stream" 戦略の読み飛ばし（チャンク境界）で見る。中断すると body を
+   * cancel して `signal.reason` で reject する。"blob" 戦略では呼び出し時に 1 回だけ見る
+   * （slice 自体を途中で止める口が Web 標準に無いため）。
+   */
+  readonly read: (
+    offset: number,
+    length: number,
+    options?: { signal?: AbortSignal },
+  ) => Promise<Uint8Array>;
+  /** どの戦略で読んでいるか（診断用）。既定の選択は `OpenCachedOptions.read` を参照。 */
+  readonly strategy: "blob" | "stream";
+};
+
+export type OpenCachedOptions = {
+  /**
+   * 期待 SHA-256（**64 桁の小文字 hex** — 形式不正は throw）。判定は `fetchBytes` の
+   * キャッシュヒットと同じく**記録ハッシュ（`x-fetch-cache-sha256`）との文字列比較だけ**で、
+   * バイト列は読まない。
+   *
+   * - 記録と一致 → 開く。
+   * - 記録と不一致 → 「内容が変わった」として self-heal（evict）し `undefined` を返す。
+   * - **記録が無い → `undefined`**（区間読みでは実ハッシュを計算できないので、記録なし
+   *   エントリを検証済みとは名乗れない。evict はしない — 先に `fetchBytes` を 1 回通せば
+   *   記録が backfill され、以後はここで開ける。DECIDED: docs/decisions/0008 §2）。
+   *
+   * 省略すると記録の有無に依らず開く（検証なしの生読み）。
+   */
+  sha256?: string;
+  /**
+   * 読み出し戦略の強制（**"blob" / "stream" 以外は throw** — 黙って既定へ落とさない）。
+   * 省略時は `globalThis.Deno` があれば "stream"、無ければ "blob"。
+   *
+   * - **"blob"**: 開く時に `cache.match` → `response.blob()` を 1 回だけ取り、read は
+   *   `blob.slice(...)`。ブラウザの Blob は遅延（ディスク直読み）なので区間読みが定数時間で
+   *   済む一方、Deno の `blob()` は全量をヒープへ載せる。
+   * - **"stream"**: read の度に `cache.match` → body を offset まで読み飛ばして length ぶん
+   *   集め、集め終えたら `cancel()`。ヒープに載るのは length ぶんだけだが、読み飛ばしの
+   *   コストが offset に比例する（DECIDED: docs/decisions/0012）。
+   */
+  read?: "blob" | "stream";
+  /**
+   * cache I/O 失敗（open / match）の通知先。既定 console.warn。開く時点の失敗は miss と
+   * 同じ扱い（`undefined`）へ縮退する（DECIDED: docs/decisions/0001）。read 中の失敗は
+   * 縮退先が無いのでそのまま throw する。
+   */
+  onCacheError?: (context: CacheErrorContext) => void;
+  /** CacheStorage の差し替え（テストの隔離・故障注入用）。既定 globalThis.caches。 */
+  caches?: CacheStorage;
+};
+
+/**
+ * 既定の読み出し戦略。Deno の `Response.blob()` は全量をヒープへ載せる（実測: 256MiB で
+ * RSS +517MiB）ので stream、ブラウザの Blob は遅延（`slice().arrayBuffer()` が 0.1〜0.3ms）
+ * なので blob を既定にする（DECIDED: docs/decisions/0012）。
+ */
+const defaultReadStrategy = (): "blob" | "stream" =>
+  (globalThis as { Deno?: unknown }).Deno === undefined ? "blob" : "stream";
+
+/**
+ * 区間指定の検査。非整数・負は「たまたま空が返る」等の静かな食い違いになるので fail loud。
+ */
+const assertRange = (
+  offset: number,
+  length: number,
+  requestUrl: string,
+): void => {
+  if (
+    !Number.isSafeInteger(offset) || offset < 0 ||
+    !Number.isSafeInteger(length) || length < 0
+  ) {
+    throw new Error(
+      `fetch-cache: 区間は 0 以上の整数で指定してください: offset ${offset} / length ${length} (${requestUrl})`,
+    );
+  }
+};
+
+/**
+ * 範囲外エラー。`size` は本文長。`undefined` は「本文長が分かる前に、要求そのものが大き
+ * すぎて弾かれた」場合（"stream" 戦略のバッファ確保失敗）— 呼び出し側から見れば範囲外の
+ * 一種なので、文言を揃えて理由だけ差し替える。
+ */
+const outOfRange = (
+  offset: number,
+  length: number,
+  size: number | undefined,
+  requestUrl: string,
+): Error =>
+  new Error(
+    `fetch-cache: 区間 [${offset}, ${
+      offset + length
+    }) はエントリの範囲外です（${
+      size === undefined
+        ? `${length} バイトのバッファを確保できません`
+        : `本文 ${size} バイト`
+    }） (${requestUrl})`,
+  );
+
+/** "blob" 戦略の read。開く時に取った Blob へ slice するだけ（再 match しない）。 */
+const readFromBlob = async (
+  blob: Blob,
+  offset: number,
+  length: number,
+  signal: AbortSignal | undefined,
+  requestUrl: string,
+): Promise<Uint8Array> => {
+  assertRange(offset, length, requestUrl);
+  signal?.throwIfAborted();
+  if (offset + length > blob.size) {
+    throw outOfRange(offset, length, blob.size, requestUrl);
+  }
+  const bytes = new Uint8Array(
+    await blob.slice(offset, offset + length).arrayBuffer(),
+  );
+  // 範囲内なのに短い = Cache / Blob 実装の異常。黙って短い view を返すと呼び出し側は
+  // 欠けたバイト列をそのまま使うので、ここで落とす。
+  if (bytes.length !== length) {
+    throw new Error(
+      `fetch-cache: 区間読みが ${bytes.length} バイトしか返しませんでした（要求 ${length} バイト） (${requestUrl})`,
+    );
+  }
+  return bytes;
+};
+
+/** "stream" 戦略の read。read の度に match し直し、offset まで読み飛ばして length ぶん集める。 */
+const readFromStream = async (
+  cache: Cache,
+  storageKey: string,
+  offset: number,
+  length: number,
+  signal: AbortSignal | undefined,
+  requestUrl: string,
+): Promise<Uint8Array> => {
+  assertRange(offset, length, requestUrl);
+  signal?.throwIfAborted();
+  // 開きっぱなしの reader は前方にしか進めない（offset を戻せない）ので read 毎に開き直す。
+  // ここでの失敗は縮退先が無い（呼び出し側は既に「開けた」と思っている）ので throw する。
+  const cached = await cache.match(storageKey);
+  if (cached === undefined) {
+    throw new Error(
+      `fetch-cache: 開いた後にエントリが消えました（evict / clearCache / self-heal と競合した可能性があります） (${requestUrl})`,
+    );
+  }
+  const body = cached.body;
+  if (body === null) {
+    // body を持たない応答は 0 バイト。範囲外だけが判定対象になる。
+    if (offset + length > 0) throw outOfRange(offset, length, 0, requestUrl);
+    return new Uint8Array(0);
+  }
+  // "blob" 戦略は size 比較で先に落ちるが、こちらは本文長が読み終わるまで分からないので
+  // 確保が先に来る。確保できない大きさ＝どの本文にも収まらないので、範囲外へ読み替える。
+  let out: Uint8Array<ArrayBuffer>;
+  try {
+    out = new Uint8Array(length);
+  } catch (error) {
+    const failure = outOfRange(offset, length, undefined, requestUrl);
+    failure.cause = error; // 実行環境の生の RangeError も残す（診断用）。
+    throw failure;
+  }
+  const reader = body.getReader();
+  let skipped = 0;
+  let filled = 0;
+  try {
+    while (skipped < offset || filled < length) {
+      // 中断はチャンクの切れ目で見る（読み飛ばしは offset に比例して長くなるため）。
+      signal?.throwIfAborted();
+      const { done, value } = await reader.read();
+      // 最後まで読んでも足りない = 範囲外。ここに来た時点で全チャンクを数え終えている
+      // （途中で抜けるのは充足したときだけ）ので、skipped + filled が本文長そのもの。
+      if (done) throw outOfRange(offset, length, skipped + filled, requestUrl);
+      let chunk: Uint8Array = value;
+      if (skipped < offset) {
+        const skip = Math.min(offset - skipped, chunk.length);
+        skipped += skip;
+        chunk = chunk.subarray(skip);
+      }
+      const take = Math.min(length - filled, chunk.length);
+      out.set(chunk.subarray(0, take), filled);
+      filled += take;
+    }
+  } finally {
+    // 途中で止めた body は接続 / ファイルハンドルを保持し続けるため必ず解放する。
+    await reader.cancel().catch(() => {});
+  }
+  return out;
+};
+
+/**
+ * キャッシュ済みエントリを開き、**区間だけ**を読むハンドルを返す（network には出ない）。
+ *
+ * `fetchBytes` はヒットしたエントリを常に全量読み出すため、数百 MB の shard から 1 行だけ
+ * 欲しい用途（層毎の埋め込み表を token 単位で引く等）では、1 回の読みに全量ぶんの時間と
+ * ヒープが要る。この API はそこだけを解く: キャッシュキーの規則と記録ハッシュの判定は
+ * この層に置いたまま、読み出しを `Blob.slice` / body の読み飛ばしへ落とす
+ * （DECIDED: docs/decisions/0012）。
+ *
+ * **network には出ない**（この API は fetch ではない）。エントリが無ければ `undefined` を
+ * 返すので、温めるのは呼び出し側の責任（`fetchBytes` / `prefetchUrl`）。
+ *
+ * **持たないもの**: `validate` / `decode` / `recheck` / `into`。区間読みが相手にするのは
+ * 保存形 raw だけで、全量の検証（実ハッシュ・カスタム検証・保存形→利用形の変換）は
+ * `fetchBytes` の責務として一本化する（docs/limitations.md）。`sha256` も記録ハッシュとの
+ * 文字列比較だけで、バイト列は読まない。
+ *
+ * NOTE: cache I/O の失敗（open / match）は miss と同じ扱いで `undefined` へ縮退し、
+ *       `onCacheError`（既定 console.warn）で通知する（DECIDED: docs/decisions/0001）。
+ *       read 中の失敗は縮退先が無いのでそのまま throw する。
+ * NOTE: 開いたハンドルはエントリのスナップショットではない。"stream" 戦略は read の度に
+ *       match し直すので、並行する `evict` / `clearCache` / self-heal でエントリが消えれば
+ *       次の read が throw する（"blob" 戦略は開いた時点の Blob を持ち続ける）。
+ */
+export const openCachedUrl = (
+  url: string | URL,
+  opts: OpenCachedOptions = {},
+): Promise<CachedEntry | undefined> =>
+  openCachedUrlWithKey(url, undefined, opts);
+
+/**
+ * 内部導管（mod.ts から再公開しない = パッケージ利用者からは到達不能）: 配列キーを注入する
+ * `openCachedUrl`。HF 層が内容キーを渡すために使う（`fetchBytesWithKey` と同じキー空間なので、
+ * `fetchHfFile` / `prefetchHfFile` が温めたエントリをそのまま開ける）。
+ */
+export const openCachedUrlWithKey = async (
+  url: string | URL,
+  key: CacheKey | undefined,
+  opts: OpenCachedOptions = {},
+): Promise<CachedEntry | undefined> => {
+  const requestUrl = normalizeUrl(url);
+  const storageKey = key === undefined ? requestUrl : serializeKey(key);
+  const onCacheError = opts.onCacheError ?? defaultOnOpenCacheError;
+
+  // 形式不正の sha256 は必ず記録と食い違う（＝ open が黙って undefined を返す）ので、
+  // 呼び出し側のバグとして先に落とす（fetchBytes の入口検査と同じ語彙）。
+  if (opts.sha256 !== undefined && !SHA256_HEX.test(opts.sha256)) {
+    throw new Error(
+      `fetch-cache: sha256 は 64 桁の小文字 hex で指定してください: ${opts.sha256} (${requestUrl})`,
+    );
+  }
+  // 綴り違いの戦略名は型を外れた呼び出し（JS 利用者・動的な値）でしか来ないが、黙って既定へ
+  // 落ちると「blob のつもりが stream」の静かな性能差になるので同じく入口で落とす。
+  if (
+    opts.read !== undefined && opts.read !== "blob" && opts.read !== "stream"
+  ) {
+    throw new Error(
+      `fetch-cache: read は "blob" / "stream" のどちらかで指定してください: ${
+        String(opts.read)
+      } (${requestUrl})`,
+    );
+  }
+
+  const cacheStorage = opts.caches ?? globalCaches();
+  // caches が無いランタイムは「キャッシュに無い」と同じ（エラーではない）。
+  if (cacheStorage === undefined) return undefined;
+  let cache: Cache;
+  try {
+    cache = await cacheStorage.open(DEFAULT_CACHE_NAME);
+  } catch (error) {
+    onCacheError({ op: "open", url: requestUrl, error });
+    return undefined;
+  }
+  let cached: Response | undefined;
+  try {
+    cached = await cache.match(storageKey);
+  } catch (error) {
+    onCacheError({ op: "match", url: requestUrl, error });
+    return undefined;
+  }
+  if (cached === undefined) return undefined;
+
+  const recorded = cached.headers.get(SHA_HEADER);
+  if (opts.sha256 !== undefined && recorded !== opts.sha256) {
+    await cached.body?.cancel().catch(() => {});
+    if (recorded !== null) {
+      // 記録 ≠ 期待 = 「内容が変わった」。fetchBytes のヒットと同じ self-heal で消し、
+      // 次の fetchBytes / prefetchUrl が真実源から取り直せるようにする。
+      try {
+        await cache.delete(storageKey);
+      } catch (error) {
+        onCacheError({ op: "delete", url: requestUrl, error });
+      }
+    }
+    // 記録が無いエントリは消さない — 中身が正しい可能性が十分にあり（無検証 prefetch 由来・
+    // 旧版）、fetchBytes を 1 回通せば実ハッシュ突合 → backfill で開けるようになる
+    // （DECIDED: docs/decisions/0008 §2）。
+    return undefined;
+  }
+
+  const strategy = opts.read ?? defaultReadStrategy();
+  if (strategy === "blob") {
+    let blob: Blob;
+    try {
+      // 開く時に 1 回だけ取る（ブラウザでは遅延ハンドルなので全量は読まれない）。
+      blob = await cached.blob();
+    } catch (error) {
+      onCacheError({ op: "match", url: requestUrl, error });
+      return undefined;
+    }
+    return {
+      strategy,
+      read: (offset, length, options) =>
+        readFromBlob(blob, offset, length, options?.signal, requestUrl),
+    };
+  }
+  // stream 戦略は read の度に match し直すので、開く時の body は解放しておく。
+  await cached.body?.cancel().catch(() => {});
+  return {
+    strategy,
+    read: (offset, length, options) =>
+      readFromStream(
+        cache,
+        storageKey,
+        offset,
+        length,
+        options?.signal,
+        requestUrl,
+      ),
+  };
 };
 
 /**

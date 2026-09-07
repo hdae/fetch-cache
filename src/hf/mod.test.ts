@@ -10,6 +10,7 @@ import {
   fetchHfFiles,
   hfResolveUrl,
   isCommitSha,
+  openHfFile,
   prefetchHfFile,
   resolveHfRevision,
 } from "./mod.ts";
@@ -1391,6 +1392,119 @@ Deno.test("fetchHfFile: expectedBytes に足りない受信は従来どおり全
     // 上限は「超過」だけを見る。不足は打ち切る理由が無いので検証（validate）の担当のまま。
     assertStringIncludes(error.message, "バイト数不一致: 4 != 8");
     assertEquals(supplied(), 1); // 最後まで読み切っている。
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
+// --- openHfFile（温め済み内容キーの区間読み — DECIDED: docs/decisions/0012）---
+
+Deno.test("openHfFile: 温めた内容キーのエントリを revision 解決なしで開く（network に一度も出ない）", async () => {
+  const { fetch, calls } = mockFetch((url) =>
+    url.endsWith("/revision/main")
+      ? Response.json({ sha: SHA })
+      : new Response(BYTES)
+  );
+  try {
+    await fetchHfFile({ repo: REPO }, {
+      path: "a.bin",
+      sha256: BYTES_SHA256,
+    }, { fetch });
+    assertEquals(calls.length, 2); // revision 解決 + ファイル取得。
+
+    // openHfFile は fetch の差し替え口を持たない — もし network に出れば --allow-net の無い
+    // このテストは権限エラーで落ちる。mock の呼び出し数が増えないことと併せて凍結する。
+    const entry = await openHfFile({ repo: REPO }, {
+      path: "a.bin",
+      sha256: BYTES_SHA256,
+    });
+    assertExists(entry);
+    assertEquals(await entry.read(1, 2), BYTES.subarray(1, 3));
+    assertEquals(calls.length, 2);
+
+    // 内容キーは revision 非依存なので、別の revision を名乗っても同じエントリが開く。
+    const pinned = await openHfFile({ repo: REPO, revision: MOVED }, {
+      path: "a.bin",
+      sha256: BYTES_SHA256,
+    });
+    assertExists(pinned);
+    assertEquals(await pinned.read(0, BYTES.length), BYTES);
+    assertEquals(calls.length, 2);
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
+Deno.test("openHfFile: sha256 の無い spec は throw する（キーが revision 入りで解決に network が要るため）", async () => {
+  try {
+    await assertRejects(
+      () => openHfFile({ repo: REPO }, "a.bin"),
+      Error,
+      "sha256 の宣言が必要",
+    );
+    await assertRejects(
+      () => openHfFile({ repo: REPO }, { path: "a.bin", expectedBytes: 4 }),
+      Error,
+      "sha256 の宣言が必要",
+    );
+    // 形式不正の sha256 は toSpec の既存検査で落ちる（語彙は fetchHfFile と同じ）。
+    await assertRejects(
+      () => openHfFile({ repo: REPO }, { path: "a.bin", sha256: "zz" }),
+      Error,
+      "64 桁の小文字 hex",
+    );
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
+Deno.test("openHfFile: read 戦略と caches の差し替えは cache 層へそのまま透過する", async () => {
+  const { fetch } = mockFetch((url) =>
+    url.endsWith("/revision/main")
+      ? Response.json({ sha: SHA })
+      : new Response(BYTES)
+  );
+  const opened: string[] = [];
+  const spyCaches: CacheStorage = {
+    open: (cacheName) => {
+      opened.push(cacheName);
+      return caches.open(cacheName);
+    },
+    has: (cacheName) => caches.has(cacheName),
+    delete: (cacheName) => caches.delete(cacheName),
+    keys: () => caches.keys(),
+    match: (request, options) => caches.match(request, options),
+  };
+  try {
+    await fetchHfFile({ repo: REPO }, {
+      path: "a.bin",
+      sha256: BYTES_SHA256,
+    }, { fetch });
+
+    const entry = await openHfFile({ repo: REPO }, {
+      path: "a.bin",
+      sha256: BYTES_SHA256,
+    }, { read: "blob", caches: spyCaches });
+    assertExists(entry);
+    // Deno の既定は "stream"。"blob" が出るのは opts.read が cache 層まで届いた証拠。
+    assertEquals(entry.strategy, "blob");
+    assertEquals(await entry.read(1, 2), BYTES.subarray(1, 3));
+    // globalThis.caches を直に見ていたら記録は空のまま（DI が素通りしていない証拠）。
+    assertEquals(opened, [CACHE_NAME]);
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
+Deno.test("openHfFile: 温めていないファイルは undefined（取得はしない）", async () => {
+  try {
+    assertEquals(
+      await openHfFile({ repo: REPO }, {
+        path: "cold.bin",
+        sha256: BYTES_SHA256,
+      }),
+      undefined,
+    );
   } finally {
     await caches.delete(CACHE_NAME);
   }

@@ -14,11 +14,16 @@ import {
   fetchBytes,
   listCachedUrls,
   listKeys,
+  openCachedUrl,
   prefetchUrl,
 } from "./mod.ts";
 // 配列キーの注入導管は内部モジュール専用（公開 `key` オプションは 0.5.0 で撤去 —
 // DECIDED: docs/decisions/0008）。直列化層・プレフィックス管理の契約はここ経由で凍結する。
-import { fetchBytesWithKey, prefetchUrlWithKey } from "./core.ts";
+import {
+  fetchBytesWithKey,
+  openCachedUrlWithKey,
+  prefetchUrlWithKey,
+} from "./core.ts";
 import {
   chunkedResponse,
   mockFetch,
@@ -3170,4 +3175,342 @@ Deno.test({
       }
     }
   },
+});
+
+// --- openCachedUrl（温め済みエントリの区間読み — DECIDED: docs/decisions/0012）---
+
+const URL_RANGE = "https://example.com/assets/shard.bin";
+
+/**
+ * 区間読みの対象。単一チャンクに収まらない大きさ（256 KiB）にして、stream 戦略の
+ * 「チャンクをまたぐ読み飛ばし」を実際に通す。中身は乱数 — offset がずれた読みが
+ * 偶然一致することを防ぐ（周期のあるパターンだと取り違えが素通りしうる）。
+ */
+const RANGE_BYTES = new Uint8Array(new ArrayBuffer(256 * 1024));
+for (let offset = 0; offset < RANGE_BYTES.length; offset += 65536) {
+  crypto.getRandomValues(RANGE_BYTES.subarray(offset, offset + 65536));
+}
+const RANGE_SHA256 = await sha256HexOf(RANGE_BYTES);
+
+for (const strategy of ["blob", "stream"] as const) {
+  Deno.test(`openCachedUrl: 温めたエントリの区間を元バイト列どおりに読む（${strategy} 戦略）`, async () => {
+    const { fetch, calls } = mockFetch(() => new Response(RANGE_BYTES));
+    try {
+      await fetchBytes(URL_RANGE, { fetch, sha256: RANGE_SHA256 });
+
+      const entry = await openCachedUrl(URL_RANGE, {
+        sha256: RANGE_SHA256,
+        read: strategy,
+      });
+      assertExists(entry);
+      assertEquals(entry.strategy, strategy);
+      // 先頭付近 / 中央 / 末尾付近（チャンク境界に依らないことを 3 点で確認する）。
+      for (
+        const [offset, length] of [
+          [3, 16],
+          [128 * 1024 - 5, 4096],
+          [RANGE_BYTES.length - 8, 8],
+        ]
+      ) {
+        const bytes = await entry.read(offset, length);
+        assertEquals(bytes.length, length);
+        assertEquals(
+          bytes,
+          RANGE_BYTES.subarray(offset, offset + length),
+          `offset=${offset} length=${length}`,
+        );
+      }
+      assertEquals(calls.length, 1); // open も read も network には出ない。
+    } finally {
+      await caches.delete(CACHE_NAME);
+    }
+  });
+}
+
+Deno.test("openCachedUrl: キャッシュに無い URL は undefined（network に出る口を持たない）", async () => {
+  try {
+    assertEquals(await openCachedUrl(URL_A), undefined);
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
+Deno.test("openCachedUrl: 記録ハッシュが期待と食い違うエントリは evict して undefined（次の fetchBytes が取り直す）", async () => {
+  const { fetch, calls } = mockFetch(() => new Response(BYTES_A));
+  try {
+    await fetchBytes(URL_A, { fetch, sha256: BYTES_A_SHA256 });
+    assertEquals(calls.length, 1);
+
+    // 期待が変わった = 内容が変わった。バイト列は読まず記録の文字列比較だけで判定する。
+    assertEquals(
+      await openCachedUrl(URL_A, { sha256: BYTES_B_SHA256 }),
+      undefined,
+    );
+    const cache = await caches.open(CACHE_NAME);
+    assertEquals(await cache.match(URL_A), undefined); // self-heal で消えている。
+
+    await fetchBytes(URL_A, { fetch, sha256: BYTES_A_SHA256 });
+    assertEquals(calls.length, 2); // 消えたので取り直しになる。
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
+Deno.test("openCachedUrl: 記録ハッシュの無いエントリは sha256 指定だと undefined（evict はせず、fetchBytes の backfill 後に開ける）", async () => {
+  const { fetch, calls } = mockFetch(() => new Response(BYTES_A));
+  try {
+    // 無検証 prefetch 由来・旧版相当の「記録なしエントリ」。
+    const cache = await caches.open(CACHE_NAME);
+    await cache.put(URL_A, new Response(BYTES_A));
+
+    assertEquals(
+      await openCachedUrl(URL_A, { sha256: BYTES_A_SHA256 }),
+      undefined,
+    );
+    // 記録が無いだけで中身は正しいかもしれないので消さない（不一致とはここが違う）。
+    const survived = await cache.match(URL_A);
+    assertExists(survived);
+    assertEquals(new Uint8Array(await survived.arrayBuffer()), BYTES_A);
+
+    // sha256 を渡さなければ記録の有無に依らず開ける（検証なしの生読み）。
+    const unchecked = await openCachedUrl(URL_A);
+    assertExists(unchecked);
+    assertEquals(await unchecked.read(1, 3), BYTES_A.subarray(1, 4));
+
+    // fetchBytes が実ハッシュで突合 → 記録を backfill すると開けるようになる。
+    await fetchBytes(URL_A, { fetch, sha256: BYTES_A_SHA256 });
+    assertEquals(calls.length, 0); // ヒットのまま（backfill は再 put だけ）。
+    const opened = await openCachedUrl(URL_A, { sha256: BYTES_A_SHA256 });
+    assertExists(opened);
+    assertEquals(await opened.read(0, BYTES_A.length), BYTES_A);
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
+for (const strategy of ["blob", "stream"] as const) {
+  Deno.test(`openCachedUrl: 範囲外の区間は throw する（${strategy} 戦略）`, async () => {
+    const { fetch } = mockFetch(() => new Response(BYTES_A));
+    try {
+      await fetchBytes(URL_A, { fetch });
+      const entry = await openCachedUrl(URL_A, { read: strategy });
+      assertExists(entry);
+
+      // 末尾を 1 バイト超える / offset そのものが本文長を超える の 2 通り。
+      for (const [offset, length] of [[1, BYTES_A.length], [99, 1]]) {
+        const error = await assertRejects(
+          () => entry.read(offset, length),
+          Error,
+          "範囲外",
+        );
+        assertStringIncludes(error.message, `本文 ${BYTES_A.length} バイト`);
+      }
+      // 確保できない length も同じ「範囲外」で出る（stream 戦略は本文長を知る前にバッファを
+      // 取るため、素だと実行環境の RangeError がそのまま漏れる）。
+      await assertRejects(
+        () => entry.read(0, Number.MAX_SAFE_INTEGER),
+        Error,
+        "範囲外",
+      );
+      // 範囲内の読みは throw の後も通る（ハンドルは壊れない）。
+      assertEquals(await entry.read(0, BYTES_A.length), BYTES_A);
+    } finally {
+      await caches.delete(CACHE_NAME);
+    }
+  });
+}
+
+Deno.test("openCachedUrl: stream 戦略の read は signal で中断でき、signal.reason で reject する", async () => {
+  const { fetch } = mockFetch(() => new Response(RANGE_BYTES));
+  try {
+    await fetchBytes(URL_RANGE, { fetch });
+    const entry = await openCachedUrl(URL_RANGE, { read: "stream" });
+    assertExists(entry);
+
+    const controller = new AbortController();
+    const reason = new Error("呼び出し側の中断");
+    // read の同期部分（引数検査 + 初回の中断検査）を通した後に abort する — 中断はチャンクの
+    // 切れ目で見る、という契約をここで凍結する（呼び出し前の abort は入口で落ちるだけ）。
+    const reading = entry.read(0, RANGE_BYTES.length, {
+      signal: controller.signal,
+    });
+    controller.abort(reason);
+    const thrown = await assertRejects(
+      () => reading,
+      Error,
+      "呼び出し側の中断",
+    );
+    assertStrictEquals(thrown, reason); // signal.reason がそのまま出る。
+
+    // 中断は読み手の都合であってエントリの破損ではない（次の read は通る）。
+    assertEquals(await entry.read(0, 4), RANGE_BYTES.subarray(0, 4));
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
+Deno.test("openCachedUrl: caches.open 失敗は miss と同じ undefined へ縮退して通知する", async () => {
+  const notified: CacheErrorContext[] = [];
+  const brokenCaches: CacheStorage = {
+    open: () => Promise.reject(new Error("open failed")),
+    has: (name) => caches.has(name),
+    delete: (name) => caches.delete(name),
+    keys: () => caches.keys(),
+    match: (request, options) => caches.match(request, options),
+  };
+  const entry = await openCachedUrl(URL_A, {
+    caches: brokenCaches,
+    onCacheError: (context) => notified.push(context),
+  });
+  assertEquals(entry, undefined);
+  assertEquals(notified.map((context) => context.op), ["open"]);
+  assertEquals(notified[0].url, URL_A);
+});
+
+Deno.test("openCachedUrl: cache 読出し失敗も undefined へ縮退して通知する", async () => {
+  const notified: CacheErrorContext[] = [];
+  try {
+    const entry = await openCachedUrl(URL_A, {
+      caches: failingCacheStorage({
+        match: () => Promise.reject(new Error("storage broken")),
+      }),
+      onCacheError: (context) => notified.push(context),
+    });
+    assertEquals(entry, undefined);
+    assertEquals(notified.map((context) => context.op), ["match"]);
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
+Deno.test("openCachedUrlWithKey: 配列キーのエントリを開き、区間読みは検証系オプションを持たない", async () => {
+  const { fetch } = mockFetch(() => new Response(BYTES_A));
+  try {
+    await fetchBytesWithKey(URL_A, ["models", "range"], {
+      fetch,
+      sha256: BYTES_A_SHA256,
+    });
+    // URL キー側にはエントリが無い（キーの分離）。
+    assertEquals(
+      await openCachedUrl(URL_A, { sha256: BYTES_A_SHA256 }),
+      undefined,
+    );
+
+    const entry = await openCachedUrlWithKey(URL_A, ["models", "range"], {
+      sha256: BYTES_A_SHA256,
+    });
+    assertExists(entry);
+    assertEquals(await entry.read(2, 2), BYTES_A.subarray(2, 4));
+
+    // 形式不正の sha256 は「必ず記録と食い違う」申告なので入口で落とす。
+    await assertRejects(
+      () => openCachedUrl(URL_A, { sha256: "NOTAHASH" }),
+      Error,
+      "64 桁の小文字 hex",
+    );
+    // 区間の指定ミス（負・非整数）も黙って空を返さず落とす。
+    await assertRejects(() => entry.read(-1, 2), Error, "0 以上の整数");
+    await assertRejects(() => entry.read(0, 1.5), Error, "0 以上の整数");
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
+Deno.test("openCachedUrl: read の不正値は入口で throw する（キャッシュにも触らない）", async () => {
+  const touched: string[] = [];
+  // open されたら記録して落とす — 入口検査より先に進んだことがそのまま赤になる。
+  const untouchableCaches: CacheStorage = {
+    open: (cacheName) => {
+      touched.push(cacheName);
+      return Promise.reject(new Error("触れてはいけない"));
+    },
+    has: (cacheName) => caches.has(cacheName),
+    delete: (cacheName) => caches.delete(cacheName),
+    keys: () => caches.keys(),
+    match: (request, options) => caches.match(request, options),
+  };
+  // 型を外れた値（JS 利用者・動的な値）が来る想定なのでキャスト経由で渡す。
+  for (const bad of ["blobb", null]) {
+    await assertRejects(
+      () =>
+        openCachedUrl(URL_A, {
+          read: bad as unknown as "blob" | "stream",
+          caches: untouchableCaches,
+        }),
+      Error,
+      '"blob" / "stream"',
+    );
+  }
+  // network の口はそもそも無い（この API は fetch を受け取らない）ので、残るのはキャッシュ。
+  assertEquals(touched, []);
+});
+
+Deno.test("openCachedUrl: stream 戦略の read は開いた後に消えたエントリで throw する（ハンドルはスナップショットではない）", async () => {
+  const { fetch } = mockFetch(() => new Response(BYTES_A));
+  try {
+    await fetchBytes(URL_A, { fetch });
+    const entry = await openCachedUrl(URL_A, { read: "stream" });
+    assertExists(entry);
+    assertEquals(await entry.read(0, 2), BYTES_A.subarray(0, 2));
+
+    assertEquals(await evictUrl(URL_A), true);
+    await assertRejects(
+      () => entry.read(0, 2),
+      Error,
+      "開いた後にエントリが消えました",
+    );
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
+Deno.test("openCachedUrl: blob 戦略のハンドルは evict 後も読める（開いた時点の Blob を持つ）", async () => {
+  const { fetch } = mockFetch(() => new Response(BYTES_A));
+  try {
+    await fetchBytes(URL_A, { fetch });
+    const entry = await openCachedUrl(URL_A, { read: "blob" });
+    assertExists(entry);
+
+    assertEquals(await evictUrl(URL_A), true);
+    // 開き直しはできないが、既存ハンドルは生き続ける（Cache 実装の性質を隠さない）。
+    assertEquals(await openCachedUrl(URL_A), undefined);
+    assertEquals(await entry.read(0, BYTES_A.length), BYTES_A);
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
+Deno.test("openCachedUrl: blob 戦略の blob() 失敗も match と同じく undefined へ縮退して通知する", async () => {
+  const notified: CacheErrorContext[] = [];
+  // この経路が応答から触るのは headers / body / blob() だけなので、その 3 つだけの偽物で足りる。
+  const brokenResponse = {
+    headers: new Headers(),
+    body: null,
+    blob: () => Promise.reject(new Error("blob failed")),
+  } as unknown as Response;
+  try {
+    const entry = await openCachedUrl(URL_A, {
+      read: "blob",
+      caches: failingCacheStorage({
+        match: () => Promise.resolve(brokenResponse),
+      }),
+      onCacheError: (context) => notified.push(context),
+    });
+    assertEquals(entry, undefined);
+    assertEquals(notified.map((context) => context.op), ["match"]);
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
+Deno.test("openCachedUrl: read 省略時の既定戦略は Deno なら stream（blob() が全量をヒープへ載せるため）", async () => {
+  const { fetch } = mockFetch(() => new Response(BYTES_A));
+  try {
+    await fetchBytes(URL_A, { fetch });
+    const entry = await openCachedUrl(URL_A);
+    assertExists(entry);
+    assertEquals(entry.strategy, "stream");
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
 });

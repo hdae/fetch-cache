@@ -149,6 +149,27 @@
   毎呼び出し実行される（storage 節約と引き換えの CPU コスト。トレードオフの選択は
   呼び出し側 — DECIDED: docs/decisions/0003）。また `validate` は decode 併用時も保存形
   raw に対して走る（利用形側の検証は decode 内で throw する）。
+- **区間読み（`openCachedUrl` / `openHfFile`）が相手にするのは保存形 raw だけで、検証は
+  全量 API の責務**（DECIDED: docs/decisions/0012）。`validate` / `decode` / `recheck` /
+  `into` は持たない — 全量を前提にした検査・変換は区間読みでは走らせようがなく、`decode`
+  併用時は利用形の offset が保存形の offset と一致しない（解凍後のバイト列を区間で引きたい
+  なら `fetchBytes` で全量を読む）。`sha256` を渡しても判定は記録ハッシュとの**文字列比較
+  だけ**で、読んだ区間そのものは照合されない（実ハッシュは全量が無いと計算できない）。
+  記録の無いエントリは「検証済みを名乗れない」ので `undefined` になる（evict はしない —
+  先に `fetchBytes` を 1 回通せば backfill で記録が付き、以後は開ける）。疑う運用は
+  `fetchBytes` の `recheck` で全量を読み直す。
+- **区間読みは network に出ない**（DECIDED: docs/decisions/0012）。エントリが無ければ
+  `undefined` で、温めるのは呼び出し側（`fetchBytes` / `prefetchUrl`）。HF 層の `openHfFile`
+  は `sha256` 宣言ファイル専用で、無宣言 spec は throw する（そちらのキーは revision 入りの
+  resolve URL で、解決に network が要るため）。
+- **区間読みの性能特性はランタイム依存**（DECIDED: docs/decisions/0012）。既定は
+  `globalThis.Deno` があれば "stream"（`read` の度に body を offset まで読み飛ばす —
+  **コストは offset に比例**）、無ければ "blob"（ブラウザの遅延 Blob なら定数時間だが、
+  Deno の `blob()` は全量をヒープへ載せる）。定数時間の区間読みは Blob 実装の性質であって
+  仕様保証ではない（`Range` ヘッダは Cache API に効かない — Chrome 152 実測で 200 全量）。
+  開いたハンドルはスナップショットではなく、"stream" は `read` の度に `match` し直すので
+  並行する `evict` / `clearCache` / self-heal でエントリが消えると次の `read` が throw し、
+  "blob" は開いた時点の Blob を持ち続けるので消えた後も読める。
 
 ## HF 層
 

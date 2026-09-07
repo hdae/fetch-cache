@@ -11,6 +11,8 @@
  * `recheck`）。ファイル毎の `decode` で「保存形 ≠ 利用形」にも対応する。`expectedBytes` は
  * 受信の**上限**でもあり、宣言を超えた時点で受信を打ち切る（DECIDED: docs/decisions/0011）。
  * revision 解決もファイル取得も 429 / 503 は既定で再試行する（DECIDED: docs/decisions/0010）。
+ * `openHfFile` は温め済みエントリの**区間だけ**を読む口で、network に出ない（revision 解決も
+ * しない）ため `sha256` 宣言ファイル専用（DECIDED: docs/decisions/0012）。
  *
  * @module
  */
@@ -18,12 +20,14 @@
 // 配列キーの注入導管（fetchBytesWithKey / prefetchUrlWithKey）は内部モジュールにだけある
 // — 公開 `key` オプションは 0.5.0 で撤去（DECIDED: docs/decisions/0008）。
 import {
+  type CachedEntry,
   type CacheErrorContext,
   type CacheKey,
   type DecodeBytes,
   fetchBytesWithKey,
   type FetchProgress,
   IntoCapacityError,
+  openCachedUrlWithKey,
   prefetchUrlWithKey,
   type ValidateBytes,
 } from "../core.ts";
@@ -37,6 +41,7 @@ import {
 // `./hf` の公開シグネチャに現れる cache 層の型を再公開する（`./hf` 単独利用者が `.`
 // エントリを併せて import しなくて済むように。`.` エントリの同名型と同一物）。
 export type {
+  CachedEntry,
   CacheErrorContext,
   DecodeBytes,
   FetchProgress,
@@ -487,4 +492,59 @@ export const fetchHfFiles = async <Names extends string>(
   );
   // fromEntries は Record<string, ...> に落ちるため Names キーへ戻す（entries は names 起点）。
   return Object.fromEntries(entries) as Record<Names, Uint8Array>;
+};
+
+/** `openHfFile` のオプション（cache 層 `openCachedUrl` の同名項目をそのまま転送する）。 */
+export type HfOpenOptions = {
+  /**
+   * 読み出し戦略の強制（省略時は `globalThis.Deno` があれば "stream"、無ければ "blob"）。
+   * 意味は cache 層 `OpenCachedOptions.read` と同じ。
+   */
+  read?: "blob" | "stream";
+  /** cache I/O 失敗（open / match）の通知。既定 console.warn。 */
+  onCacheError?: (context: CacheErrorContext) => void;
+  /** CacheStorage の差し替え（cache 層へそのまま渡す）。既定 globalThis.caches。 */
+  caches?: CacheStorage;
+};
+
+/**
+ * 温め済みの HF ファイルを開き、**区間だけ**を読むハンドルを返す（cache 層
+ * `openCachedUrl` の HF 版）。エントリが無ければ `undefined`。
+ *
+ * **network には出ない** — revision 解決もファイル取得も行わない。だから開けるのは
+ * `spec.sha256` のあるファイル（キーが revision 非依存の内容キー
+ * `["hf", kind, repo, path, sha256]`）だけで、**sha256 の無い spec は throw する**:
+ * そちらのキーは revision 入りの resolve URL なので、解決に network が要り「出ない」契約を
+ * 破る（DECIDED: docs/decisions/0012）。温めは `fetchHfFile` / `prefetchHfFile` の担当で、
+ * どちらも同じ内容キーへ書くのでそのまま開ける。
+ *
+ * NOTE: `spec.expectedBytes` / `validate` / `decode` / `into` は**読み出しには使わない**
+ *       （区間読みが相手にするのは保存形 raw で、全量の検証・変換は `fetchHfFile` の責務 —
+ *       docs/limitations.md）。ただし spec の**形式検査（`toSpec`）は `fetchHfFile` と共通で
+ *       走る**ので、負・非整数の `expectedBytes` や `into` に収まらない `expectedBytes` は、
+ *       読み出しに使われないまま同じ文言で throw する（申告の食い違いはどの入口から入っても
+ *       同じ扱い）。
+ *       `sha256` は cache 層へ渡り、記録ハッシュとの文字列比較だけで判定される（記録なしの
+ *       エントリは `undefined` — 先に `fetchHfFile` を 1 回通せば backfill される）。
+ */
+export const openHfFile = async (
+  ref: HfRepoRef,
+  file: string | HfFileSpec,
+  opts: HfOpenOptions = {},
+): Promise<CachedEntry | undefined> => {
+  const spec = toSpec(file);
+  if (spec.sha256 === undefined) {
+    throw new Error(
+      `fetch-cache: openHfFile には sha256 の宣言が必要です（無宣言ファイルのキーは revision 入りの resolve URL で、解決に network が要ります — この API は network に出ません） (${spec.path})`,
+    );
+  }
+  // revision は解決しない。この URL はエラー文言のラベルにしか使わない（キーは内容キー =
+  // revision 非依存なので、"main" のままでも読み出し先は変わらない）。
+  const url = hfResolveUrl({ ...ref, path: spec.path });
+  return await openCachedUrlWithKey(url, contentKey(ref, spec), {
+    sha256: spec.sha256,
+    read: opts.read,
+    onCacheError: opts.onCacheError,
+    caches: opts.caches,
+  });
 };

@@ -16,6 +16,9 @@
  * `retry: false` で従来どおり即 throw — DECIDED: docs/decisions/0010）。再試行するのは
  * **GET / HEAD だけ**で、`cache: false` 経由でしか network に出ない他の method は 429 / 503
  * でも打ち直さず最初の応答で throw する。
+ * `openCachedUrl` は温め済みエントリの**区間だけ**を読む口で、network には出ない（無ければ
+ * `undefined`）。数百 MB の shard から 1 行だけ引く用途向けで、検証は記録ハッシュとの
+ * 文字列比較だけ（DECIDED: docs/decisions/0012）。
  *
  * キャッシュキーは URL、または**ライブラリが生成する配列キー**（HF 層の内容キー
  * `["hf", kind, repo, path, sha256]` 等。直列化はこの層が所有し、予約 origin の URL へ畳む）。
@@ -39,15 +42,18 @@ export {
   fetchBytes,
   listCachedUrls,
   listKeys,
+  openCachedUrl,
   prefetchUrl,
 } from "./core.ts";
 export type {
   CacheAdminOptions,
+  CachedEntry,
   CacheErrorContext,
   CacheKey,
   DecodeBytes,
   FetchBytesOptions,
   FetchProgress,
+  OpenCachedOptions,
   PrefetchUrlOptions,
   ValidateBytes,
 } from "./core.ts";

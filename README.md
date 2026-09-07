@@ -32,6 +32,10 @@ HuggingFace Hub layer (`./hf`) is included.
   without an extra full-size copy; `prefetchUrl` streams a response straight
   into the cache and never materializes it at all — optionally verifying a
   `sha256` **in flight**, so a corrupted download never becomes a cache entry
+- **Range reads on cached entries**: `openCachedUrl` opens an entry that is
+  already cached and reads just the range you ask for — one row out of a
+  multi-hundred-MB table instead of the whole thing, with no network access at
+  all (`openHfFile` on the HF layer)
 - **Caller-owned buffers**: pass `into` to read a download _or a cache hit_
   straight into a buffer you allocated and get a view of it back — reuse one
   buffer across sequential shard reads instead of allocating a receive buffer
@@ -277,6 +281,72 @@ error and is not treated as corruption, so it is not self-healed: recover with
 an in-flight download (single-flight) never receive the leader's `into`
 buffer — they get their own copy, or their own `into` — see
 [ADR 0009](https://github.com/hdae/fetch-cache/blob/main/docs/decisions/0009-into-caller-buffer.md).
+
+### Reading a range out of a cached entry (`openCachedUrl`)
+
+```typescript
+import { openCachedUrl, prefetchUrl } from "@hdae/fetch-cache";
+
+// Warm the entry first — opening never goes to the network.
+await prefetchUrl(shard.url, { sha256: shard.sha256 });
+
+const entry = await openCachedUrl(shard.url, { sha256: shard.sha256 });
+if (entry === undefined) throw new Error("not cached");
+
+// One row out of a 253 MB shard, without materializing the shard.
+const row = await entry.read(token * rowBytes, rowBytes);
+entry.strategy; // "blob" | "stream" — which read path is in use
+```
+
+`fetchBytes` always reads a cache hit in full. When a multi-hundred-MB entry is
+a table you index into — one embedding row per decoded token, say — that turns
+every row read into a full-size read (measured: 117 ms on Chrome/macOS, 300 ms
+on Linux) and pushes everything else out of the cache along the way.
+`openCachedUrl` opens an entry that is **already cached** and reads only the
+range you ask for. It never goes to the network: a missing entry is
+`undefined`, and warming it stays the caller's job (`fetchBytes` /
+`prefetchUrl`).
+
+Two read strategies exist because runtimes differ. A browser `Blob` is a lazy
+handle to the stored entry, so `blob.slice(...)` is constant-time; Deno's
+`blob()` reads the whole entry into memory, so there the body stream is skipped
+forward to the offset instead — a cost proportional to the offset. The default
+is `"stream"` under Deno and `"blob"` elsewhere; override it with
+`read: "blob" | "stream"`, and pass `options.signal` to `read` to abort a long
+skip (checked at chunk boundaries, rejecting with `signal.reason`). The `"blob"`
+strategy has no such skip to interrupt, so it checks the signal once before the
+slice and never during it. A read
+returns **exactly** `length` bytes; a range past the end of the entry throws
+rather than returning a short array.
+
+Verification is the recorded hash only: `sha256` is compared against the
+`x-fetch-cache-sha256` header as a string, exactly like a `fetchBytes` hit, and
+the bytes themselves are never hashed (a range read cannot compute the hash of
+the whole entry). A mismatch self-heals — the entry is evicted and `undefined`
+comes back. An entry with **no** record returns `undefined` too, but is not
+evicted: read it once through `fetchBytes` with the same `sha256` and the
+record is backfilled, after which it opens. There is deliberately no `validate`
+/ `decode` / `recheck` / `into` here — a range read only ever sees the stored
+raw form, and full-entry verification stays with `fetchBytes`
+([ADR 0012](https://github.com/hdae/fetch-cache/blob/main/docs/decisions/0012-open-cached-range-read.md)).
+Cache I/O failures while opening degrade to `undefined` and notify
+`onCacheError`; a failure during `read` throws.
+
+On the HF layer, `openHfFile(ref, spec)` does the same for a file whose
+`sha256` is declared — that is the content key, and it does not contain the
+revision, so nothing has to be resolved. A spec without `sha256` is keyed by
+its revision-pinned resolve URL, and resolving that would need the network, so
+it throws instead.
+
+```typescript
+import { openHfFile, prefetchHfFile } from "@hdae/fetch-cache/hf";
+
+const file = { path: "shard-0.safetensors", sha256: "…" };
+await prefetchHfFile({ repo: "owner/name" }, file);
+
+const entry = await openHfFile({ repo: "owner/name" }, file);
+const row = await entry?.read(offset, rowBytes);
+```
 
 ### Auth & abort
 
