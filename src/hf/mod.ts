@@ -17,8 +17,9 @@
  * @module
  */
 
-// 配列キーの注入導管（fetchBytesWithKey / prefetchUrlWithKey）は内部モジュールにだけある
-// — 公開 `key` オプションは 0.5.0 で撤去（DECIDED: docs/decisions/0008）。
+// 配列キーの注入導管（fetchBytesWithKey / prefetchUrlWithKey / openCachedUrlWithKey）は
+// 内部モジュールにだけある — 公開 `key` オプションは 0.5.0 で撤去
+// （DECIDED: docs/decisions/0008）。
 import {
   type CachedEntry,
   type CacheErrorContext,
@@ -504,7 +505,11 @@ export type HfOpenOptions = {
    * 意味は cache 層 `OpenCachedOptions.strategy` と同じ。
    */
   strategy?: "blob" | "stream";
-  /** cache I/O 失敗（open / match）の通知。既定 console.warn。 */
+  /**
+   * cache I/O 失敗の通知（cache 層へそのまま渡す）。既定 console.warn（文言は取得系と別で
+   * 「エントリ無しとして扱います」）。`op` は "open" / "match"（"blob" 戦略の
+   * `response.blob()` 失敗を含む）/ "delete"（記録ハッシュ不一致の self-heal）の 3 種。
+   */
   onCacheError?: (context: CacheErrorContext) => void;
   /** CacheStorage の差し替え（cache 層へそのまま渡す）。既定 globalThis.caches。 */
   caches?: CacheStorage;
@@ -529,6 +534,10 @@ export type HfOpenOptions = {
  *       同じ扱い）。
  *       `sha256` は cache 層へ渡り、記録ハッシュとの文字列比較だけで判定される（記録なしの
  *       エントリは `undefined` — 先に `fetchHfFile` を 1 回通せば backfill される）。
+ * NOTE: エラー文言と `onCacheError` の `url` に出る `.../resolve/<revision>/<path>` は
+ *       **表示用のラベル**で、取得元でも保存キーでもない（`revision` は解決しないので、
+ *       省略時は "main" のまま出る）。そのエントリを消すなら `evictUrl(そのURL)` ではなく
+ *       内容キーの `evict(["hf", kind, repo, path, sha256])`。
  */
 export const openHfFile = async (
   ref: HfRepoRef,

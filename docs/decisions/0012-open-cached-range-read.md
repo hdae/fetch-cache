@@ -24,7 +24,8 @@ LRU を押し出すため追い出し連鎖が起き、自然文 400 token の�
 呼び出し側が `caches` を直接読めばキー規則の複製と記録ハッシュ検査の素通りになる
 （ADR 0009 Context と同じ理由で、この層の内側にしか置けない）。
 
-区間だけを読む手段は**ランタイムで性格が違う**（2026-09-07 実測）:
+区間だけを読む手段は**ランタイムで性格が違う**（2026-09-07 実測。対象は上記と同じ 253 MB の
+shard エントリ 1 本 — Deno 列の「256 MiB」も同じ規模の実測値）:
 
 | 操作                                      | Chrome 152                       | Deno 2.9                                         |
 | ----------------------------------------- | -------------------------------- | ------------------------------------------------ |
@@ -42,6 +43,7 @@ Deno の `blob()` は全量をヒープへ載せるので、同じ手が最悪�
 
 ```ts
 const entry = await openCachedUrl(url, { sha256 }); // 無ければ undefined
+if (entry === undefined) throw new Error("not cached");
 const row = await entry.read(offset, 8960); // length ちょうど / 足りなければ throw
 ```
 
@@ -105,13 +107,40 @@ throw で、本文長は "blob" なら `blob.size`、"stream" なら末尾到達
 として同じ文言で落とす**（素通しすると実行環境の RangeError がそのまま漏れ、"blob" と
 食い違う）。
 
+通知の `op` は失敗点の識別子で、観測できるのは **3 種**: `cacheStorage.open` の失敗が
+"open"、`cache.match` の失敗と "blob" の `blob()` の失敗が "match"、記録ハッシュ不一致の
+self-heal で `cache.delete` に失敗した場合が "delete"。`blob()` の失敗を "match" にまとめる
+のは、それが match 済み応答の本文取得であり縮退の扱いも同じだからで、
+`CacheErrorContext["op"]` に `"blob"` を足すと公開 union の拡張（網羅 switch を書いた下流を
+壊す breaking）になる。self-heal の delete が失敗しても縮退先は変わらない（`undefined`）—
+消せなかったことを黙らせないための通知で、次の `fetchBytes` が取り直せばそこで上書きされる。
+
+"stream" のバッファ確保は `cache.match` より**前**に置く。後ろに置くと、確保に失敗したときに
+match 済みの body を解放しないまま抜けて Cache のファイルハンドルが残る（確保できない
+`length` はどの本文にも収まらない要求なので、資源を 1 つも取らずに範囲外で落とすのが正しい。
+実行環境の生の `RangeError` は `cause` に残す — 診断用）。
+
+"stream" は `read` の度に `match` し直すので、**開いた時点の照合は次の `read` には効かない**。
+`sha256` を渡して開いた場合は記録ハッシュも `read` ごとに再照合し、開いた時点と食い違えば
+body を cancel して throw する（並行する `fetchBytes` の self-heal が同じキーへ別内容を書く
+経路があり、区間読みは実ハッシュを計算できないので下流では検出できない — エントリが消えた
+場合と同じ fail loud に揃える。"blob" は開いた時点の Blob を持つので元から差し替えの影響を
+受けない）。
+
+"stream" は `response.body` を要求する。Cache 応答が body を持たないランタイムでは、中身の
+あるエントリも「本文 0 バイト」と判定されて範囲外で落ちるので、そこでは "blob" を使う
+（既定はブラウザ側が "blob" なので、該当するのは "stream" を明示した呼び出しだけ）。
+
 ### 5. HF 層は内容キー専用 — `sha256` 無しは throw
 
 `openHfFile(ref, file, opts)` は `spec.sha256` があるときだけ開ける。無い spec のキーは
 revision 入りの resolve URL で、その revision を解決するには network が要る — §1 の「この API は
 network に出ない」を破るので、**黙って解決せず throw する**。`sha256` があれば内容キー
-`["hf", kind, repo, path, sha256]` は revision 非依存なので、`ref.revision` は解決も参照も
-されない（エラー文言のラベルにだけ使う）。
+`["hf", kind, repo, path, sha256]` は revision 非依存で、`ref.revision` は**解決しない** —
+キーにも入らず読み出し先も変えず、エラー文言と `onCacheError` の `url` に出す表示用のラベル
+URL（`.../resolve/<revision>/<path>`。省略時は "main" のまま）にだけ現れる。その URL は
+取得元でも保存キーでもないので、開いたエントリを消すのは `evictUrl(そのラベル URL)` ではなく
+`evict(["hf", kind, repo, path, sha256])`。
 
 ## Consequences
 
@@ -121,9 +150,13 @@ network に出ない」を破るので、**黙って解決せず throw する**�
   先頭の行より高い。定数時間の区間読みはブラウザの遅延 Blob に依存した性質であって、Web 標準の
   保証ではない（`Range` は Cache API に効かないことが Chrome 152 で実測済み）。
 - 開いたハンドルはエントリのスナップショットではない。"stream" は `read` の度に `match` し直す
-  ので、並行する `evict` / `clearCache` / self-heal でエントリが消えれば次の `read` が throw
-  する。"blob" は開いた時点の Blob を持ち続けるので、消えた後も読めてしまう（どちらの挙動も
-  Cache 実装の性質そのままで、この層は隠さない）。
+  ので、並行する `evictUrl` / `evict` / self-heal でエントリが消えれば次の `read` が throw
+  する。`sha256` を渡して開いた場合は記録ハッシュも `read` ごとに再照合するので、消えずに
+  **差し替わった**（同じキーへ別内容が書かれた）場合も同じく throw する。
+  **`clearCache` だけはランタイム依存** — 名前空間ごと消しても保持中の `Cache` オブジェクトが
+  生き続けるかは実装次第で、Deno 2.9 は以後の `match` が `undefined` になる（＝ throw）が、
+  ブラウザは未実測。"blob" は開いた時点の Blob を持ち続けるので、どの経路で消えても
+  読み続けられる（どちらの挙動も Cache 実装の性質そのままで、この層は隠さない）。
 - 「区間読みは検証しない」という穴が新設される。記録ハッシュは保存時の全量に対する主張であり、
   区間読みはそれを引き継ぐだけで、読んだ区間そのものは照合できない。疑う運用は `fetchBytes`
   （`recheck`）で全量を読み直す — docs/limitations.md に明記する。

@@ -312,12 +312,13 @@ handle to the stored entry, so `blob.slice(...)` is constant-time; Deno's
 `blob()` reads the whole entry into memory, so there the body stream is skipped
 forward to the offset instead — a cost proportional to the offset. The default
 is `"stream"` under Deno and `"blob"` elsewhere; override it with
-`strategy: "blob" | "stream"`, and pass `options.signal` to `read` to abort a long
-skip (checked at chunk boundaries, rejecting with `signal.reason`). The `"blob"`
-strategy has no such skip to interrupt, so it checks the signal once before the
-slice and never during it. A read
-returns **exactly** `length` bytes; a range past the end of the entry throws
-rather than returning a short array.
+`strategy: "blob" | "stream"`, and pass `options.signal` to `read` to abort a
+long skip (checked at chunk boundaries, rejecting with `signal.reason`). The
+`"blob"` strategy has no such skip to interrupt, so it checks the signal once
+before the slice and never during it. A read returns **exactly** `length`
+bytes; a range past the end of the entry throws rather than returning a short
+array, and an `offset` or `length` that is negative or not an integer throws
+before the cache is touched at all.
 
 Verification is the recorded hash only: `sha256` is compared against the
 `x-fetch-cache-sha256` header as a string, exactly like a `fetchBytes` hit, and
@@ -325,12 +326,26 @@ the bytes themselves are never hashed (a range read cannot compute the hash of
 the whole entry). A mismatch self-heals — the entry is evicted and `undefined`
 comes back. An entry with **no** record returns `undefined` too, but is not
 evicted: read it once through `fetchBytes` with the same `sha256` and the
-record is backfilled, after which it opens. There is deliberately no `validate`
-/ `decode` / `recheck` / `into` here — a range read only ever sees the stored
-raw form, and full-entry verification stays with `fetchBytes`
+record is backfilled, after which it opens. Passing `sha256` is optional:
+leave it out and the entry opens whatever its record says, or does not say —
+an unverified raw read. There is deliberately no `validate` / `decode` /
+`recheck` / `into` here — a range read only ever sees the stored raw form, and
+full-entry verification stays with `fetchBytes`
 ([ADR 0012](https://github.com/hdae/fetch-cache/blob/main/docs/decisions/0012-open-cached-range-read.md)).
 Cache I/O failures while opening degrade to `undefined` and notify
 `onCacheError`; a failure during `read` throws.
+
+An open handle is **not a snapshot** of the entry. `"stream"` re-runs
+`cache.match` on every `read`, so once the entry is gone — `evictUrl` / `evict`
+/ a self-heal — the next `read` throws; and when the handle was opened with a
+`sha256`, the recorded hash is re-checked on every `read` as well, so an entry
+that was _replaced_ rather than removed (a different body written to the same
+key) throws too instead of quietly handing back the new bytes. `clearCache` is
+the one case that depends on the runtime: under Deno the `Cache` object the
+handle holds stops matching once the namespace is deleted, so the read throws
+there, while a browser may keep that object alive. `"blob"` keeps the `Blob` it
+took while opening and goes on reading the old bytes however the entry went
+away.
 
 On the HF layer, `openHfFile(ref, spec)` does the same for a file whose
 `sha256` is declared — that is the content key, and it does not contain the
@@ -503,6 +518,11 @@ How the cache key is chosen (per file):
   do **not** see them; clean them up with `listCachedUrls` + `evictUrl` (see
   Cache management above).
 
+To read only a range out of a file that is already cached — one row of a shard
+rather than the whole shard — use `openHfFile`, which takes the same content
+key and never resolves a revision (see Reading a range out of a cached entry
+above).
+
 `expectedBytes` (exact length check) and a custom per-file `validate` run on
 top of the generic layer's hooks, so they also protect cache reads. On this
 layer `expectedBytes` is an upper bound as well: a response that grows past the
@@ -660,7 +680,10 @@ A few things worth knowing:
 Caching is an optimization, not a correctness requirement. On runtimes without
 `caches`, `fetchBytes` falls back to a plain fetch (`sha256` / `validate`
 still apply per call), `evictUrl` / `evict` / `clearCache` return
-false / 0, and `listCachedUrls` / `listKeys` return `[]`. The one exception:
+false / 0, `listCachedUrls` / `listKeys` return `[]`, and `openCachedUrl` /
+`openHfFile` return `undefined` — not an error, the same answer as a miss
+(`openHfFile` still throws for a spec without `sha256`; that check runs before
+`caches` is looked at). The one exception:
 `prefetchUrl` / `prefetchHfFile` **throw** there instead — storing is their
 only job, so there is nothing to degrade to (see Large assets).
 

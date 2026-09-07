@@ -161,15 +161,40 @@
 - **区間読みは network に出ない**（DECIDED: docs/decisions/0012）。エントリが無ければ
   `undefined` で、温めるのは呼び出し側（`fetchBytes` / `prefetchUrl`）。HF 層の `openHfFile`
   は `sha256` 宣言ファイル専用で、無宣言 spec は throw する（そちらのキーは revision 入りの
-  resolve URL で、解決に network が要るため）。
+  resolve URL で、解決に network が要るため）。**`caches` が無いランタイム**（Node.js 等）でも
+  同じく `undefined` で、エラーではない（`openHfFile` の無宣言 throw だけは `caches` の検査より
+  前に走るので、そこでは throw が先に出る）。**single-flight（ADR 0004）にも参加しない** —
+  取得がエントリを作るのは `cache.put` の後なので、進行中の `fetchBytes` / `prefetchUrl` が
+  あっても待たずに `undefined` を返す（温めを `await` してから開く。非 await の prefetch を
+  `openCachedUrl` でポーリングする使い方はできない）。
+- **区間読みの cache I/O 失敗が縮退するのは開く時だけ**（DECIDED: docs/decisions/0012・0001）。
+  開く時の失敗（`cacheStorage.open` / `cache.match` / "blob" 戦略の `response.blob()`）は miss と
+  同じ `undefined` へ縮退し `onCacheError` で通知する（既定フックの文言は取得系と別で
+  「エントリ無しとして扱います」— この API は network に出ないので「network へ縮退します」は
+  縮退先を偽る）。通知の `op` は **"open" / "match" / "delete" の 3 種** — `blob()` の失敗も
+  "match" に含める（match 済み応答の本文取得で縮退の扱いが同じ。`op` の union を広げると公開
+  型の breaking になる）、"delete" は記録ハッシュ不一致の self-heal で `cache.delete` が失敗
+  した場合（縮退先は変わらず `undefined`）。`read` 中の失敗は縮退先が無いのでそのまま throw
+  する。
+- **区間読みの中断は `read` のチャンク境界まで**（DECIDED: docs/decisions/0012）。"stream" は
+  `reader.read()` の前で `signal` を見るので、進行中の 1 チャンクの読み出しは中断できない。
+  "blob" は読み飛ばしが無いぶん slice の前に 1 回見るだけで、slice 自体を途中で止める口は
+  Web 標準に無い。**開く操作（`openCachedUrl` / `openHfFile`）自体は中断できない** —
+  `signal` を受け取らないので、Deno で "blob" を明示した open の全量 materialize は最後まで
+  走る。
 - **区間読みの性能特性はランタイム依存**（DECIDED: docs/decisions/0012）。既定は
   `globalThis.Deno` があれば "stream"（`read` の度に body を offset まで読み飛ばす —
   **コストは offset に比例**）、無ければ "blob"（ブラウザの遅延 Blob なら定数時間だが、
   Deno の `blob()` は全量をヒープへ載せる）。定数時間の区間読みは Blob 実装の性質であって
   仕様保証ではない（`Range` ヘッダは Cache API に効かない — Chrome 152 実測で 200 全量）。
   開いたハンドルはスナップショットではなく、"stream" は `read` の度に `match` し直すので
-  並行する `evict` / `clearCache` / self-heal でエントリが消えると次の `read` が throw し、
-  "blob" は開いた時点の Blob を持ち続けるので消えた後も読める。
+  並行する `evictUrl` / `evict` / self-heal でエントリが消えると次の `read` が throw する。
+  `sha256` を渡して開いた場合は記録ハッシュも `read` ごとに再照合するので、消えずに
+  **差し替わった**（同じキーへ別内容が書かれた）場合も throw する。
+  **`clearCache` だけはランタイム依存** — 名前空間ごと消しても保持中の `Cache` オブジェクトが
+  生き続けるかは実装次第で、Deno 2.9 は以後の `match` が `undefined` になる（＝ throw）が、
+  ブラウザは未実測。"blob" は開いた時点の Blob を持ち続けるので、どの経路で消えても
+  読み続けられる。
 
 ## HF 層
 
@@ -180,6 +205,12 @@
   `evictUrl`（無宣言分）の 2 段になる。`HfFetchOptions.recheck` も宣言ファイル限定で、
   無宣言ファイルには効かない（黙って素通し — 疑うなら
   `evictUrl(hfResolveUrl({ ...ref, revision, path }))` で落として取り直す）。
+- **`openHfFile` のエラー・通知に出る URL は表示用のラベル**（DECIDED:
+  docs/decisions/0012）。この API は revision を解決しないので、ラベルは
+  `.../resolve/<revision>/<path>`（`revision` 省略時は "main"）のまま出る — 取得元でも保存
+  キーでもなく、実際の読み出し先は revision 非依存の内容キー
+  `["hf", kind, repo, path, sha256]`。そのエントリを消すなら `evictUrl(そのラベル URL)` は
+  何もせず、`evict(["hf", kind, repo, path, sha256])` が正しい。
 - **`fetchHfFiles` の部分キャッシュ**: 1 ファイルの失敗で全体が reject するが、成功済み
   ファイルのキャッシュ書込みは取り消されない（リトライは即ヒット。テストで凍結済み）。
 - **prefetch の複数ファイル版は無い**（DECIDED: docs/decisions/0005 §5）。`prefetchHfFile`

@@ -2,9 +2,9 @@
  * 汎用 cache 層の内部実装。公開 API は src/mod.ts（`.` エントリ）が再公開する。
  *
  * このモジュール自体は deno.json の `exports` に載せない — パッケージ利用者からは import
- * 不能で、`fetchBytesWithKey` / `prefetchUrlWithKey`（配列キーの注入導管）は HF 層と
- * テスト専用に留まる。公開 `key` オプションは 0.5.0 で撤去した（安定キー × sha256 の
- * ピンポン / stale 固着という誤用クラスをモジュール境界で表現不能にする —
+ * 不能で、`fetchBytesWithKey` / `prefetchUrlWithKey` / `openCachedUrlWithKey`（配列キーの
+ * 注入導管）は HF 層とテスト専用に留まる。公開 `key` オプションは 0.5.0 で撤去した（安定
+ * キー × sha256 のピンポン / stale 固着という誤用クラスをモジュール境界で表現不能にする —
  * DECIDED: docs/decisions/0008）。
  *
  * MUST: 実行時依存ゼロ。fetch / caches / crypto.subtle など Web 標準 API のみを使う
@@ -1368,6 +1368,7 @@ export type CachedEntry = {
    * 区間 `[offset, offset + length)` を読む。戻りは **length ちょうど**の新しい
    * `Uint8Array`。範囲外（`offset + length` が本文長を超える）と、本文が途中で尽きた場合は
    * throw する — 黙って短く返すと呼び出し側が末尾の欠けを検出できない（fail loud）。
+   * 負・非整数の `offset` / `length` はキャッシュに触る前に throw する。
    *
    * `options.signal` は "stream" 戦略の読み飛ばし（チャンク境界）で見る。中断すると body を
    * cancel して `signal.reason` で reject する。"blob" 戦略では呼び出し時に 1 回だけ見る
@@ -1382,6 +1383,10 @@ export type CachedEntry = {
   readonly strategy: "blob" | "stream";
 };
 
+/**
+ * `openCachedUrl` のオプション。取得系のオプション（`fetch` / `init` / `retry` / `into` 等）は
+ * 持たない — この API は network に出ず、相手にするのは保存形 raw だけ（ADR 0012 §3）。
+ */
 export type OpenCachedOptions = {
   /**
    * 期待 SHA-256（**64 桁の小文字 hex** — 形式不正は throw）。判定は `fetchBytes` の
@@ -1406,13 +1411,20 @@ export type OpenCachedOptions = {
    *   済む一方、Deno の `blob()` は全量をヒープへ載せる。
    * - **"stream"**: read の度に `cache.match` → body を offset まで読み飛ばして length ぶん
    *   集め、集め終えたら `cancel()`。ヒープに載るのは length ぶんだけだが、読み飛ばしの
-   *   コストが offset に比例する（DECIDED: docs/decisions/0012）。
+   *   コストが offset に比例する（DECIDED: docs/decisions/0012）。この戦略は
+   *   `response.body` を要求する — Cache 応答が body を持たないランタイムでは中身のある
+   *   エントリも「本文 0 バイト」と判定されるので、そこでは "blob" を使う。
    */
   strategy?: "blob" | "stream";
   /**
-   * cache I/O 失敗（open / match）の通知先。既定 console.warn。開く時点の失敗は miss と
-   * 同じ扱い（`undefined`）へ縮退する（DECIDED: docs/decisions/0001）。read 中の失敗は
-   * 縮退先が無いのでそのまま throw する。
+   * cache I/O 失敗の通知先。既定 console.warn。開く時点の失敗は miss と同じ扱い
+   * （`undefined`）へ縮退する（DECIDED: docs/decisions/0001）。read 中の失敗は縮退先が
+   * 無いのでそのまま throw する。
+   *
+   * 通知される `op` は 3 種: `cacheStorage.open` の失敗が "open"、`cache.match` の失敗と
+   * "blob" 戦略の `response.blob()` の失敗が "match"（`blob()` は match 済み応答の本文取得で、
+   * 縮退の扱いも同じなので同じラベルにまとめる）、記録ハッシュ不一致の self-heal で
+   * `cache.delete` が失敗した場合が "delete"。
    */
   onCacheError?: (context: CacheErrorContext) => void;
   /** CacheStorage の差し替え（テストの隔離・故障注入用）。既定 globalThis.caches。 */
@@ -1592,14 +1604,22 @@ const readFromStream = async (
  * `fetchBytes` の責務として一本化する（docs/limitations.md）。`sha256` も記録ハッシュとの
  * 文字列比較だけで、バイト列は読まない。
  *
- * NOTE: cache I/O の失敗（open / match）は miss と同じ扱いで `undefined` へ縮退し、
- *       `onCacheError`（既定 console.warn）で通知する（DECIDED: docs/decisions/0001）。
- *       read 中の失敗は縮退先が無いのでそのまま throw する。
+ * NOTE: 開く時の cache I/O 失敗（`cacheStorage.open` / `cache.match` / "blob" 戦略の
+ *       `response.blob()`）は miss と同じ扱いで `undefined` へ縮退し、`onCacheError`
+ *       （既定 console.warn。通知される `op` は `OpenCachedOptions.onCacheError` 参照）で
+ *       通知する（DECIDED: docs/decisions/0001）。read 中の失敗は縮退先が無いのでそのまま
+ *       throw する。`caches` を持たないランタイムも同じく `undefined`（エラーではない）。
+ * NOTE: single-flight（同一キーの取得を 1 本に束ねる合流機構 — DECIDED:
+ *       docs/decisions/0004）には参加しない。取得がエントリを作るのは `cache.put` の後なので、
+ *       進行中の `fetchBytes` / `prefetchUrl` があっても待たずに `undefined` を返す
+ *       （ポーリングではなく、温めを `await` してから開く）。
  * NOTE: 開いたハンドルはエントリのスナップショットではない。"stream" 戦略は read の度に
- *       match し直すので、並行する `evict` / `clearCache` / self-heal でエントリが消えれば
- *       次の read が throw する。`sha256` を渡して開いた場合は記録ハッシュも read ごとに
- *       再照合し、同じキーへ別内容が書かれていれば（self-heal の取り直し・無検証の
- *       prefetch）同じく throw する（"blob" 戦略は開いた時点の Blob を持ち続ける）。
+ *       match し直すので、並行する `evictUrl` / `evict` / self-heal でエントリが消えれば
+ *       次の read が throw する（`clearCache` 後も throw するかは、保持中の `Cache` が
+ *       名前空間の削除後も生きるかというランタイム依存 — docs/limitations.md）。`sha256` を
+ *       渡して開いた場合は記録ハッシュも read ごとに再照合し、同じキーへ別内容が書かれて
+ *       いれば（self-heal の取り直し・無検証の prefetch）同じく throw する（"blob" 戦略は
+ *       開いた時点の Blob を持ち続ける）。
  */
 export const openCachedUrl = (
   url: string | URL,

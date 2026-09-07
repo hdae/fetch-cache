@@ -9,8 +9,8 @@ Deno / ブラウザ両対応の「URL ベースの Cache API 付きダウンロ�
   evict / listKeys / evictUrl / clearCache / listCachedUrls / openCachedUrl /
   VERSION 焼き込み）。
 - `src/core.ts` — 汎用 cache 層の実装（**exports 外の内部モジュール**）。配列キーの注入導管
-  fetchBytesWithKey / prefetchUrlWithKey / openCachedUrlWithKey は HF 層とテスト専用（公開 `key` は 0.5.0 で撤去 —
-  ADR 0008）。
+  fetchBytesWithKey / prefetchUrlWithKey / openCachedUrlWithKey は HF 層とテスト専用
+  （公開 `key` は 0.5.0 で撤去 — ADR 0008）。
 - `src/retry.ts` — 内部モジュール（非公開）。429 / 503 の再試行（Retry-After 追従）。3 か所の
   fetch 呼び出し点（fetchBytes の network 経路 / prefetchUrl / resolveHfRevision）が全て
   ここを通る。公開されるのは `RetryPolicy` / `RetryContext` の 2 型だけ（ADR 0010）。
