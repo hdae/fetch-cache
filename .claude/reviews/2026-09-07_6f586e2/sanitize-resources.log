@@ -1,0 +1,343 @@
+running 6 tests from ./scripts/release_tag.test.ts
+checkReleaseTag: v<version> 完全一致は ok で bare version を返す ... ok (610µs)
+checkReleaseTag: prerelease タグも完全一致で受理し bare version を返す ... ok (69µs)
+checkReleaseTag: v プレフィックス欠落は fail ... ok (47µs)
+checkReleaseTag: 境界（v 単独・空文字・前後空白）はすべて fail ... ok (80µs)
+checkReleaseTag: 大文字 V は通さない（慣習に厳格） ... ok (51µs)
+checkReleaseTag: version 不一致は fail ... ok (48µs)
+running 1 test from ./scripts/version_sync.test.ts
+version 焼き込み: 公開 VERSION == deno.json.version ... ok (565µs)
+running 59 tests from ./src/hf/mod.test.ts
+hfResolveUrl: kind ごとのパス接頭辞と revision/path を組み立てる ... ok (537µs)
+hfResolveUrl: revision は丸ごと・path はセグメント毎に percent-encode される ... ok (71µs)
+hfResolveUrl / resolveHfRevision: hubUrl の末尾スラッシュは吸収される ... ok (5ms)
+isCommitSha: 40桁小文字 hex のみ true ... ok (81µs)
+resolveHfRevision: 可変 ref を API の sha へ解決する ... ok (137µs)
+resolveHfRevision: kind で API セグメントが変わる ... ok (118µs)
+resolveHfRevision: slash 入り ref は encode されて API に渡る ... ok (109µs)
+resolveHfRevision: SHA passthrough はネットワークに出ない ... ok (56µs)
+resolveHfRevision: 応答に sha が無ければ throw する ... ok (290µs)
+resolveHfRevision: HTTP エラーは status 入りメッセージで throw する ... ok (772µs)
+resolveHfRevision: HTTP エラー時は body を cancel して接続リソースを解放する ... ok (181µs)
+fetchHfFile: 可変 ref は解決 1 回 → SHA 固定 URL で取得する ... ok (26ms)
+fetchHfFile: sha256 無しの既定キーは SHA 固定 resolve URL（従来どおり） ... FAILED (9ms)
+fetchHfFile: init は revision 解決とファイル取得の両方へ渡る ... ok (7ms)
+fetchHfFile: ファイル取得の 404 は fail-loud に伝播する ... ok (780µs)
+fetchHfFile: sha256 一致で取得され、既定キーは内容キー（revision 非依存）になる ... FAILED (9ms)
+fetchHfFile: revision が動いてもバイト不変なら内容キーでヒットする（再ダウンロードしない） ... ok (7ms)
+fetchHfFile: revision 切り替えで内容が違えば別エントリとして共存する（ピンポンしない） ... ok (15ms)
+fetchHfFile: hubUrl はキーに含まれない（ミラー跨ぎで同一内容がヒットする） ... ok (8ms)
+fetchHfFile: kind はキーに含まれる（model と dataset は同一 repo/path/sha256 でも別エントリ） ... FAILED (12ms)
+fetchHfFile: 破損キャッシュは sha256 で検知され再取得される（self-heal） ... ok (12ms)
+fetchHfFile: sha256 不一致は throw し、キャッシュしない ... ok (654µs)
+fetchHfFile: expectedBytes 不一致は throw する ... ok (561µs)
+fetchHfFiles: revision API は 1 回だけ・並列結果が名前にマップされる ... ok (15ms)
+fetchHfFiles: 1 ファイルの失敗で全体が reject し、成功分のキャッシュは残る ... FAILED (9ms)
+fetchHfFile: decode は利用形を返し、cache は保存形 raw のまま（sha256 は raw に照合） ... ok (8ms)
+fetchHfFile: カスタム validate は保存形 raw を受け、throw は不正扱いでキャッシュしない ... ok (8ms)
+fetchHfFile: built-in 検証（expectedBytes）が落ちたらカスタム validate は走らない ... ok (517µs)
+fetchHfFiles: decode はファイル毎に独立して適用される ... ok (14ms)
+fetchHfFiles: onProgress に path が付く ... ok (14ms)
+sha256 検証: digest には validate が受け取った view がそのまま渡る（コピーしない） ... ok (8ms)
+既定: 記録一致のヒットでは再ハッシュしない（ハッシュは保存時の 1 回だけ） ... ok (7ms)
+recheck: true ならヒット時に実バイトを再ハッシュして突合する（opt-out） ... ok (6ms)
+recheck: sha256 の無いファイルには影響しない（単独指定 throw を HF 層が回避する） ... ok (5ms)
+HfFileSpec.expectedBytes は受信バッファの確保ヒントとして cache 層へ流れる ... ok (6ms)
+HfFileSpec.into は cache 層へ流れ、network もキャッシュヒットも器の prefix view を返す ... ok (8ms)
+prefetchHfFile: 可変 ref を解決 1 回 → SHA 固定 URL で温め、以後の取得はヒットする ... ok (10ms)
+prefetchHfFile: 戻り値の revision / url が温めたエントリを指し、渡し回せば upstream が動いてもヒットする ... FAILED (15ms)
+prefetchHfFile: spec.sha256 で内容キーに温まり、読み出しと無ハッシュで噛み合う ... FAILED (8ms)
+prefetchHfFile: sha256 不一致は throw し、エントリを残さない ... ok (1ms)
+prefetchHfFile: 既にエントリがあれば network に出ず false を返す ... ok (8ms)
+fetchHfFile: 形式不正の sha256 は network に出る前に fail loud ... ok (370µs)
+prefetchHfFile: 形式不正の sha256 は network に出る前に fail loud ... ok (141µs)
+fetchHfFile / prefetchHfFile: 形式不正の sha256 は可変 ref の解決 API にも出ない ... ok (142µs)
+fetchHfFiles: 1 つでも形式不正の spec があれば解決にも兄弟ファイル取得にも出ない ... ok (147µs)
+fetchHfFile / prefetchHfFile / fetchHfFiles: 形式不正の expectedBytes は要求の前に fail loud ... ok (239µs)
+fetchHfFile / fetchHfFiles: into の容量を超える expectedBytes は可変 ref の解決 API にも出ない ... ok (213µs)
+prefetchHfFile: spec.into は見ない（器は無傷のまま温まる） ... ok (7ms)
+prefetchHfFile: onProgress には path が付き、init は解決と取得の両方へ渡る ... ok (8ms)
+fetchHfFile: 受信が expectedBytes を超えたら残りを読まずに throw し、キャッシュしない ... ok (1ms)
+prefetchHfFile: 受信が expectedBytes を超えたら throw し、エントリを成立させない ... ok (1ms)
+fetchHfFile / prefetchHfFile: ちょうど expectedBytes ぶんなら成功する ... ok (15ms)
+fetchHfFile: into 使用時も受信上限が先に立つ（器不足ではなく申告違反で落ちる） ... ok (598µs)
+fetchHfFile: expectedBytes:0 は妥当な申告（空は成功・1 バイトで超過） ... ok (6ms)
+fetchHfFile: expectedBytes に足りない受信は従来どおり全量後の不一致で落ちる ... ok (613µs)
+openHfFile: 温めた内容キーのエントリを revision 解決なしで開く（network に一度も出ない） ... ok (7ms)
+openHfFile: sha256 の無い spec は throw する（キーが revision 入りで解決に network が要るため） ... ok (242µs)
+openHfFile: read 戦略と caches の差し替えは cache 層へそのまま透過する ... ok (7ms)
+openHfFile: 温めていないファイルは undefined（取得はしない） ... ok (409µs)
+running 141 tests from ./src/mod.test.ts
+fetchBytes: ミスで fetch 1回、2回目はキャッシュヒットで fetch 0回 ... ok (12ms)
+fetchBytes: cache:false は Cache API を触らず毎回 fetch する ... ok (639µs)
+fetchBytes: 破損キャッシュは evict して network から取り直す（self-heal） ... ok (15ms)
+fetchBytes: network 取得物の validate 失敗は throw し、キャッシュしない ... ok (999µs)
+fetchBytes: onProgress はチャンク毎に loaded を累積し、content-length があれば total を持つ ... ok (7ms)
+fetchBytes: content-length が無ければ total は undefined ... ok (8ms)
+fetchBytes: HTTP エラーは status 入りメッセージで throw する ... ok (722µs)
+single-flight: 同一 URL の並行呼び出しは 1 フライトに合流し fetch は 1 回 ... ok (5ms)
+single-flight: decode は合流後に各呼び出しが自分のものを適用する ... ok (11ms)
+single-flight: 合流者の validate 失敗はその呼び出しだけ throw する ... ok (7ms)
+single-flight: 取得失敗は合流全員へ伝播するが、失敗は記憶されず次の呼び出しで再取得する ... ok (8ms)
+single-flight: onProgress は合流者へも fan-out される ... ok (7ms)
+single-flight: 途中合流者には直近の進捗が合流時に 1 回即時通知される ... ok (9ms)
+single-flight: 進捗通知中に合流した呼び出しは同じ進捗を二重に受けない ... ok (7ms)
+single-flight: onProgress リスナーの throw は取得を巻き添えにしない（隔離+警告） ... ok (8ms)
+single-flight: cache:false の呼び出しは合流しない（毎回取得の意図を尊重） ... ok (158µs)
+single-flight: 同一 URL でも key の有無でキーが違えば合流しない ... ok (14ms)
+fetchBytes: body が null の応答は arrayBuffer フォールバックで空 bytes・onProgress 1回 ... ok (7ms)
+fetchBytes: self-heal の再取得も validate 失敗なら throw し、エントリは残らない ... ok (8ms)
+fetchBytes: async validate の reject も拾い、resolve は通す ... ok (7ms)
+fetchBytes: fetch の transport 例外は握りつぶさず伝播する ... ok (631µs)
+fetchBytes / evictUrl: URL オブジェクト入力は文字列と同じキーになる ... ok (7ms)
+fetchBytes: 正常キャッシュヒットは validate 通過で network に出ない ... ok (5ms)
+fetchBytes: HTTP エラー時は body を cancel して接続リソースを解放する ... ok (600µs)
+fetchBytes: cache.put 失敗は成功したダウンロードを巻き添えにせず通知する ... ok (599µs)
+fetchBytes: cache 読出し失敗は miss として network へ縮退し通知する ... ok (6ms)
+fetchBytes: caches.open 失敗はキャッシュ無しの素の fetch へ縮退する ... ok (513µs)
+fetchBytes: self-heal 中の evict 失敗でも再取得は続行し通知する ... ok (14ms)
+fetchBytes: init（ヘッダ・signal）は fetch へそのまま渡る ... ok (7ms)
+fetchBytes: GET 以外はキャッシュ有効のままだと throw、cache:false なら通る ... ok (344µs)
+fetchBytes: decode は利用形を返し、cache には保存形 raw がそのまま入る ... ok (8ms)
+fetchBytes: validate は decode 前の保存形 raw を受ける（両経路で契約を凍結） ... ok (7ms)
+fetchBytes: キャッシュヒットの decode 失敗は evict して network から取り直す（self-heal） ... ok (16ms)
+fetchBytes: network 取得物の decode 失敗は throw し、キャッシュしない ... ok (611µs)
+fetchBytes: cache:false（素の fetch 経路）でも async decode が適用される ... ok (129µs)
+key: 格納も読出しもキー側で行い、取得元 URL が変わってもヒットする ... ok (8ms)
+key: 破損したキー側エントリを evict して取り直す（self-heal もキー側） ... ok (15ms)
+key: 同一 key・別 URL の並行呼び出しは合流し fetch は 1 回 ... ok (7ms)
+key: 直列化は単射（セグメント境界・要素型・非 ASCII が衝突しない） ... ok (47ms)
+key: 不正な指定は network に出る前に fail loud ... ok (410µs)
+予約 origin（fetch-cache.invalid）は取得元 URL に使えない ... ok (555µs)
+URL 正規化: 大文字 scheme/host・既定 port・fragment の表記違いは同一キーにヒットする ... ok (7ms)
+URL 正規化: 表記違いの並行呼び出しも 1 フライトに合流する（二重取得しない） ... ok (8ms)
+予約 origin ガード: 大文字表記もすり抜けず、network に出る前に fail loud ... ok (229µs)
+予約 origin ガード: 似て非なる origin は過剰拒否せず、一覧からも巻き添え除外しない ... ok (7ms)
+解釈できない URL は fail loud（fetch へ丸投げしない） ... ok (255µs)
+sha256: network 取得を検証し、記録ハッシュをエントリへ焼く ... FAILED (9ms)
+sha256: network 取得の不一致は throw し、キャッシュしない ... ok (642µs)
+sha256: 記録一致のヒットは再ハッシュせず信じる（既定）— recheck で opt-out できる ... ok (14ms)
+sha256: 記録が無いエントリは実ハッシュで突合し、一致したら記録を焼き直す（backfill） ... ok (26ms)
+sha256: 無検証 prefetch → sha256 付き読み出しで記録が補完され、ヒットのまま ... FAILED (13ms)
+sha256: backfill の put 失敗は結果を壊さず通知して続行する（縮退） ... ok (7ms)
+sha256: 記録 ≠ 期待は実バイトが期待と一致していても evict して取り直す（判定は記録のみ） ... FAILED (15ms)
+sha256: 記録 ≠ 期待は「内容が変わった」として同じキーを上書きする（安定キーのピンポン凍結) ... FAILED (23ms)
+sha256: 旧ヘッダ x-fetch-cache-verified は記録として読まない（0.5.0 破壊的移行） ... ok (15ms)
+sha256: カスタム validate は記録一致のヒットでも常に走る（省くのは再ハッシュだけ） ... ok (7ms)
+sha256: 合流者は自分の期待値で検証する（不一致はその呼び出しだけ throw） ... ok (8ms)
+sha256 / recheck: 不正な指定は network に出る前に fail loud ... ok (206µs)
+fetchBytes: expectedBytes を渡すと受信バッファを事前確保しチャンクを即コピーする ... ok (7ms)
+fetchBytes: expectedBytes 省略時は content-length を確保ヒントに使う ... ok (7ms)
+fetchBytes: content-length が無ければ従来どおり蓄積経路で読み切る ... ok (5ms)
+fetchBytes: 申告を超えて届いたら蓄積経路へ落ちて全量を返す（ヒントは検証ではない） ... ok (6ms)
+fetchBytes: 明示 expectedBytes を超えて届いても全量を返す（汎用層の申告は上限にならない） ... ok (7ms)
+fetchBytes: 申告に足りない受信は実長へ詰め直して tight view で返す ... ok (8ms)
+fetchBytes: expectedBytes は content-length より優先される（判別可能な手順で凍結） ... ok (15ms)
+fetchBytes: 確保できないほど巨大な content-length でも取得は落とさず蓄積経路で完走する ... FAILED (52ms)
+fetchBytes: 不正な expectedBytes（非整数・0 以下）は確保ヒントを捨てて蓄積経路で完走する ... ok (24ms)
+fetchBytes: 明示 expectedBytes の確保が落ちたら受信前に fail loud で止める ... ok (52ms)
+fetchBytes: into は network 受信を器の先頭へ書き、prefix view を返す ... ok (7ms)
+fetchBytes: into はキャッシュヒットでも器へ流し込み、network に出ない ... ok (7ms)
+fetchBytes: 同じ器を渡し回すと毎回先頭から上書きされ、戻り値は各回の実長になる ... ok (11ms)
+fetchBytes: into 使用時の sha256 は器の prefix view で検証される（network・記録なしヒット） ... ok (22ms)
+fetchBytes: into と decode の併用は器に保存形 raw・戻り値は decode 後 ... ok (10ms)
+fetchBytes: into の容量不足は network 受信を打ち切って throw し、キャッシュしない ... ok (894µs)
+fetchBytes: into の容量不足はキャッシュヒットでも throw し、エントリを消さず network にも出ない ... ok (8ms)
+fetchBytes: expectedBytes が into の容量を超える申告は network に出る前に throw する ... ok (201µs)
+single-flight: leader の into は合流者へ渡らない（合流者はコピー、または自分の into を受け取る） ... ok (7ms)
+single-flight: 合流者の into が保存形より小さければその呼び出しだけ throw する ... ok (7ms)
+fetchBytes: cache:false でも into は効く（受信を器へ書く） ... ok (120µs)
+fetchBytes: body を持たない応答でも into へ写し、容量不足は throw する ... ok (8ms)
+fetchBytes: 記録不一致のヒットは self-heal し、network 内容を器へ書き直す ... ok (15ms)
+fetchBytes: validate 拒否のヒットは器へ一度書いた後 network 内容で上書きされる ... ok (14ms)
+fetchBytes: into のキャッシュヒットでは onProgress が発火しない ... ok (11ms)
+fetchBytes: 空 body + into は長さ 0 の prefix view と空エントリになる ... ok (7ms)
+fetchBytes: into のキャッシュヒットは body stream で器へ流す（materialize しない） ... ok (662µs)
+single-flight: leader の into 容量不足は合流者にも伝播する（誰もキャッシュしない） ... ok (666µs)
+fetchBytes: 同じ器を並行する別の取得へ渡すと network に出る前に throw する ... ok (15ms)
+fetchBytes: SharedArrayBuffer 背面の into は network に出る前に throw する ... ok (139µs)
+fetchBytes: キャッシュヒットの容量不足はエントリが残っていることと回復手順を伝える ... ok (8ms)
+prefetchUrl: body を streaming で格納し、以後の fetchBytes は network に出ない ... ok (7ms)
+prefetchUrl: 既にエントリがあれば network に出ず false を返す ... ok (8ms)
+prefetchUrl: key 側へ格納し、既存エントリ検査も key で行う ... ok (7ms)
+prefetchUrl: 転送が途中で切れたら throw し、エントリは成立しない ... ok (1ms)
+prefetchUrl: put 失敗（quota 等）は縮退せず throw する（手元にバイトが無い） ... ok (646µs)
+prefetchUrl: caches.open 失敗も縮退せず throw する ... ok (168µs)
+prefetchUrl: HTTP エラーは throw し、body を cancel してエントリも作らない ... ok (687µs)
+prefetchUrl: 非 GET は fail loud（Cache API に格納できない） ... ok (112µs)
+prefetchUrl: onProgress はチャンク毎に発火し content-length を total に持つ ... ok (8ms)
+prefetchUrl: single-flight の対象外（並行の fetchBytes / prefetch と合流しない） ... ok (7ms)
+prefetchUrl: body が null の応答も空エントリとして成立する ... ok (8ms)
+prefetchUrl: sha256 一致で記録付きエントリが成立し、読み出しは記録との突合だけで済む ... ok (8ms)
+prefetchUrl: key + sha256 の記録はキー側に焼かれ、同じ key の読み出しに繋がる ... FAILED (7ms)
+prefetchUrl: sha256 不一致は put ごと reject させ、エントリを成立させない ... ok (1ms)
+prefetchUrl: stream の error を握り潰す非準拠 Cache でも記録付きの不正エントリは残さない（保険 delete はキー側） ... ok (466µs)
+prefetchUrl: 保険 delete まで失敗したら黙殺せず両方の失敗を束ねて throw する ... ok (368µs)
+prefetchUrl: 受信上限の超過で保険 delete まで失敗したら、事由を名指しして束ねて throw する ... ok (471µs)
+prefetchUrl: 通過中検証のチャンクは呼び出し側の書き換えから隔離される（記録と中身が乖離しない） ... ok (5ms)
+prefetchUrl: body が null の応答でも sha256 は検証される ... ok (8ms)
+受信上限: body が null の経路でも判定は onProgress より先（進捗に超過を流さない） ... ok (907µs)
+prefetchUrl: 既存エントリの記録が期待 sha256 と食い違えば温め直して置換する ... ok (15ms)
+prefetchUrl: 記録なしエントリへの sha256 付き prefetch は検証付きで温め直す ... FAILED (15ms)
+prefetchUrl: 温め直しの取得が失敗しても既存エントリは失われない ... ok (7ms)
+prefetchUrl: sha256 未指定なら記録は付かない（既定の無検証格納は不変） ... FAILED (8ms)
+prefetchUrl: 形式不正の sha256 は network に出る前に fail loud ... ok (157µs)
+decodeGzip: gzip を解凍して元のバイト列を返し、不正入力は throw する ... ok (692µs)
+evictUrl: エントリがあれば削除して true、無ければ false ... ok (7ms)
+evictUrl / listCachedUrls / evict / listKeys: 無い名前空間を作らない（読み取り系の永続化副作用の禁止） ... ok (451µs)
+clearCache: 名前空間ごと削除して true、既に無ければ false ... ok (7ms)
+listCachedUrls: keys() 未実装ランタイム（Deno 2.8 以前）では fail loud に throw する ... ignored (0ms)
+listCachedUrls / listKeys: URL キーと配列キーを分けて一覧する（keys() 実装ランタイムのみ） ... ok (15ms)
+evict / listKeys: プレフィックスで部分木を操作できる ... ok (32ms)
+evict: プレフィックス一致はセグメント境界で判定される（['a'] は ['ab'] に一致しない） ... ok (22ms)
+管理 API: caches DI — DI したストレージのエントリを列挙・削除でき、global には触れない ... ok (755µs)
+listKeys: 予約 origin 配下に復元できないエントリがあれば fail loud に throw する ... ok (7ms)
+listKeys: JSON として解析できても型範囲外の要素（null / 1e400 / 配列）は復元不能として fail loud ... ok (31ms)
+openCachedUrl: 温めたエントリの区間を元バイト列どおりに読む（blob 戦略） ... ok (10ms)
+openCachedUrl: 温めたエントリの区間を元バイト列どおりに読む（stream 戦略） ... ok (8ms)
+openCachedUrl: キャッシュに無い URL は undefined（network に出る口を持たない） ... ok (593µs)
+openCachedUrl: 記録ハッシュが期待と食い違うエントリは evict して undefined（次の fetchBytes が取り直す） ... ok (11ms)
+openCachedUrl: 記録ハッシュの無いエントリは sha256 指定だと undefined（evict はせず、fetchBytes の backfill 後に開ける） ... ok (14ms)
+openCachedUrl: 範囲外の区間は throw する（blob 戦略） ... ok (9ms)
+openCachedUrl: 範囲外の区間は throw する（stream 戦略） ... FAILED (64ms)
+openCachedUrl: stream 戦略の read は signal で中断でき、signal.reason で reject する ... ok (9ms)
+openCachedUrl: caches.open 失敗は miss と同じ undefined へ縮退して通知する ... ok (302µs)
+openCachedUrl: cache 読出し失敗も undefined へ縮退して通知する ... ok (567µs)
+openCachedUrlWithKey: 配列キーのエントリを開き、区間読みは検証系オプションを持たない ... ok (8ms)
+openCachedUrl: read の不正値は入口で throw する（キャッシュにも触らない） ... ok (204µs)
+openCachedUrl: stream 戦略の read は開いた後に消えたエントリで throw する（ハンドルはスナップショットではない） ... ok (31ms)
+openCachedUrl: blob 戦略のハンドルは evict 後も読める（開いた時点の Blob を持つ） ... ok (9ms)
+openCachedUrl: blob 戦略の blob() 失敗も match と同じく undefined へ縮退して通知する ... ok (462µs)
+openCachedUrl: read 省略時の既定戦略は Deno なら stream（blob() が全量をヒープへ載せるため） ... ok (5ms)
+running 29 tests from ./src/retry.test.ts
+再試行: 429 + Retry-After は既定で 1 回待って取り直し、結果はキャッシュされる ... ok (40ms)
+再試行: Retry-After が無ければ baseDelayMs から始まる待機で取り直す（503 も対象） ... ok (9ms)
+再試行: Retry-After が無いときの待機は 2 倍ずつ伸びる ... ok (18ms)
+再試行: HTTP-date 形式の Retry-After は現在時刻との差（過去なら 0）で待つ ... ok (10ms)
+再試行: 解釈できない Retry-After は「指示なし」扱いで baseDelayMs に落ちる ... ok (9ms)
+再試行: 数値系の書式ミスの Retry-After も「指示なし」扱いで baseDelayMs に落ちる ... ok (48ms)
+再試行: maxDelayMs は Retry-After の指示も上限で切る ... ok (10ms)
+再試行: 使い切ったら従来の文言で throw し、キャッシュも残さない ... ok (5ms)
+再試行: policy の形式不正は要求を出す前に throw する（network に出ない） ... ok (2ms)
+再試行: 対象外ステータスと retry:false は 1 回目でそのまま throw する ... ok (801µs)
+再試行: retry:false は 503 も 1 回目でそのまま throw する ... ok (582µs)
+再試行: maxRetries:0 と statuses:[] はどちらも再試行を止める ... ok (814µs)
+再試行: 再試行の後に届いた対象外ステータスにも回数の接尾辞が付く ... ok (2ms)
+再試行: setTimeout の上限を超える Retry-After は待たずに応答を返す（再試行しない） ... ok (9ms)
+再試行: 上限超えで止めても、それまでの再試行回数は文言に残る ... ok (2ms)
+再試行: GET / HEAD 以外は再試行しない（cache:false の POST は打ち直さない） ... ok (325µs)
+再試行: HEAD は冪等なので再試行する（cache:false 経由） ... ok (2ms)
+再試行: 待機中の abort は timer を消して signal.reason で reject する ... ok (3ms)
+再試行: 既に aborted の signal では待たずに reject する ... ok (620µs)
+再試行: onRetry の throw は取得を巻き添えにしない（隔離+警告） ... ok (10ms)
+再試行: prefetchUrl 経路も同じ 1 本を通る ... FAILED (10ms)
+再試行: prefetchUrl の HTTP エラー文言にも再試行回数が付く ... ok (2ms)
+再試行: single-flight の合流者は leader の再試行を待つ（合流者の retry / onRetry は使われない） ... ok (8ms)
+再試行: resolveHfRevision 経路も同じ 1 本を通る ... ok (2ms)
+再試行: HF 層の retry / onRetry は revision 解決とファイル取得の両方へ届く ... ok (11ms)
+再試行: prefetchHfFile 経路にも retry / onRetry が透過する ... FAILED (10ms)
+再試行: fetchHfFiles 経路にも retry / onRetry が透過する（ファイル毎に効く） ... ok (17ms)
+再試行: statuses を差し替えると対象が入れ替わる（既定の 429 は外れる） ... ok (9ms)
+再試行: HF 層の retry:false は解決 API の 429 も即 throw にする ... ok (247µs)
+running 6 tests from ./src/sha256.test.ts
+createSha256: ランダムな分割で update しても native の一括 digest と一致する ... ok (10ms)
+createSha256: 1 バイトずつ・空チャンク混じりでも一括結果と一致する ... ok (237µs)
+createSha256: hex() は状態を消費せず、途中経過は prefix のダイジェストになる ... ok (206µs)
+createSha256: 既知のテストベクタと一致する（実装同士の共倒れ検出） ... ok (61µs)
+createSha256: update から戻った後にチャンクを書き換えても結果は変わらない（非保持契約） ... ok (83µs)
+createSha256: 512MiB+1 バイト（長さフィールド上位 32bit が非ゼロ）が golden と一致する ... ok (2s)
+
+ ERRORS 
+
+fetchHfFile: sha256 無しの既定キーは SHA 固定 resolve URL（従来どおり） => ./src/hf/mod.test.ts:203:6
+error: Leaks detected:
+  - "CacheResponseResource" was created during the test, but not cleaned up during the test. Close the resource before the end of the test.
+
+fetchHfFile: sha256 一致で取得され、既定キーは内容キー（revision 非依存）になる => ./src/hf/mod.test.ts:253:6
+error: Leaks detected:
+  - "CacheResponseResource" was created during the test, but not cleaned up during the test. Close the resource before the end of the test.
+
+fetchHfFile: kind はキーに含まれる（model と dataset は同一 repo/path/sha256 でも別エントリ） => ./src/hf/mod.test.ts:359:6
+error: Leaks detected:
+  - "CacheResponseResource" was created during the test, but not cleaned up during the test. Close the resource before the end of the test.
+
+fetchHfFiles: 1 ファイルの失敗で全体が reject し、成功分のキャッシュは残る => ./src/hf/mod.test.ts:487:6
+error: Leaks detected:
+  - "CacheResponseResource" was created during the test, but not cleaned up during the test. Close the resource before the end of the test.
+
+prefetchHfFile: 戻り値の revision / url が温めたエントリを指し、渡し回せば upstream が動いてもヒットする => ./src/hf/mod.test.ts:879:6
+error: Leaks detected:
+  - "CacheResponseResource" was created during the test, but not cleaned up during the test. Close the resource before the end of the test.
+
+prefetchHfFile: spec.sha256 で内容キーに温まり、読み出しと無ハッシュで噛み合う => ./src/hf/mod.test.ts:919:6
+error: Leaks detected:
+  - "CacheResponseResource" was created during the test, but not cleaned up during the test. Close the resource before the end of the test.
+
+sha256: network 取得を検証し、記録ハッシュをエントリへ焼く => ./src/mod.test.ts:1104:6
+error: Leaks detected:
+  - "CacheResponseResource" was created during the test, but not cleaned up during the test. Close the resource before the end of the test.
+
+sha256: 無検証 prefetch → sha256 付き読み出しで記録が補完され、ヒットのまま => ./src/mod.test.ts:1204:6
+error: Leaks detected:
+  - "CacheResponseResource" was created during the test, but not cleaned up during the test. Close the resource before the end of the test.
+
+sha256: 記録 ≠ 期待は実バイトが期待と一致していても evict して取り直す（判定は記録のみ） => ./src/mod.test.ts:1245:6
+error: Leaks detected:
+  - "CacheResponseResource" was created during the test, but not cleaned up during the test. Close the resource before the end of the test.
+
+sha256: 記録 ≠ 期待は「内容が変わった」として同じキーを上書きする（安定キーのピンポン凍結) => ./src/mod.test.ts:1269:6
+error: Leaks detected:
+  - "CacheResponseResource" was created during the test, but not cleaned up during the test. Close the resource before the end of the test.
+
+fetchBytes: 確保できないほど巨大な content-length でも取得は落とさず蓄積経路で完走する => ./src/mod.test.ts:1553:6
+error: Leaks detected:
+  - "CacheResponseResource" was created before the test started, but was cleaned up during the test. Do not close resources in a test that were not created during that test.
+
+prefetchUrl: key + sha256 の記録はキー側に焼かれ、同じ key の読み出しに繋がる => ./src/mod.test.ts:2507:6
+error: Leaks detected:
+  - "CacheResponseResource" was created during the test, but not cleaned up during the test. Close the resource before the end of the test.
+
+prefetchUrl: 記録なしエントリへの sha256 付き prefetch は検証付きで温め直す => ./src/mod.test.ts:2837:6
+error: Leaks detected:
+  - "CacheResponseResource" was created during the test, but not cleaned up during the test. Close the resource before the end of the test.
+
+prefetchUrl: sha256 未指定なら記録は付かない（既定の無検証格納は不変） => ./src/mod.test.ts:2887:6
+error: Leaks detected:
+  - "CacheResponseResource" was created during the test, but not cleaned up during the test. Close the resource before the end of the test.
+
+openCachedUrl: 範囲外の区間は throw する（stream 戦略） => ./src/mod.test.ts:3292:8
+error: Leaks detected:
+  - "CacheResponseResource" was created before the test started, but was cleaned up during the test. Do not close resources in a test that were not created during that test.
+  - "CacheResponseResource" was created during the test, but not cleaned up during the test. Close the resource before the end of the test.
+
+再試行: prefetchUrl 経路も同じ 1 本を通る => ./src/retry.test.ts:642:6
+error: Leaks detected:
+  - "CacheResponseResource" was created during the test, but not cleaned up during the test. Close the resource before the end of the test.
+
+再試行: prefetchHfFile 経路にも retry / onRetry が透過する => ./src/retry.test.ts:786:6
+error: Leaks detected:
+  - "CacheResponseResource" was created during the test, but not cleaned up during the test. Close the resource before the end of the test.
+
+ FAILURES 
+
+fetchHfFile: sha256 無しの既定キーは SHA 固定 resolve URL（従来どおり） => ./src/hf/mod.test.ts:203:6
+fetchHfFile: sha256 一致で取得され、既定キーは内容キー（revision 非依存）になる => ./src/hf/mod.test.ts:253:6
+fetchHfFile: kind はキーに含まれる（model と dataset は同一 repo/path/sha256 でも別エントリ） => ./src/hf/mod.test.ts:359:6
+fetchHfFiles: 1 ファイルの失敗で全体が reject し、成功分のキャッシュは残る => ./src/hf/mod.test.ts:487:6
+prefetchHfFile: 戻り値の revision / url が温めたエントリを指し、渡し回せば upstream が動いてもヒットする => ./src/hf/mod.test.ts:879:6
+prefetchHfFile: spec.sha256 で内容キーに温まり、読み出しと無ハッシュで噛み合う => ./src/hf/mod.test.ts:919:6
+sha256: network 取得を検証し、記録ハッシュをエントリへ焼く => ./src/mod.test.ts:1104:6
+sha256: 無検証 prefetch → sha256 付き読み出しで記録が補完され、ヒットのまま => ./src/mod.test.ts:1204:6
+sha256: 記録 ≠ 期待は実バイトが期待と一致していても evict して取り直す（判定は記録のみ） => ./src/mod.test.ts:1245:6
+sha256: 記録 ≠ 期待は「内容が変わった」として同じキーを上書きする（安定キーのピンポン凍結) => ./src/mod.test.ts:1269:6
+fetchBytes: 確保できないほど巨大な content-length でも取得は落とさず蓄積経路で完走する => ./src/mod.test.ts:1553:6
+prefetchUrl: key + sha256 の記録はキー側に焼かれ、同じ key の読み出しに繋がる => ./src/mod.test.ts:2507:6
+prefetchUrl: 記録なしエントリへの sha256 付き prefetch は検証付きで温め直す => ./src/mod.test.ts:2837:6
+prefetchUrl: sha256 未指定なら記録は付かない（既定の無検証格納は不変） => ./src/mod.test.ts:2887:6
+openCachedUrl: 範囲外の区間は throw する（stream 戦略） => ./src/mod.test.ts:3292:8
+再試行: prefetchUrl 経路も同じ 1 本を通る => ./src/retry.test.ts:642:6
+再試行: prefetchHfFile 経路にも retry / onRetry が透過する => ./src/retry.test.ts:786:6
+
+FAILED | 224 passed | 17 failed | 1 ignored (4s)
+
+error: Test failed
