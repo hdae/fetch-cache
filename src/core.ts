@@ -1455,6 +1455,7 @@ const outOfRange = (
   length: number,
   size: number | undefined,
   requestUrl: string,
+  cause?: unknown,
 ): Error =>
   new Error(
     `fetch-cache: 区間 [${offset}, ${
@@ -1464,6 +1465,7 @@ const outOfRange = (
         ? `${length} バイトのバッファを確保できません`
         : `本文 ${size} バイト`
     }） (${requestUrl})`,
+    cause === undefined ? undefined : { cause },
   );
 
 /** "blob" 戦略の read。開く時に取った Blob へ slice するだけ（再 match しない）。 */
@@ -1503,6 +1505,16 @@ const readFromStream = async (
 ): Promise<Uint8Array> => {
   assertRange(offset, length, requestUrl);
   signal?.throwIfAborted();
+  // "blob" 戦略は size 比較で先に落ちるが、こちらは本文長が読み終わるまで分からないので
+  // 確保が先に来る。確保できない大きさ＝どの本文にも収まらないので、範囲外へ読み替える。
+  // 確保は match より前に置く: 後ろに置くと確保失敗で match 済みの body を解放せずに抜け、
+  // Cache のファイルハンドルが残る（実行環境の生の RangeError は cause に残す — 診断用）。
+  let out: Uint8Array<ArrayBuffer>;
+  try {
+    out = new Uint8Array(length);
+  } catch (error) {
+    throw outOfRange(offset, length, undefined, requestUrl, error);
+  }
   // 開きっぱなしの reader は前方にしか進めない（offset を戻せない）ので read 毎に開き直す。
   // ここでの失敗は縮退先が無い（呼び出し側は既に「開けた」と思っている）ので throw する。
   const cached = await cache.match(storageKey);
@@ -1516,16 +1528,6 @@ const readFromStream = async (
     // body を持たない応答は 0 バイト。範囲外だけが判定対象になる。
     if (offset + length > 0) throw outOfRange(offset, length, 0, requestUrl);
     return new Uint8Array(0);
-  }
-  // "blob" 戦略は size 比較で先に落ちるが、こちらは本文長が読み終わるまで分からないので
-  // 確保が先に来る。確保できない大きさ＝どの本文にも収まらないので、範囲外へ読み替える。
-  let out: Uint8Array<ArrayBuffer>;
-  try {
-    out = new Uint8Array(length);
-  } catch (error) {
-    const failure = outOfRange(offset, length, undefined, requestUrl);
-    failure.cause = error; // 実行環境の生の RangeError も残す（診断用）。
-    throw failure;
   }
   const reader = body.getReader();
   let skipped = 0;

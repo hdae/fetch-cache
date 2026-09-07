@@ -3514,3 +3514,59 @@ Deno.test("openCachedUrl: strategy 省略時の既定戦略は Deno なら strea
     await caches.delete(CACHE_NAME);
   }
 });
+
+Deno.test("openCachedUrl: stream 戦略は完走 / 末尾到達 / 確保失敗 / 中断のどの経路でも取った body を手放す", async () => {
+  // match の度に新しい body を返し、解放（cancel / 末尾での close）を数える偽 Cache。
+  // "stream" 戦略は read ごとに match するので、取った数と手放した数が常に一致するのが契約。
+  let handed = 0;
+  let released = 0;
+  const bodyCaches = failingCacheStorage({
+    match: () => {
+      handed++;
+      const chunks = [BYTES_A.subarray(0, 2), BYTES_A.subarray(2)];
+      let next = 0;
+      const stream = new ReadableStream<Uint8Array<ArrayBuffer>>({
+        pull(controller) {
+          if (next >= chunks.length) {
+            released++; // 末尾まで読み切った body は Cache 実装が閉じる経路。
+            controller.close();
+            return;
+          }
+          controller.enqueue(chunks[next++]);
+        },
+        cancel() {
+          released++;
+        },
+      }, { highWaterMark: 0 });
+      return Promise.resolve(new Response(stream));
+    },
+  });
+  try {
+    const entry = await openCachedUrl(URL_A, {
+      strategy: "stream",
+      caches: bodyCaches,
+    });
+    assertExists(entry);
+    assertEquals([handed, released], [1, 1]); // 開く時の match は body を使わず手放す。
+
+    assertEquals(await entry.read(1, 2), BYTES_A.subarray(1, 3)); // 途中で充足して止める。
+    assertEquals([handed, released], [2, 2]);
+    await assertRejects(() => entry.read(0, 99), Error, "範囲外"); // 末尾到達。
+    assertEquals([handed, released], [3, 3]);
+    // 確保できない length は match より前に落ちる = body を 1 つも取らない（取ってから落ちると
+    // 手放されずに残る）。
+    await assertRejects(
+      () => entry.read(0, Number.MAX_SAFE_INTEGER),
+      Error,
+      "確保できません",
+    );
+    assertEquals([handed, released], [3, 3]);
+    const controller = new AbortController();
+    const reading = entry.read(0, 4, { signal: controller.signal });
+    controller.abort(new Error("呼び出し側の中断"));
+    await assertRejects(() => reading, Error, "呼び出し側の中断");
+    assertEquals([handed, released], [4, 4]);
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
