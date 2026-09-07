@@ -3200,7 +3200,7 @@ for (const strategy of ["blob", "stream"] as const) {
 
       const entry = await openCachedUrl(URL_RANGE, {
         sha256: RANGE_SHA256,
-        read: strategy,
+        strategy,
       });
       assertExists(entry);
       assertEquals(entry.strategy, strategy);
@@ -3293,7 +3293,7 @@ for (const strategy of ["blob", "stream"] as const) {
     const { fetch } = mockFetch(() => new Response(BYTES_A));
     try {
       await fetchBytes(URL_A, { fetch });
-      const entry = await openCachedUrl(URL_A, { read: strategy });
+      const entry = await openCachedUrl(URL_A, { strategy });
       assertExists(entry);
 
       // 末尾を 1 バイト超える / offset そのものが本文長を超える の 2 通り。
@@ -3324,7 +3324,7 @@ Deno.test("openCachedUrl: stream 戦略の read は signal で中断でき、sig
   const { fetch } = mockFetch(() => new Response(RANGE_BYTES));
   try {
     await fetchBytes(URL_RANGE, { fetch });
-    const entry = await openCachedUrl(URL_RANGE, { read: "stream" });
+    const entry = await openCachedUrl(URL_RANGE, { strategy: "stream" });
     assertExists(entry);
 
     const controller = new AbortController();
@@ -3416,7 +3416,7 @@ Deno.test("openCachedUrlWithKey: 配列キーのエントリを開き、区間�
   }
 });
 
-Deno.test("openCachedUrl: read の不正値は入口で throw する（キャッシュにも触らない）", async () => {
+Deno.test("openCachedUrl: strategy の不正値は入口で throw する（キャッシュにも触らない）", async () => {
   const touched: string[] = [];
   // open されたら記録して落とす — 入口検査より先に進んだことがそのまま赤になる。
   const untouchableCaches: CacheStorage = {
@@ -3434,7 +3434,7 @@ Deno.test("openCachedUrl: read の不正値は入口で throw する（キャッ
     await assertRejects(
       () =>
         openCachedUrl(URL_A, {
-          read: bad as unknown as "blob" | "stream",
+          strategy: bad as unknown as "blob" | "stream",
           caches: untouchableCaches,
         }),
       Error,
@@ -3449,7 +3449,7 @@ Deno.test("openCachedUrl: stream 戦略の read は開いた後に消えたエ�
   const { fetch } = mockFetch(() => new Response(BYTES_A));
   try {
     await fetchBytes(URL_A, { fetch });
-    const entry = await openCachedUrl(URL_A, { read: "stream" });
+    const entry = await openCachedUrl(URL_A, { strategy: "stream" });
     assertExists(entry);
     assertEquals(await entry.read(0, 2), BYTES_A.subarray(0, 2));
 
@@ -3468,7 +3468,7 @@ Deno.test("openCachedUrl: blob 戦略のハンドルは evict 後も読める（
   const { fetch } = mockFetch(() => new Response(BYTES_A));
   try {
     await fetchBytes(URL_A, { fetch });
-    const entry = await openCachedUrl(URL_A, { read: "blob" });
+    const entry = await openCachedUrl(URL_A, { strategy: "blob" });
     assertExists(entry);
 
     assertEquals(await evictUrl(URL_A), true);
@@ -3490,7 +3490,7 @@ Deno.test("openCachedUrl: blob 戦略の blob() 失敗も match と同じく und
   } as unknown as Response;
   try {
     const entry = await openCachedUrl(URL_A, {
-      read: "blob",
+      strategy: "blob",
       caches: failingCacheStorage({
         match: () => Promise.resolve(brokenResponse),
       }),
@@ -3503,7 +3503,7 @@ Deno.test("openCachedUrl: blob 戦略の blob() 失敗も match と同じく und
   }
 });
 
-Deno.test("openCachedUrl: read 省略時の既定戦略は Deno なら stream（blob() が全量をヒープへ載せるため）", async () => {
+Deno.test("openCachedUrl: strategy 省略時の既定戦略は Deno なら stream（blob() が全量をヒープへ載せるため）", async () => {
   const { fetch } = mockFetch(() => new Response(BYTES_A));
   try {
     await fetchBytes(URL_A, { fetch });

@@ -498,9 +498,9 @@ export const fetchHfFiles = async <Names extends string>(
 export type HfOpenOptions = {
   /**
    * 読み出し戦略の強制（省略時は `globalThis.Deno` があれば "stream"、無ければ "blob"）。
-   * 意味は cache 層 `OpenCachedOptions.read` と同じ。
+   * 意味は cache 層 `OpenCachedOptions.strategy` と同じ。
    */
-  read?: "blob" | "stream";
+  strategy?: "blob" | "stream";
   /** cache I/O 失敗（open / match）の通知。既定 console.warn。 */
   onCacheError?: (context: CacheErrorContext) => void;
   /** CacheStorage の差し替え（cache 層へそのまま渡す）。既定 globalThis.caches。 */
@@ -543,7 +543,7 @@ export const openHfFile = async (
   const url = hfResolveUrl({ ...ref, path: spec.path });
   return await openCachedUrlWithKey(url, contentKey(ref, spec), {
     sha256: spec.sha256,
-    read: opts.read,
+    strategy: opts.strategy,
     onCacheError: opts.onCacheError,
     caches: opts.caches,
   });

@@ -312,7 +312,7 @@ handle to the stored entry, so `blob.slice(...)` is constant-time; Deno's
 `blob()` reads the whole entry into memory, so there the body stream is skipped
 forward to the offset instead — a cost proportional to the offset. The default
 is `"stream"` under Deno and `"blob"` elsewhere; override it with
-`read: "blob" | "stream"`, and pass `options.signal` to `read` to abort a long
+`strategy: "blob" | "stream"`, and pass `options.signal` to `read` to abort a long
 skip (checked at chunk boundaries, rejecting with `signal.reason`). The `"blob"`
 strategy has no such skip to interrupt, so it checks the signal once before the
 slice and never during it. A read

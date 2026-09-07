@@ -1458,7 +1458,7 @@ Deno.test("openHfFile: sha256 の無い spec は throw する（キーが revisi
   }
 });
 
-Deno.test("openHfFile: read 戦略と caches の差し替えは cache 層へそのまま透過する", async () => {
+Deno.test("openHfFile: strategy と caches の差し替えは cache 層へそのまま透過する", async () => {
   const { fetch } = mockFetch((url) =>
     url.endsWith("/revision/main")
       ? Response.json({ sha: SHA })
@@ -1484,9 +1484,9 @@ Deno.test("openHfFile: read 戦略と caches の差し替えは cache 層へそ�
     const entry = await openHfFile({ repo: REPO }, {
       path: "a.bin",
       sha256: BYTES_SHA256,
-    }, { read: "blob", caches: spyCaches });
+    }, { strategy: "blob", caches: spyCaches });
     assertExists(entry);
-    // Deno の既定は "stream"。"blob" が出るのは opts.read が cache 層まで届いた証拠。
+    // Deno の既定は "stream"。"blob" が出るのは opts.strategy が cache 層まで届いた証拠。
     assertEquals(entry.strategy, "blob");
     assertEquals(await entry.read(1, 2), BYTES.subarray(1, 3));
     // globalThis.caches を直に見ていたら記録は空のまま（DI が素通りしていない証拠）。

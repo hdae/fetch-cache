@@ -53,7 +53,7 @@ const row = await entry.read(offset, 8960); // length ちょうど / 足りな�
 - 実装は `src/core.ts` に置き、配列キーの注入導管 `openCachedUrlWithKey` は
   `fetchBytesWithKey` / `prefetchUrlWithKey` と同じ扱い（HF 層とテスト専用 — ADR 0008 §1）。
 
-### 2. 戦略は 2 つ。既定はランタイムで選び、`read` で強制できる
+### 2. 戦略は 2 つ。既定はランタイムで選び、`strategy` で強制できる
 
 - **"blob"**: 開く時に `cache.match` → `response.blob()` を 1 回だけ取り、`read` は
   `blob.slice(offset, offset + length).arrayBuffer()`。
@@ -62,7 +62,7 @@ const row = await entry.read(offset, 8960); // length ちょうど / 足りな�
   戻せない）ので毎回開き直す。
 - 既定は `globalThis.Deno` があれば "stream"、無ければ "blob" — 上の表がそのまま根拠。
   `strategy` を戻り値に出すのは、どちらで読んでいるかが性能特性を決めるため（診断用）。
-  2 値以外の `read` は入口で throw する（`sha256` の形式検査と同じ扱い）— 黙って既定へ
+  2 値以外の `strategy` は入口で throw する（`sha256` の形式検査と同じ扱い）— 黙って既定へ
   落とすと「"blob" のつもりが "stream"」が性能差としてしか現れず、原因に辿り着けない。
 - `options.signal` は "stream" の読み飛ばし（チャンクの切れ目）で見る。中断すると
   `reader.cancel()` して `signal.reason` で reject する。読み飛ばしが offset に比例して

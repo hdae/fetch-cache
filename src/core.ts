@@ -1378,7 +1378,7 @@ export type CachedEntry = {
     length: number,
     options?: { signal?: AbortSignal },
   ) => Promise<Uint8Array>;
-  /** どの戦略で読んでいるか（診断用）。既定の選択は `OpenCachedOptions.read` を参照。 */
+  /** どの戦略で読んでいるか（診断用）。既定の選択は `OpenCachedOptions.strategy` を参照。 */
   readonly strategy: "blob" | "stream";
 };
 
@@ -1408,7 +1408,7 @@ export type OpenCachedOptions = {
    *   集め、集め終えたら `cancel()`。ヒープに載るのは length ぶんだけだが、読み飛ばしの
    *   コストが offset に比例する（DECIDED: docs/decisions/0012）。
    */
-  read?: "blob" | "stream";
+  strategy?: "blob" | "stream";
   /**
    * cache I/O 失敗（open / match）の通知先。既定 console.warn。開く時点の失敗は miss と
    * 同じ扱い（`undefined`）へ縮退する（DECIDED: docs/decisions/0001）。read 中の失敗は
@@ -1609,11 +1609,12 @@ export const openCachedUrlWithKey = async (
   // 綴り違いの戦略名は型を外れた呼び出し（JS 利用者・動的な値）でしか来ないが、黙って既定へ
   // 落ちると「blob のつもりが stream」の静かな性能差になるので同じく入口で落とす。
   if (
-    opts.read !== undefined && opts.read !== "blob" && opts.read !== "stream"
+    opts.strategy !== undefined && opts.strategy !== "blob" &&
+    opts.strategy !== "stream"
   ) {
     throw new Error(
-      `fetch-cache: read は "blob" / "stream" のどちらかで指定してください: ${
-        String(opts.read)
+      `fetch-cache: strategy は "blob" / "stream" のどちらかで指定してください: ${
+        String(opts.strategy)
       } (${requestUrl})`,
     );
   }
@@ -1655,7 +1656,7 @@ export const openCachedUrlWithKey = async (
     return undefined;
   }
 
-  const strategy = opts.read ?? defaultReadStrategy();
+  const strategy = opts.strategy ?? defaultReadStrategy();
   if (strategy === "blob") {
     let blob: Blob;
     try {
