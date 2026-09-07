@@ -8,6 +8,7 @@ import {
 import {
   fetchHfFile,
   fetchHfFiles,
+  type HfResolveOptions,
   hfResolveUrl,
   isCommitSha,
   openHfFile,
@@ -1508,4 +1509,11 @@ Deno.test("openHfFile: 温めていないファイルは undefined（取得は�
   } finally {
     await caches.delete(CACHE_NAME);
   }
+});
+
+Deno.test("resolveHfRevision: オプションは公開型 HfResolveOptions で渡せる（下流がラッパを書ける）", async () => {
+  const { fetch, calls } = mockFetch(() => Response.json({ sha: SHA }));
+  const opts: HfResolveOptions = { fetch, retry: false };
+  assertEquals(await resolveHfRevision({ repo: REPO }, opts), SHA);
+  assertEquals(calls.length, 1);
 });

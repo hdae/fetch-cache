@@ -161,6 +161,16 @@ export const hfResolveUrl = (ref: HfRepoRef & { path: string }): string => {
   }/${encodePath(ref.path)}`;
 };
 
+/** `resolveHfRevision` のオプション（名前付きで公開し、下流がラッパを書けるようにする）。 */
+export type HfResolveOptions = {
+  fetch?: typeof globalThis.fetch;
+  init?: RequestInit;
+  /** 再試行方針（cache 層と同じ既定・`false` で無効 — DECIDED: docs/decisions/0010）。 */
+  retry?: RetryPolicy | false;
+  /** 再試行 1 回ごとの通知（待機の前に呼ばれる）。 */
+  onRetry?: (context: RetryContext) => void;
+};
+
 /**
  * 可変 ref（"main" 等）を現在のコミット SHA へ解決する。revision が既に SHA なら
  * ネットワークに出ずそのまま返す。
@@ -170,14 +180,7 @@ export const hfResolveUrl = (ref: HfRepoRef & { path: string }): string => {
  */
 export const resolveHfRevision = async (
   ref: HfRepoRef,
-  opts: {
-    fetch?: typeof globalThis.fetch;
-    init?: RequestInit;
-    /** 再試行方針（cache 層と同じ既定・`false` で無効 — DECIDED: docs/decisions/0010）。 */
-    retry?: RetryPolicy | false;
-    /** 再試行 1 回ごとの通知（待機の前に呼ばれる）。 */
-    onRetry?: (context: RetryContext) => void;
-  } = {},
+  opts: HfResolveOptions = {},
 ): Promise<string> => {
   const revision = ref.revision ?? "main";
   if (isCommitSha(revision)) return revision;
