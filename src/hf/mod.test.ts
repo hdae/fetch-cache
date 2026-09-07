@@ -15,7 +15,7 @@ import {
   prefetchHfFile,
   resolveHfRevision,
 } from "./mod.ts";
-import { listKeys } from "../mod.ts";
+import { type CacheErrorContext, listKeys } from "../mod.ts";
 import { mockFetch } from "../testing/mock_fetch.ts";
 
 // 名前空間は内部固定 1 個（cache 層と共通 — DECIDED: docs/decisions/0006 §3）。
@@ -1516,4 +1516,127 @@ Deno.test("resolveHfRevision: オプションは公開型 HfResolveOptions で�
   const opts: HfResolveOptions = { fetch, retry: false };
   assertEquals(await resolveHfRevision({ repo: REPO }, opts), SHA);
   assertEquals(calls.length, 1);
+});
+
+Deno.test("openHfFile: cache 読出し失敗は undefined へ縮退し onCacheError を透過する", async () => {
+  // HF 層は cache 層の通知契約を素通しする役。フックを落とすと利用者からは既定の
+  // console.warn に落ちて「失敗を握られた」ように見える。
+  const notified: CacheErrorContext[] = [];
+  const brokenCaches: CacheStorage = {
+    open: () => Promise.reject(new Error("open failed")),
+    has: (cacheName) => caches.has(cacheName),
+    delete: (cacheName) => caches.delete(cacheName),
+    keys: () => caches.keys(),
+    match: (request, options) => caches.match(request, options),
+  };
+  try {
+    assertEquals(
+      await openHfFile({ repo: REPO }, {
+        path: "a.bin",
+        sha256: BYTES_SHA256,
+      }, {
+        caches: brokenCaches,
+        onCacheError: (context) => notified.push(context),
+      }),
+      undefined,
+    );
+    assertEquals(notified.map((context) => context.op), ["open"]);
+    // 通知に出る URL は表示用ラベル（取得元でも保存キーでもない resolve URL）。
+    assertEquals(
+      notified[0].url,
+      hfResolveUrl({ repo: REPO, path: "a.bin" }),
+    );
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
+Deno.test("openHfFile: spec の形式検査は fetchHfFile と共通で走る（読み出しに使わない申告も同じ文言で throw）", async () => {
+  try {
+    // expectedBytes / into は区間読みでは一切使わないが、申告の食い違いはどの入口から
+    // 入っても同じ扱いにする（JSDoc が明言している振る舞い）。
+    for (const expectedBytes of [-1, 1.5]) {
+      const error = await assertRejects(
+        () =>
+          openHfFile({ repo: REPO }, {
+            path: "a.bin",
+            sha256: BYTES_SHA256,
+            expectedBytes,
+          }),
+        Error,
+      );
+      assertStringIncludes(error.message, "expectedBytes は 0 以上の整数");
+      assertStringIncludes(error.message, `: ${expectedBytes} (a.bin)`);
+    }
+    const error = await assertRejects(
+      () =>
+        openHfFile({ repo: REPO }, {
+          path: "a.bin",
+          sha256: BYTES_SHA256,
+          expectedBytes: 8,
+          into: new Uint8Array(new ArrayBuffer(4)),
+        }),
+      Error,
+    );
+    assertEquals(error.name, "IntoCapacityError");
+    assertStringIncludes(error.message, "into の容量 4 バイト");
+    assertStringIncludes(error.message, "expectedBytes 8 バイト");
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
+Deno.test("openHfFile: prefetchHfFile で温めた内容キーもそのまま開ける", async () => {
+  const { fetch, calls } = mockFetch(() => new Response(BYTES));
+  const spec = { path: "a.bin", sha256: BYTES_SHA256 };
+  try {
+    // 温めの 2 経路目（prefetch は body を流し切ってから put する別経路）。
+    assertEquals(
+      await prefetchHfFile({ repo: REPO, revision: SHA }, spec, { fetch }),
+      {
+        fetched: true,
+        revision: SHA,
+        url: `https://huggingface.co/${REPO}/resolve/${SHA}/a.bin`,
+      },
+    );
+    assertEquals(calls.length, 1); // SHA 固定なので revision 解決には出ない。
+
+    const entry = await openHfFile({ repo: REPO }, spec);
+    assertExists(entry);
+    assertEquals(await entry.read(1, 2), BYTES.subarray(1, 3));
+    assertEquals(await entry.read(0, BYTES.length), BYTES);
+    assertEquals(calls.length, 1); // open も read も network には出ない。
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
+Deno.test("openHfFile: kind 違いは別エントリ・hubUrl 違いは同一エントリ（キーは内容キーだけで決まる）", async () => {
+  const { fetch, calls } = mockFetch(() => new Response(BYTES));
+  const spec = { path: "a.bin", sha256: BYTES_SHA256 };
+  try {
+    await fetchHfFile({ repo: REPO, revision: SHA, kind: "dataset" }, spec, {
+      fetch,
+    });
+    assertEquals(calls.length, 1);
+
+    const dataset = await openHfFile({ repo: REPO, kind: "dataset" }, spec);
+    assertExists(dataset);
+    assertEquals(await dataset.read(0, BYTES.length), BYTES);
+
+    // kind はキー ["hf", kind, repo, path, sha256] に入るので、既定の model では開かない。
+    assertEquals(await openHfFile({ repo: REPO }, spec), undefined);
+
+    // hubUrl はキーに入らない（変わるのはラベル URL だけ）ので同じエントリが開く。
+    const mirrored = await openHfFile({
+      repo: REPO,
+      kind: "dataset",
+      hubUrl: "https://mirror.example",
+    }, spec);
+    assertExists(mirrored);
+    assertEquals(await mirrored.read(2, 2), BYTES.subarray(2, 4));
+    assertEquals(calls.length, 1);
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
 });

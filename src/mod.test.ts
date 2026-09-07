@@ -1,6 +1,7 @@
 import {
   assertEquals,
   assertExists,
+  assertInstanceOf,
   assertRejects,
   assertStrictEquals,
   assertStringIncludes,
@@ -1011,6 +1012,14 @@ Deno.test("予約 origin（fetch-cache.invalid）は取得元 URL に使えな�
   await assertRejects(() => fetchBytes(reserved, { fetch }), Error, "予約");
   await assertRejects(() => prefetchUrl(reserved, { fetch }), Error, "予約");
   await assertRejects(() => evictUrl(reserved), Error, "予約");
+  // 読み出し専用の入口も同じガードを通る（素通しすると配列キー空間のエントリを URL 入口から
+  // 開けてしまう = 0.5.0 で撤去した「利用者がキーを指定する口」の復活に等しい）。
+  await assertRejects(() => openCachedUrl(reserved), Error, "予約");
+  await assertRejects(
+    () => openCachedUrlWithKey(reserved, ["models", "range"]),
+    Error,
+    "予約",
+  );
   assertEquals(calls.length, 0);
 });
 
@@ -1061,6 +1070,7 @@ Deno.test("予約 origin ガード: 大文字表記もすり抜けず、network 
   await assertRejects(() => fetchBytes(uppercase, { fetch }), Error, "予約");
   await assertRejects(() => prefetchUrl(uppercase, { fetch }), Error, "予約");
   await assertRejects(() => evictUrl(uppercase), Error, "予約");
+  await assertRejects(() => openCachedUrl(uppercase), Error, "予約");
   assertEquals(calls.length, 0);
 });
 
@@ -3210,6 +3220,12 @@ for (const strategy of ["blob", "stream"] as const) {
           [3, 16],
           [128 * 1024 - 5, 4096],
           [RANGE_BYTES.length - 8, 8],
+          // 空区間と末尾ちょうどの境界。両戦略で経路が根本的に違う（blob は
+          // `offset + length > blob.size` の 1 本、stream はループ条件）ので、範囲内の
+          // length 0 が空配列・末尾 1 バイトが読めることを両方で縛る。
+          [0, 0],
+          [RANGE_BYTES.length, 0],
+          [RANGE_BYTES.length - 1, 1],
         ]
       ) {
         const bytes = await entry.read(offset, length);
@@ -3296,8 +3312,15 @@ for (const strategy of ["blob", "stream"] as const) {
       const entry = await openCachedUrl(URL_A, { strategy });
       assertExists(entry);
 
-      // 末尾を 1 バイト超える / offset そのものが本文長を超える の 2 通り。
-      for (const [offset, length] of [[1, BYTES_A.length], [99, 1]]) {
+      // 末尾を 1 バイト超える / offset そのものが本文長を超える / 空区間でも offset が
+      // 本文長を超えていれば範囲外（length 0 は「範囲内なら空配列」であって免除ではない）。
+      for (
+        const [offset, length] of [
+          [1, BYTES_A.length],
+          [99, 1],
+          [BYTES_A.length + 1, 0],
+        ]
+      ) {
         const error = await assertRejects(
           () => entry.read(offset, length),
           Error,
@@ -3329,8 +3352,9 @@ Deno.test("openCachedUrl: stream 戦略の read は signal で中断でき、sig
 
     const controller = new AbortController();
     const reason = new Error("呼び出し側の中断");
-    // read の同期部分（引数検査 + 初回の中断検査）を通した後に abort する — 中断はチャンクの
-    // 切れ目で見る、という契約をここで凍結する（呼び出し前の abort は入口で落ちるだけ）。
+    // read の同期部分（引数検査 + 初回の中断検査）を通した後に abort する。ここで凍結するのは
+    // 「cache.match を待っている間に届いた abort を、ループ先頭の検査が最初のチャンクを読む前に
+    // 拾う」経路（チャンク境界での中断そのものは次のテストが縛る）。
     const reading = entry.read(0, RANGE_BYTES.length, {
       signal: controller.signal,
     });
@@ -3358,13 +3382,17 @@ Deno.test("openCachedUrl: caches.open 失敗は miss と同じ undefined へ縮�
     keys: () => caches.keys(),
     match: (request, options) => caches.match(request, options),
   };
-  const entry = await openCachedUrl(URL_A, {
-    caches: brokenCaches,
-    onCacheError: (context) => notified.push(context),
-  });
-  assertEquals(entry, undefined);
-  assertEquals(notified.map((context) => context.op), ["open"]);
-  assertEquals(notified[0].url, URL_A);
+  try {
+    const entry = await openCachedUrl(URL_A, {
+      caches: brokenCaches,
+      onCacheError: (context) => notified.push(context),
+    });
+    assertEquals(entry, undefined);
+    assertEquals(notified.map((context) => context.op), ["open"]);
+    assertEquals(notified[0].url, URL_A);
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
 });
 
 Deno.test("openCachedUrl: cache 読出し失敗も undefined へ縮退して通知する", async () => {
@@ -3383,7 +3411,7 @@ Deno.test("openCachedUrl: cache 読出し失敗も undefined へ縮退して通�
   }
 });
 
-Deno.test("openCachedUrlWithKey: 配列キーのエントリを開き、区間読みは検証系オプションを持たない", async () => {
+Deno.test("openCachedUrlWithKey: 配列キーのエントリを URL キーと分けて開き、入口検査は両者で共通に走る", async () => {
   const { fetch } = mockFetch(() => new Response(BYTES_A));
   try {
     await fetchBytesWithKey(URL_A, ["models", "range"], {
@@ -3408,9 +3436,12 @@ Deno.test("openCachedUrlWithKey: 配列キーのエントリを開き、区間�
       Error,
       "64 桁の小文字 hex",
     );
-    // 区間の指定ミス（負・非整数）も黙って空を返さず落とす。
+    // 区間の指定ミス（負・非整数）も黙って空を返さず落とす。offset / length の 4 通りを
+    // すべて踏む（同じ文言でも、どれか 1 項を落とす実装退行はここでしか赤にならない）。
     await assertRejects(() => entry.read(-1, 2), Error, "0 以上の整数");
     await assertRejects(() => entry.read(0, 1.5), Error, "0 以上の整数");
+    await assertRejects(() => entry.read(1.5, 1), Error, "0 以上の整数");
+    await assertRejects(() => entry.read(0, -1), Error, "0 以上の整数");
   } finally {
     await caches.delete(CACHE_NAME);
   }
@@ -3429,20 +3460,24 @@ Deno.test("openCachedUrl: strategy の不正値は入口で throw する（キ�
     keys: () => caches.keys(),
     match: (request, options) => caches.match(request, options),
   };
-  // 型を外れた値（JS 利用者・動的な値）が来る想定なのでキャスト経由で渡す。
-  for (const bad of ["blobb", null]) {
-    await assertRejects(
-      () =>
-        openCachedUrl(URL_A, {
-          strategy: bad as unknown as "blob" | "stream",
-          caches: untouchableCaches,
-        }),
-      Error,
-      '"blob" / "stream"',
-    );
+  try {
+    // 型を外れた値（JS 利用者・動的な値）が来る想定なのでキャスト経由で渡す。
+    for (const bad of ["blobb", null]) {
+      await assertRejects(
+        () =>
+          openCachedUrl(URL_A, {
+            strategy: bad as unknown as "blob" | "stream",
+            caches: untouchableCaches,
+          }),
+        Error,
+        '"blob" / "stream"',
+      );
+    }
+    // network の口はそもそも無い（この API は fetch を受け取らない）ので、残るのはキャッシュ。
+    assertEquals(touched, []);
+  } finally {
+    await caches.delete(CACHE_NAME);
   }
-  // network の口はそもそも無い（この API は fetch を受け取らない）ので、残るのはキャッシュ。
-  assertEquals(touched, []);
 });
 
 Deno.test("openCachedUrl: stream 戦略の read は開いた後に消えたエントリで throw する（ハンドルはスナップショットではない）", async () => {
@@ -3601,6 +3636,398 @@ Deno.test("openCachedUrl: stream 戦略は完走 / 末尾到達 / 確保失敗 /
     controller.abort(new Error("呼び出し側の中断"));
     await assertRejects(() => reading, Error, "呼び出し側の中断");
     assertEquals([handed, released], [4, 4]);
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
+Deno.test("openCachedUrl: stream 戦略の read はチャンク境界で中断を見る（読み飛ばしの途中で止まる）", async () => {
+  // 中断の存在理由は「offset に比例して長くなる読み飛ばしを途中で打ち切れること」なので、
+  // 1 チャンクも読まないうちに落ちる形では縛れない。手動 pull の body（highWaterMark 0 =
+  // 先読みしない）で 2 チャンク目に入った瞬間を捕まえ、そこへ abort を届ける。
+  const source = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]);
+  const chunks = [0, 2, 4, 6].map((start) => source.subarray(start, start + 2));
+  const gate = Promise.withResolvers<void>();
+  let pulled = 0;
+  const gatedCaches = failingCacheStorage({
+    // stream 戦略は read の度に match するので、毎回新しい body を組み立てる。
+    match: () => {
+      let next = 0;
+      const stream = new ReadableStream<Uint8Array<ArrayBuffer>>({
+        async pull(controller) {
+          pulled++;
+          if (pulled === 2) await gate.promise; // 2 チャンク目で止める。
+          if (next >= chunks.length) {
+            controller.close();
+            return;
+          }
+          controller.enqueue(chunks[next++].slice());
+        },
+      }, { highWaterMark: 0 });
+      return Promise.resolve(new Response(stream));
+    },
+  });
+  try {
+    const entry = await openCachedUrl(URL_A, {
+      strategy: "stream",
+      caches: gatedCaches,
+    });
+    assertExists(entry);
+
+    const controller = new AbortController();
+    const reason = new Error("読み飛ばしの途中で中断");
+    // 末尾 2 バイトを読む = 3 チャンク読み飛ばしてから詰める区間。
+    const reading = entry.read(6, 2, { signal: controller.signal });
+    // 2 チャンク目の pull に入るまで待つ（期限なしのポーリングは、前提が崩れたとき赤ではなく
+    // ハングになる — CLAUDE.md の deadline 規約）。
+    const deadline = Date.now() + 5_000;
+    while (pulled < 2) {
+      if (Date.now() > deadline) {
+        throw new Error(`2 チャンク目の pull に入らない（pulled=${pulled}）`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    controller.abort(reason);
+    gate.resolve(); // 止めた pull は必ず先へ進める（解放しないと read が返らない）。
+    const thrown = await assertRejects(
+      () => reading,
+      Error,
+      "読み飛ばしの途中で中断",
+    );
+    assertStrictEquals(thrown, reason);
+    // 全チャンクを引き切る前に止まっている = 中断がチャンク境界で効いた証拠。
+    assertEquals(pulled < chunks.length, true, `pulled=${pulled}`);
+
+    // 中断は読み手の都合であってエントリの破損ではない（次の read は最後まで通る）。
+    assertEquals(await entry.read(6, 2), source.subarray(6, 8));
+  } finally {
+    gate.resolve();
+    await caches.delete(CACHE_NAME);
+  }
+});
+
+Deno.test('openCachedUrl: 記録不一致の evict に失敗しても undefined へ縮退し op:"delete" で通知する', async () => {
+  const { fetch } = mockFetch(() => new Response(BYTES_A));
+  const notified: CacheErrorContext[] = [];
+  try {
+    await fetchBytes(URL_A, { fetch, sha256: BYTES_A_SHA256 });
+
+    // 記録 ≠ 期待の self-heal で delete が失敗しても、開く時の失敗は必ず undefined へ畳む
+    // （呼び出し側は fetchBytes へ落ちればよい）。握り潰さずに通知だけ出す。
+    assertEquals(
+      await openCachedUrl(URL_A, {
+        sha256: BYTES_B_SHA256,
+        caches: failingCacheStorage({
+          delete: () => Promise.reject(new Error("delete failed")),
+        }),
+        onCacheError: (context) => notified.push(context),
+      }),
+      undefined,
+    );
+    assertEquals(notified.map((context) => context.op), ["delete"]);
+    assertEquals(notified[0].url, URL_A);
+    // 消せなかったのだからエントリは残る（縮退したことが観測できる）。
+    const cache = await caches.open(CACHE_NAME);
+    const survived = await cache.match(URL_A);
+    assertExists(survived);
+    await survived.body?.cancel(); // 覗いた応答は必ず手放す（資源を残さない）。
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
+for (const strategy of ["blob", "stream"] as const) {
+  Deno.test(`openCachedUrl: 呼び出し前に abort 済みの signal は入口で reject する（${strategy} 戦略）`, async () => {
+    const { fetch } = mockFetch(() => new Response(BYTES_A));
+    let matches = 0;
+    const countingCaches = failingCacheStorage({
+      match: async (request, options) => {
+        matches++;
+        const real = await caches.open(CACHE_NAME);
+        return await real.match(request, options);
+      },
+    });
+    try {
+      await fetchBytes(URL_A, { fetch });
+      const entry = await openCachedUrl(URL_A, {
+        strategy,
+        caches: countingCaches,
+      });
+      assertExists(entry);
+      const opened = matches;
+
+      const controller = new AbortController();
+      const reason = new Error("呼び出し前の中断");
+      controller.abort(reason);
+      const thrown = await assertRejects(
+        () => entry.read(0, 2, { signal: controller.signal }),
+        Error,
+        "呼び出し前の中断",
+      );
+      assertStrictEquals(thrown, reason); // signal.reason がそのまま出る。
+      // 入口で落ちる = キャッシュを読む前（"stream" は read 毎に match するので差が出る）。
+      assertEquals(matches, opened);
+
+      // 中断していない read は通る（戦略を替えても中断の契約は消えない）。
+      assertEquals(await entry.read(0, 2), BYTES_A.subarray(0, 2));
+    } finally {
+      await caches.delete(CACHE_NAME);
+    }
+  });
+}
+
+Deno.test("openCachedUrl: body を持たない応答は 0 バイト扱い（stream 戦略の保険分岐）", async () => {
+  // 準拠ランタイムでは body null ⟺ 0 バイトなので、実 Cache 経由では到達しない分岐。
+  // 外部が同じ名前空間へ書いた応答・将来のランタイム差に備えた保険を DI で縛る。
+  const nullBodyCaches = failingCacheStorage({
+    match: () =>
+      Promise.resolve(
+        { headers: new Headers(), body: null } as unknown as Response,
+      ),
+  });
+  try {
+    const entry = await openCachedUrl(URL_A, {
+      strategy: "stream",
+      caches: nullBodyCaches,
+    });
+    assertExists(entry);
+    assertEquals(entry.strategy, "stream");
+
+    const empty = await entry.read(0, 0);
+    assertEquals(empty.length, 0);
+    assertEquals(empty, new Uint8Array(0));
+    // 0 バイトの本文に対する要求は、長さ 0 の区間でも offset がはみ出せば範囲外。
+    for (const [offset, length] of [[0, 1], [1, 0]]) {
+      await assertRejects(
+        () => entry.read(offset, length),
+        Error,
+        "本文 0 バイト",
+      );
+    }
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
+Deno.test("openCachedUrl: stream 戦略の確保失敗は範囲外へ読み替え、実行環境の RangeError を cause に残す", async () => {
+  const { fetch } = mockFetch(() => new Response(BYTES_A));
+  try {
+    await fetchBytes(URL_A, { fetch });
+    const entry = await openCachedUrl(URL_A, { strategy: "stream" });
+    assertExists(entry);
+
+    // "blob" は size 比較で先に落ちるので、この経路を通るのは stream のときだけ。
+    const error = await assertRejects(
+      () => entry.read(0, Number.MAX_SAFE_INTEGER),
+      Error,
+      "範囲外",
+    );
+    assertStringIncludes(
+      error.message,
+      `${Number.MAX_SAFE_INTEGER} バイトのバッファを確保できません`,
+    );
+    // 読み替えても診断は失わない（生の失敗理由は cause に残る）。
+    assertInstanceOf(error.cause, RangeError);
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
+Deno.test("openCachedUrl: 既定の通知は「エントリ無しとして扱います」（取得系の network 縮退とは言わない）", async () => {
+  // この経路は network に出る口を持たない。取得系の文言をそのまま出すと縮退先を偽る
+  // （DECIDED: docs/decisions/0012 §4）。
+  const original = console.warn;
+  const warned: string[] = [];
+  try {
+    console.warn = (...args: unknown[]) => {
+      warned.push(String(args[0]));
+    };
+    assertEquals(
+      await openCachedUrl(URL_A, {
+        caches: failingCacheStorage({
+          match: () => Promise.reject(new Error("storage broken")),
+        }),
+      }),
+      undefined,
+    );
+  } finally {
+    console.warn = original; // 差し替えを残すと以降のテスト全体を汚す。
+    await caches.delete(CACHE_NAME);
+  }
+  assertEquals(warned.length, 1);
+  assertStringIncludes(warned[0], "エントリ無しとして扱います");
+  assertEquals(warned[0].includes("network へ縮退"), false);
+});
+
+Deno.test("openCachedUrl: Deno が無いランタイムの既定戦略は blob（ブラウザの遅延 Blob 前提）", async () => {
+  const { fetch } = mockFetch(() => new Response(BYTES_A));
+  const descriptor = Object.getOwnPropertyDescriptor(globalThis, "Deno");
+  assertExists(descriptor);
+  let strategy: "blob" | "stream" | undefined;
+  try {
+    await fetchBytes(URL_A, { fetch }); // 温めは削除の前に済ませる。
+    Reflect.deleteProperty(globalThis, "Deno");
+    // 削除窓の中では assert しない（@std/assert が失敗を組み立てる際に Deno を参照して
+    // ReferenceError になり、本来の失敗が隠れる）。観測値は変数へ退避するだけ。
+    strategy = (await openCachedUrl(URL_A))?.strategy;
+  } finally {
+    Object.defineProperty(globalThis, "Deno", descriptor);
+    await caches.delete(CACHE_NAME);
+  }
+  assertEquals(strategy, "blob");
+});
+
+Deno.test("openCachedUrl: stream 戦略はチャンク境界を跨いで読み飛ばし・詰めができる", async () => {
+  // 実 Cache のチャンク長はランタイム実装依存（Deno 2.9.6 は 64 KiB 固定）なので、跨ぎの
+  // 網羅を実 Cache に任せると 1 チャンクに退化した瞬間に黙って検出力を失う。3 バイト刻みの
+  // 偽 body で「境界ちょうど / 跨ぎ / 末尾ちょうど / はみ出し」を実装非依存に固定する。
+  const source = new Uint8Array(
+    Array.from({ length: 20 }, (_, index) => index),
+  );
+  const chunks = [0, 3, 6, 9, 12, 15, 18].map((start) =>
+    source.subarray(start, start + 3)
+  );
+  const chunkedCaches = failingCacheStorage({
+    // read の度に新しい Response を返す（使い回すと 2 回目が消費済み body で落ちる）。
+    match: () =>
+      Promise.resolve(chunkedResponse(chunks.map((chunk) => chunk.slice()))),
+  });
+  try {
+    const entry = await openCachedUrl(URL_A, {
+      strategy: "stream",
+      caches: chunkedCaches,
+    });
+    assertExists(entry);
+    for (
+      const [offset, length] of [
+        [0, 3], // チャンクぴったり（跨ぎ 0 回）。
+        [2, 2], // 詰めが境界を跨ぐ。
+        [1, 11], // 読み飛ばしも詰めも複数チャンクに渡る。
+        [17, 3], // 読み飛ばしが 5 チャンク以上・末尾ぴったり。
+      ]
+    ) {
+      assertEquals(
+        await entry.read(offset, length),
+        source.subarray(offset, offset + length),
+        `offset=${offset} length=${length}`,
+      );
+    }
+    // 末尾を跨いだ要求は、チャンクを数え終えた本文長で範囲外になる。
+    await assertRejects(() => entry.read(18, 3), Error, "本文 20 バイト");
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
+Deno.test("openCachedUrl: blob が要求より短く返したら fail loud に落ちる（blob 戦略）", async () => {
+  // 範囲内なのに短い = Cache / Blob 実装の異常。区間読みは検証を持たないので、この 1 本が
+  // 唯一の長さ保証になる（黙って短い view を返すと欠けがそのまま下流へ流れる）。
+  const shortBlob = {
+    size: 8,
+    slice: () => new Blob([new Uint8Array([1, 2, 3])]),
+  } as unknown as Blob;
+  const shortCaches = failingCacheStorage({
+    match: () =>
+      Promise.resolve(
+        {
+          headers: new Headers(),
+          body: null,
+          blob: () => Promise.resolve(shortBlob),
+        } as unknown as Response,
+      ),
+  });
+  try {
+    const entry = await openCachedUrl(URL_A, {
+      strategy: "blob",
+      caches: shortCaches,
+    });
+    assertExists(entry);
+    const error = await assertRejects(
+      () => entry.read(0, 8), // size 8 の申告どおりなら範囲内。
+      Error,
+      "3 バイトしか返しませんでした",
+    );
+    assertStringIncludes(error.message, "要求 8 バイト");
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
+Deno.test("openCachedUrl: prefetchUrl で温めたエントリも sha256 付きで開ける", async () => {
+  const { fetch, calls } = mockFetch(() => new Response(BYTES_A));
+  try {
+    // prefetch は body を流し切ってから put する別経路（記録ハッシュの焼き込み方が
+    // fetchBytes と違う）ので、区間読みと噛み合うことを独立に縛る。
+    await prefetchUrl(URL_A, { fetch, sha256: BYTES_A_SHA256 });
+    assertEquals(calls.length, 1);
+
+    const entry = await openCachedUrl(URL_A, { sha256: BYTES_A_SHA256 });
+    assertExists(entry);
+    assertEquals(await entry.read(0, BYTES_A.length), BYTES_A);
+    assertEquals(await entry.read(1, 3), BYTES_A.subarray(1, 4));
+    assertEquals(calls.length, 1); // open も read も network には出ない。
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
+for (const strategy of ["blob", "stream"] as const) {
+  Deno.test(`openCachedUrl: 同一ハンドルからの並行 read は互いに干渉しない（${strategy} 戦略）`, async () => {
+    const { fetch } = mockFetch(() => new Response(RANGE_BYTES));
+    try {
+      await fetchBytes(URL_RANGE, { fetch });
+      const entry = await openCachedUrl(URL_RANGE, { strategy });
+      assertExists(entry);
+
+      // read は純粋な問い合わせ（ハンドルは読み位置などの状態を共有しない）。"stream" は
+      // read 毎に match して独立した body を得る / "blob" は slice が毎回新しい Blob を返す。
+      const spans = [
+        [0, 16],
+        [65536 - 4, 8],
+        [128 * 1024, 32],
+        [RANGE_BYTES.length - 5, 5],
+      ];
+      const results = await Promise.all(
+        spans.map(([offset, length]) => entry.read(offset, length)),
+      );
+      for (const [index, [offset, length]] of spans.entries()) {
+        assertEquals(
+          results[index],
+          RANGE_BYTES.subarray(offset, offset + length),
+          `offset=${offset} length=${length}`,
+        );
+      }
+    } finally {
+      await caches.delete(CACHE_NAME);
+    }
+  });
+}
+
+Deno.test("openCachedUrl: read 中の cache 失敗は縮退せず throw する（通知は開く時だけ）", async () => {
+  const { fetch } = mockFetch(() => new Response(BYTES_A));
+  const notified: CacheErrorContext[] = [];
+  // 開く時の match は通し、以後（= read 側）だけ壊すカウンタ付きスタブ。
+  let matches = 0;
+  const flakyCaches = failingCacheStorage({
+    match: async (request, options) => {
+      if (matches++ > 0) throw new Error("storage broken");
+      const real = await caches.open(CACHE_NAME);
+      return await real.match(request, options);
+    },
+  });
+  try {
+    await fetchBytes(URL_A, { fetch });
+    const entry = await openCachedUrl(URL_A, {
+      strategy: "stream",
+      caches: flakyCaches,
+      onCacheError: (context) => notified.push(context),
+    });
+    assertExists(entry);
+
+    // 開けたと思っている呼び出し側には縮退先が無いので、そのまま伝播させる（undefined へは
+    // 畳めない = read は必ず「読めたか throw か」の 2 択）。
+    await assertRejects(() => entry.read(0, 2), Error, "storage broken");
+    assertEquals(notified, []); // onCacheError の適用範囲は開く時まで。
   } finally {
     await caches.delete(CACHE_NAME);
   }
