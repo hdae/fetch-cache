@@ -1494,10 +1494,14 @@ const readFromBlob = async (
   return bytes;
 };
 
-/** "stream" 戦略の read。read の度に match し直し、offset まで読み飛ばして length ぶん集める。 */
+/**
+ * "stream" 戦略の read。read の度に match し直し、offset まで読み飛ばして length ぶん集める。
+ * `expectedSha256` は開いた時点で照合した期待ハッシュ（無検証の生読みなら undefined）。
+ */
 const readFromStream = async (
   cache: Cache,
   storageKey: string,
+  expectedSha256: string | undefined,
   offset: number,
   length: number,
   signal: AbortSignal | undefined,
@@ -1521,6 +1525,20 @@ const readFromStream = async (
   if (cached === undefined) {
     throw new Error(
       `fetch-cache: 開いた後にエントリが消えました（evict / clearCache / self-heal と競合した可能性があります） (${requestUrl})`,
+    );
+  }
+  // 開いた時点の照合は「その時のエントリ」に対する主張でしかない。並行する fetchBytes の
+  // self-heal（記録 ≠ 期待 → evict → 取り直し）が同じキーへ別内容を書くと、match し直す
+  // この戦略は差し替え後の本文を掴む。区間読みは実ハッシュを計算できず下流で検出できないので、
+  // 記録ハッシュを read ごとに再照合して fail loud にする（"blob" は開いた時点の Blob を持つ
+  // ので元から差し替えの影響を受けない — 2 戦略の意味論をここで揃える）。
+  if (
+    expectedSha256 !== undefined &&
+    cached.headers.get(SHA_HEADER) !== expectedSha256
+  ) {
+    await cached.body?.cancel().catch(() => {});
+    throw new Error(
+      `fetch-cache: 開いた後にエントリが差し替わりました（記録ハッシュが開いた時点と一致しません — 並行する fetchBytes / prefetchUrl と競合した可能性があります） (${requestUrl})`,
     );
   }
   const body = cached.body;
@@ -1579,7 +1597,9 @@ const readFromStream = async (
  *       read 中の失敗は縮退先が無いのでそのまま throw する。
  * NOTE: 開いたハンドルはエントリのスナップショットではない。"stream" 戦略は read の度に
  *       match し直すので、並行する `evict` / `clearCache` / self-heal でエントリが消えれば
- *       次の read が throw する（"blob" 戦略は開いた時点の Blob を持ち続ける）。
+ *       次の read が throw する。`sha256` を渡して開いた場合は記録ハッシュも read ごとに
+ *       再照合し、同じキーへ別内容が書かれていれば（self-heal の取り直し・無検証の
+ *       prefetch）同じく throw する（"blob" 戦略は開いた時点の Blob を持ち続ける）。
  */
 export const openCachedUrl = (
   url: string | URL,
@@ -1682,6 +1702,7 @@ export const openCachedUrlWithKey = async (
       readFromStream(
         cache,
         storageKey,
+        opts.sha256,
         offset,
         length,
         options?.signal,

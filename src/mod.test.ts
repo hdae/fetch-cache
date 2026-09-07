@@ -3515,6 +3515,41 @@ Deno.test("openCachedUrl: strategy 省略時の既定戦略は Deno なら strea
   }
 });
 
+Deno.test("openCachedUrl: stream 戦略の read は記録ハッシュを毎回再照合し、開いた後に差し替わったエントリで throw する", async () => {
+  const { fetch: fetchA } = mockFetch(() => new Response(BYTES_A));
+  const { fetch: fetchB } = mockFetch(() => new Response(BYTES_B));
+  try {
+    await fetchBytes(URL_A, { fetch: fetchA, sha256: BYTES_A_SHA256 });
+    const entry = await openCachedUrl(URL_A, {
+      sha256: BYTES_A_SHA256,
+      strategy: "stream",
+    });
+    assertExists(entry);
+    assertEquals(await entry.read(0, 2), BYTES_A.subarray(0, 2));
+
+    // 並行する fetchBytes が「記録 ≠ 期待」の self-heal で同じキーへ別内容を書く。
+    assertEquals(
+      await fetchBytes(URL_A, { fetch: fetchB, sha256: BYTES_B_SHA256 }),
+      BYTES_B,
+    );
+    // 消えたのではなく差し替わった。"stream" は read の度に match し直すので、記録ハッシュを
+    // 再照合しなければ B の中身が黙って返る（区間読みでは下流が検出できない）。
+    await assertRejects(() => entry.read(0, 2), Error, "差し替わりました");
+    // 新しい期待で開き直せば読める。sha256 無しの生読みは現在のエントリをそのまま読む。
+    const reopened = await openCachedUrl(URL_A, {
+      sha256: BYTES_B_SHA256,
+      strategy: "stream",
+    });
+    assertExists(reopened);
+    assertEquals(await reopened.read(0, 2), BYTES_B.subarray(0, 2));
+    const unchecked = await openCachedUrl(URL_A, { strategy: "stream" });
+    assertExists(unchecked);
+    assertEquals(await unchecked.read(0, 3), BYTES_B);
+  } finally {
+    await caches.delete(CACHE_NAME);
+  }
+});
+
 Deno.test("openCachedUrl: stream 戦略は完走 / 末尾到達 / 確保失敗 / 中断のどの経路でも取った body を手放す", async () => {
   // match の度に新しい body を返し、解放（cancel / 末尾での close）を数える偽 Cache。
   // "stream" 戦略は read ごとに match するので、取った数と手放した数が常に一致するのが契約。
